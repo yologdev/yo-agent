@@ -200,8 +200,9 @@ impl StreamProvider for OpenAiCompatProvider {
                         // surfaces a body close as StreamEnded; an I/O failure
                         // mid-body surfaces as Transport instead.) A
                         // StreamEnded with NO finish_reason is truncation and
-                        // stays an error — a retryable one since #83, because
-                        // a proxy closing mid-response also lands here.
+                        // stays an error — a retryable one since #83, since a
+                        // well-framed body carrying a truncated payload is
+                        // usually a transient gateway fault.
                         Some(Err(reqwest_eventsource::Error::StreamEnded)) if saw_finish_reason => {
                             debug!("provider closed stream without [DONE] after finish_reason");
                             break;

@@ -1140,28 +1140,48 @@ impl Agent {
 /// [`JoinHandle`] does not cancel its task on drop, so without this a dropped
 /// streaming `Agent` leaves the spawned loop running as an orphan — burning
 /// tokens on work nobody will read, holding the tools, and keeping the event
-/// channel's sender alive so the caller's receiver never closes.
+/// channel alive so the caller's receiver never closes.
 ///
-/// Two limitations, both inherent to `Drop` rather than oversights:
+/// Applies only to the receiver-returning methods ([`prompt`](Agent::prompt),
+/// [`continue_loop`](Agent::continue_loop)), which spawn. The `*_with_sender`
+/// variants run inline and never set `pending_completion`, so this is a no-op
+/// for them.
 ///
-/// - **Tools are dropped, not recovered.** [`reset`](Agent::reset) and
-///   [`finish`](Agent::finish) await the task to take its tools back; `Drop`
-///   cannot await, so the tools go with the task. Call one of those explicitly
-///   if you need the tools back.
-/// - **A tool blocked in synchronous code keeps running** until it reaches an
-///   await point, because that is when cancellation takes effect. Wrap blocking
-///   work in `tokio::task::spawn_blocking` inside [`AgentTool::execute`] if a
-///   tool can block for a long time.
+/// **A dropped `Agent` kills its run.** Keep the `Agent` alive until you have
+/// drained the receiver; dropping it early closes the channel *without* an
+/// [`AgentEvent::AgentEnd`], which a consumer looping on `recv()` cannot
+/// distinguish from a clean finish.
+///
+/// Three limitations, inherent to `Drop` rather than oversights:
+///
+/// - **Tools are dropped, not recovered.** `Drop` cannot await the task to take
+///   them back. [`reset`](Agent::reset) cancels then awaits (but also clears
+///   messages and every queue); [`finish`](Agent::finish) awaits natural
+///   completion without cancelling, so it blocks until the run ends.
+/// - **In-flight tool side effects may be half-applied** — a partly written
+///   file, an open transaction. Nothing is rolled back.
+/// - **A tool blocked in synchronous code keeps running.** Abort only takes
+///   effect at an await point. `tokio::task::spawn_blocking` makes the *loop*
+///   promptly abortable but does not stop the blocking closure itself; for
+///   genuinely interruptible work, have the tool poll the cancellation token it
+///   receives on [`ToolContext`].
 impl Drop for Agent {
     fn drop(&mut self) {
-        // Cooperative first: lets the loop stop at its next checkpoint and run
-        // whatever cleanup it has, rather than being cut off mid-turn.
+        // Cancel first so the child tokens handed to tools via ToolContext, and
+        // any sub-agent tasks spawned beneath them, observe the shutdown — those
+        // outlive the abort below. The loop task itself is stopped by abort(),
+        // which drops it at its next poll rather than polling it again.
         if let Some(ref cancel) = self.cancel {
             cancel.cancel();
         }
-        // Then forceful, for a task parked on an await that the token check
-        // would not otherwise reach.
         if let Some(handle) = self.pending_completion.take() {
+            if self.is_streaming && !handle.is_finished() {
+                tracing::warn!(
+                    "Agent dropped mid-run; aborting the loop. The event receiver will \
+                     close without an AgentEnd event and in-flight tool side effects may \
+                     be partially applied. Call finish() or reset() to end a run cleanly."
+                );
+            }
             handle.abort();
         }
     }
