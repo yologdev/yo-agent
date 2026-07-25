@@ -1189,3 +1189,117 @@ async fn test_tool_middleware_deny_under_batched_strategy() {
     });
     assert!(denied);
 }
+
+// ---------------------------------------------------------------------------
+// Drop: dropping a streaming Agent must not orphan the spawned loop (#84)
+// ---------------------------------------------------------------------------
+
+/// Fires when the tool future is dropped, so a test can prove the *in-flight*
+/// tool was actually cancelled rather than merely that the channel closed.
+struct CancelSignal(mpsc::UnboundedSender<()>);
+
+impl Drop for CancelSignal {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+/// Signals when it has been entered, then parks. Deliberately ignores
+/// `ctx.cancel`: only a real abort can stop it, so a passing test cannot be
+/// explained by cooperative cancellation alone.
+struct BarrierTool {
+    entered: mpsc::UnboundedSender<()>,
+    cancelled: mpsc::UnboundedSender<()>,
+}
+
+#[async_trait::async_trait]
+impl AgentTool for BarrierTool {
+    fn name(&self) -> &str {
+        "barrier_tool"
+    }
+    fn label(&self) -> &str {
+        "Barrier Tool"
+    }
+    fn description(&self) -> &str {
+        "Signals that it started, then parks"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(
+        &self,
+        _params: serde_json::Value,
+        _ctx: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let _guard = CancelSignal(self.cancelled.clone());
+        let _ = self.entered.send(());
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        Ok(ToolResult {
+            content: vec![Content::Text {
+                text: "done".into(),
+            }],
+            details: serde_json::Value::Null,
+        })
+    }
+}
+
+/// Issue #84: `JoinHandle` does not cancel its task on drop, so before the
+/// `Drop` impl a dropped streaming Agent left the loop running as an orphan —
+/// holding the event channel open, so the caller's receiver never closed.
+///
+/// Synchronisation is a barrier, not a sleep. That matters: `MockProvider`
+/// checks `cancel.is_cancelled()` at the top of `stream()`, so a `drop` landing
+/// before the loop reaches the tool would let cooperative cancellation alone
+/// close the channel — and the test would pass with `abort()` removed. Waiting
+/// for the tool to signal entry makes the abort the only possible explanation.
+///
+/// Every timeout below is a failure deadline, never a synchronisation point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_drop_aborts_in_flight_tool_and_closes_channel() {
+    let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+    let (cancelled_tx, mut cancelled_rx) = mpsc::unbounded_channel();
+
+    let provider = MockProvider::new(vec![MockResponse::ToolCalls(vec![MockToolCall {
+        name: "barrier_tool".into(),
+        arguments: serde_json::json!({}),
+        provider_metadata: None,
+    }])]);
+
+    let mut agent = Agent::from_provider(provider, ModelConfig::mock())
+        .with_system_prompt("test")
+        .with_tools(vec![Box::new(BarrierTool {
+            entered: entered_tx,
+            cancelled: cancelled_tx,
+        })]);
+
+    let mut rx = agent.prompt("run the barrier tool").await;
+    assert!(agent.is_streaming(), "loop should be in flight");
+
+    // The loop is now provably inside the tool.
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx.recv())
+        .await
+        .expect("agent loop must reach the tool")
+        .expect("tool must signal entry");
+
+    drop(agent);
+
+    // Load-bearing: the *running* tool future was dropped. Cooperative
+    // cancellation cannot do this — BarrierTool ignores ctx.cancel and
+    // agent_loop awaits it without a select!.
+    let cancelled =
+        tokio::time::timeout(std::time::Duration::from_secs(5), cancelled_rx.recv()).await;
+    assert!(
+        matches!(cancelled, Ok(Some(()))),
+        "dropping the Agent must abort the in-flight tool future; it kept running"
+    );
+
+    // And the caller's receiver closes rather than hanging.
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while rx.recv().await.is_some() {}
+    })
+    .await;
+    assert!(
+        drained.is_ok(),
+        "dropping the Agent must close the event channel; it stayed open"
+    );
+}

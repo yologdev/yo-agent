@@ -4,6 +4,50 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- **Anthropic messages carry the configured provider** (#81). `AnthropicProvider`
+  hardcoded `provider: "anthropic"`, the sole outlier among providers — every
+  other one propagates `ModelConfig.provider`. This mis-attributed gateways
+  speaking the Anthropic Messages protocol, including yoagent's own
+  `ModelConfig::opencode_zen()` preset, which routes Claude model ids over this
+  provider under the name `"opencode-zen"`. Falls back to `"anthropic"` when no
+  `ModelConfig` is supplied.
+- **Truncated SSE streams retry instead of failing hard** (#83). A stream whose
+  body ended without an SSE terminator mapped to the non-retryable
+  `ProviderError::Other`, so the agent loop gave up immediately even though a
+  gateway returning a well-framed body with a truncated payload is usually
+  transient. It now maps to `Network`, which the retry policy already covers.
+  (A mid-body connection reset is a decode error and surfaces as `Transport`,
+  not `StreamEnded` — the two are distinct.)
+
+  Three providers needed work so that reclassification could not retry an
+  already-billed response: `anthropic` gains the clean-EOF guard `openai_compat`
+  got in #76, armed only by a `message_delta` carrying a terminal `stop_reason`
+  and refusing to return a tool call whose arguments never finished streaming;
+  `openai_responses` and `azure_openai` now break on `response.incomplete` and
+  `response.failed`, which previously fell through and turned one billed
+  generation into four.
+- **`message_delta` without a `usage` field no longer loses its stop reason**
+  (Anthropic). The field was required, so relaying gateways that omit it failed
+  the whole parse and silently downgraded `tool_use` / `max_tokens` / `refusal`
+  to a plain stop.
+- **Dropping a streaming `Agent` no longer orphans its task** (#84). `JoinHandle`
+  does not cancel on drop, so the spawned loop kept running — burning tokens,
+  holding the tools, and keeping the event channel open so the caller's receiver
+  never closed. A `Drop` impl now cancels the token and aborts the handle.
+
+  **Behavior change:** a dropped `Agent` now *kills* its run. Keep the `Agent`
+  alive until you have drained the receiver — dropping it early closes the
+  channel without an `AgentEnd` event, which a consumer looping on `recv()`
+  cannot distinguish from a clean finish. It logs a warning when this happens.
+  Tools are dropped rather than recovered, and a tool blocked in synchronous
+  code still runs until it yields; both are documented on the impl.
+
+Thanks to @markokocic for reporting #81, #83, and #84.
+
 ## 0.13.2
 
 ### Added

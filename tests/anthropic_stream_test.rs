@@ -202,3 +202,214 @@ async fn rate_limit_carries_retry_after_from_header() {
         other => panic!("expected RateLimited, got: {:?}", other),
     }
 }
+
+/// Issue #81: the returned message must carry the `ModelConfig.provider`, not a
+/// hardcoded "anthropic". Gateways that speak the Anthropic Messages protocol
+/// (OpenCode Zen, Copilot) set their own provider name for cost and session
+/// attribution — yoagent's own `ModelConfig::opencode_zen()` preset routes
+/// Claude model ids over this provider, so the hardcoded value mis-attributed
+/// a first-class preset.
+#[tokio::test]
+async fn provider_comes_from_model_config_not_hardcoded() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(sse_empty_with_stop("end_turn"), "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    // Build from the real preset, not a hand-set field, so this also guards
+    // ModelConfig::opencode_zen() continuing to route Claude ids here.
+    let mut mc = ModelConfig::opencode_zen("claude-sonnet-5");
+    mc.base_url = server.uri();
+    assert_eq!(mc.provider, "opencode-zen", "preset sets the provider name");
+    let mut config = stream_config(&server.uri(), None);
+    config.model_config = Some(mc);
+
+    let message = run_stream(config).await.expect("stream should succeed");
+
+    let Message::Assistant { provider, .. } = &message else {
+        panic!("expected assistant message");
+    };
+    assert_eq!(
+        provider, "opencode-zen",
+        "provider must be propagated from ModelConfig, not hardcoded"
+    );
+}
+
+/// Issue #83: a terminator-less close BEFORE any `message_delta` is genuine
+/// truncation. It must surface as a retryable `Network` error, not the
+/// non-retryable `Other` it used to be — a proxy or load balancer closing
+/// mid-response sends a FIN, which the eventsource reports as `StreamEnded`.
+#[tokio::test]
+async fn stream_ended_without_stop_reason_is_retryable_network_error() {
+    let server = MockServer::start().await;
+    // message_start only, then the body ends: no stop_reason, no message_stop.
+    let truncated = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(truncated, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let err = run_stream(stream_config(&server.uri(), None))
+        .await
+        .expect_err("truncation before stop_reason must be an error");
+
+    assert!(
+        matches!(err, yoagent::provider::ProviderError::Network(_)),
+        "expected retryable Network, got: {err:?}"
+    );
+    assert!(err.is_retryable(), "truncation must be retryable");
+}
+
+/// The other half of #83: a terminator-less close AFTER `message_delta` means
+/// the response is already complete (stop_reason and usage arrived), so it is a
+/// clean EOF — NOT a retry. Without this guard, making StreamEnded retryable
+/// would re-bill a finished response, the bug #76 fixed for openai_compat.
+#[tokio::test]
+async fn stream_ended_after_stop_reason_is_clean_eof() {
+    let server = MockServer::start().await;
+    // Complete response, but the body ends without `message_stop`.
+    let no_terminator = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n\n\
+         event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(no_terminator, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let message = run_stream(stream_config(&server.uri(), None))
+        .await
+        .expect("close after message_delta must not be an error");
+
+    let Message::Assistant {
+        stop_reason,
+        content,
+        usage,
+        ..
+    } = &message
+    else {
+        panic!("expected assistant message");
+    };
+    assert_eq!(*stop_reason, StopReason::Stop);
+    assert_eq!(usage.output, 5, "usage from message_delta must survive");
+    let text: String = content
+        .iter()
+        .filter_map(|c| match c {
+            Content::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text, "hello",
+        "content must survive the terminator-less close"
+    );
+}
+
+/// Review follow-up: the clean-EOF guard must be armed only by a `message_delta`
+/// that actually carried a terminal `stop_reason`. An intermediate delta (usage
+/// update, empty `delta`) parses fine, and arming on it turned a genuine
+/// truncation into a silently-partial success.
+#[tokio::test]
+async fn intermediate_message_delta_does_not_arm_the_clean_eof_guard() {
+    let server = MockServer::start().await;
+    // A delta with NO stop_reason, then the body ends: still truncation.
+    let body = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n\n\
+         event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":3}}\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let err = run_stream(stream_config(&server.uri(), None))
+        .await
+        .expect_err("a delta without stop_reason must not mark the response complete");
+    assert!(
+        err.is_retryable(),
+        "expected retryable truncation, got: {err:?}"
+    );
+}
+
+/// Review follow-up: `content_block_stop` is what parses a tool call's
+/// accumulated `__partial_json` buffer into real arguments. If the stream ends
+/// after `message_delta` but before that, returning the message would hand the
+/// tool its own sentinel key as input — and the loop would execute it.
+#[tokio::test]
+async fn clean_eof_guard_rejects_unterminated_tool_call() {
+    let server = MockServer::start().await;
+    let body = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n\n\
+         event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"bash\",\"input\":{}}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\": \\\"rm -rf /tm\"}}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let err = run_stream(stream_config(&server.uri(), None))
+        .await
+        .expect_err("an unterminated tool_use block must not be returned as success");
+    assert!(
+        err.is_retryable(),
+        "expected retryable truncation, got: {err:?}"
+    );
+}
+
+/// Review follow-up: gateways relaying this protocol sometimes omit `usage` on
+/// `message_delta`. That used to fail the whole parse, silently dropping the
+/// stop_reason it carried and downgrading `tool_use` to `Stop`.
+#[tokio::test]
+async fn message_delta_without_usage_still_yields_its_stop_reason() {
+    let server = MockServer::start().await;
+    let body = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n\
+         event: message_stop\n\
+         data: {\"type\":\"message_stop\"}\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let message = run_stream(stream_config(&server.uri(), None))
+        .await
+        .expect("a usage-less message_delta must still parse");
+    let Message::Assistant { stop_reason, .. } = &message else {
+        panic!("expected assistant message");
+    };
+    assert_eq!(
+        *stop_reason,
+        StopReason::Length,
+        "stop_reason must survive a message_delta with no usage field"
+    );
+}

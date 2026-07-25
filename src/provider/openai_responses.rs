@@ -162,7 +162,27 @@ impl StreamProvider for OpenAiResponsesProvider {
                                     }
                                     break;
                                 }
-                                "error" => {
+                                // Terminal events other than `response.completed`.
+                                // Without these arms the loop never breaks, the
+                                // body closes, and the resulting StreamEnded is
+                                // retryable (#83) — re-running an already-billed
+                                // generation that would fail the same way again.
+                                "response.incomplete" => {
+                                    if let Ok(data) =
+                                        serde_json::from_str::<ResponseCompletedEvent>(&msg.data)
+                                    {
+                                        if let Some(resp) = data.response {
+                                            if let Some(u) = resp.usage {
+                                                usage.input = u.input_tokens;
+                                                usage.output = u.output_tokens;
+                                                usage.total_tokens = u.total_tokens;
+                                            }
+                                        }
+                                    }
+                                    stop_reason = StopReason::Length;
+                                    break;
+                                }
+                                "response.failed" | "error" => {
                                     let provider_err = classify_sse_error_event(&msg.data);
                                     warn!("OpenAI Responses error: {}", provider_err);
                                     return Err(provider_err);

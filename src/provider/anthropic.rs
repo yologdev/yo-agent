@@ -107,6 +107,11 @@ impl StreamProvider for AnthropicProvider {
         let mut content: Vec<Content> = Vec::new();
         let mut usage = Usage::default();
         let mut stop_reason = StopReason::Stop;
+        // Whether a `message_delta` carrying a terminal `stop_reason` arrived —
+        // i.e. the model finished, even if `message_stop` never shows up. Gates
+        // the terminator-less-close guard below. Deliberately not set by a
+        // delta without a stop_reason: that proves nothing about completeness.
+        let mut saw_stop_reason = false;
         let mut error_message: Option<String> = None;
 
         let _ = tx.send(StreamEvent::Start);
@@ -233,6 +238,12 @@ impl StreamProvider for AnthropicProvider {
                                 }
                                 "message_delta" => {
                                     if let Ok(data) = serde_json::from_str::<AnthropicMessageDelta>(&msg.data) {
+                                        // Only a delta that actually carried a
+                                        // terminal stop_reason proves the response
+                                        // is finished. An intermediate delta (usage
+                                        // update, empty `delta`) parses fine and
+                                        // must NOT arm the clean-EOF guard.
+                                        saw_stop_reason |= data.delta.stop_reason.is_some();
                                         stop_reason = match data.delta.stop_reason.as_deref() {
                                             Some("tool_use") => StopReason::ToolUse,
                                             Some("max_tokens") => StopReason::Length,
@@ -274,6 +285,35 @@ impl StreamProvider for AnthropicProvider {
                                 }
                             }
                         }
+                        // A gateway can deliver a complete response and then
+                        // close without the `message_stop` terminator —
+                        // `message_delta` already carried stop_reason and
+                        // usage, so the message is whole. Treat as clean EOF;
+                        // classifying it would make it retryable (Network) and
+                        // re-bill a finished response. Same shape as the
+                        // openai_compat DONE-less guard (#76).
+                        Some(Err(reqwest_eventsource::Error::StreamEnded)) if saw_stop_reason => {
+                            // A stop_reason arrived, but a tool_use block may
+                            // still be unterminated: `content_block_stop` is
+                            // what parses the accumulated `__partial_json`
+                            // buffer into real arguments. Returning that buffer
+                            // as a tool call would run the tool with the
+                            // sentinel key as its input — treat as truncation.
+                            if content.iter().any(|c| {
+                                matches!(c, Content::ToolCall { arguments, .. }
+                                    if arguments.get("__partial_json").is_some())
+                            }) {
+                                warn!(
+                                    "stream ended after message_delta with an unterminated \
+                                     tool_use block; treating as truncation"
+                                );
+                                return Err(ProviderError::Network(
+                                    "stream ended with an incomplete tool_use block".into(),
+                                ));
+                            }
+                            debug!("provider closed stream without message_stop after message_delta");
+                            break;
+                        }
                         Some(Err(e)) => {
                             let provider_err = classify_eventsource_error(e).await;
                             warn!("SSE error: {}", provider_err);
@@ -296,7 +336,15 @@ impl StreamProvider for AnthropicProvider {
             content,
             stop_reason,
             model: config.model.clone(),
-            provider: "anthropic".into(),
+            // Gateways that speak the Anthropic Messages protocol (OpenCode
+            // Zen, Copilot) carry their own provider name for cost and session
+            // attribution — don't overwrite it. Falls back to "anthropic" when
+            // no ModelConfig was supplied.
+            provider: config
+                .model_config
+                .as_ref()
+                .map(|mc| mc.provider.clone())
+                .unwrap_or_else(|| "anthropic".into()),
             usage,
             timestamp: now_ms(),
             error_message,
@@ -602,7 +650,7 @@ struct AnthropicMessageInfo {
     usage: AnthropicUsage,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct AnthropicUsage {
     #[serde(default)]
     input_tokens: u64,
@@ -660,6 +708,10 @@ enum AnthropicDelta {
 #[derive(Deserialize)]
 struct AnthropicMessageDelta {
     delta: AnthropicMessageDeltaInner,
+    // Gateways relaying this protocol sometimes omit `usage` on message_delta.
+    // Without the default the whole event fails to parse, silently dropping the
+    // stop_reason it carried (downgrading tool_use/max_tokens/refusal to Stop).
+    #[serde(default)]
     usage: AnthropicUsage,
 }
 

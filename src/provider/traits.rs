@@ -199,8 +199,23 @@ impl ProviderError {
 /// - `InvalidStatusCode` — reads the response body and classifies via
 ///   [`ProviderError::classify()`] (context overflow, rate limit, auth, etc.).
 /// - `Transport` — maps to [`ProviderError::Network`] (retryable).
-/// - All other variants (protocol/parse errors like `StreamEnded`,
-///   `InvalidContentType`, `Utf8`, `Parser`) — maps to [`ProviderError::Other`]
+/// - `StreamEnded` — the HTTP body ended *legally* (terminal chunk, exact
+///   `Content-Length`, or a close-framed response) but the SSE payload carried
+///   no terminator. Note this is **not** the connection-reset case: a mid-body
+///   TCP reset is a decode error and surfaces as `Transport`. Mapped to
+///   [`ProviderError::Network`] (retryable) because a gateway that returns a
+///   well-framed body with a truncated payload is usually transient.
+///
+///   Reaching this arm must mean no complete response was assembled. A provider
+///   that can finish a response before a terminator-less close is required to
+///   catch `StreamEnded` itself and break instead — otherwise a finished
+///   response gets retried and re-billed. `openai_compat` (`saw_finish_reason`)
+///   and `anthropic` (`saw_stop_reason`) do this. `openai_responses` and
+///   `azure_openai` instead break on every terminal event they can receive
+///   (`response.completed` / `.incomplete` / `.failed`), which upholds the same
+///   invariant without a flag.
+/// - All other variants (protocol/parse errors like `InvalidContentType`,
+///   `Utf8`, `Parser`, `InvalidLastEventId`) — maps to [`ProviderError::Other`]
 ///   (non-retryable, fail fast).
 pub async fn classify_eventsource_error(error: reqwest_eventsource::Error) -> ProviderError {
     match error {
@@ -220,6 +235,12 @@ pub async fn classify_eventsource_error(error: reqwest_eventsource::Error) -> Pr
             )
         }
         reqwest_eventsource::Error::Transport(e) => ProviderError::Network(format!("{:?}", e)),
+        reqwest_eventsource::Error::StreamEnded => ProviderError::Network(
+            "SSE body ended without a terminator and no complete response was assembled \
+             (if this repeats, the endpoint may be returning 200 with an empty or \
+             truncated body rather than an error status)"
+                .into(),
+        ),
         other => ProviderError::Other(other.to_string()),
     }
 }
