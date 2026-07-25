@@ -5,7 +5,8 @@
 The [Model Context Protocol (MCP)](https://modelcontextprotocol.io) is a JSON-RPC 2.0 protocol that lets AI agents discover and call tools from external servers. It defines a standard way for agents to connect to tool providers over two transports:
 
 - **Stdio** — spawn a child process, communicate via stdin/stdout (newline-delimited JSON)
-- **HTTP** — POST JSON-RPC requests to an HTTP endpoint
+- **HTTP** — POST JSON-RPC requests to an HTTP endpoint, including the
+  request/response subset of Streamable HTTP
 
 ## Connecting to MCP Servers
 
@@ -56,6 +57,25 @@ let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Claude
     .with_mcp_server_http("http://localhost:8080/mcp")
     .await?;
 ```
+
+`HttpTransport` handles both the plain JSON-RPC-over-POST shape and the
+**request/response subset of Streamable HTTP**:
+
+- Responses framed as `text/event-stream` are parsed out of their SSE frames,
+  so servers following the Streamable HTTP spec work without a custom transport.
+- Requests advertise `Accept: application/json, text/event-stream`, letting the
+  server pick its framing.
+- An `Mcp-Session-Id` returned on `initialize` is captured and replayed on every
+  later request, and released with a `DELETE` when the client closes. Servers
+  that reject `DELETE` are tolerated — teardown is best-effort.
+- `202 Accepted` with an empty body (how notifications are acknowledged) is a
+  success, not a parse failure.
+
+**Not supported:** the `GET` server→client stream and `Last-Event-ID`
+resumability. `McpTransport` is strictly request/response, so a server-initiated
+message has nowhere to be delivered — those would need a different transport
+trait. In practice this only matters for servers that push notifications
+unprompted; ordinary tool discovery and invocation are unaffected.
 
 ## How MCP Tools Work
 

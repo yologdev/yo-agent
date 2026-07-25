@@ -118,9 +118,22 @@ impl McpTransport for StdioTransport {
 // ---------------------------------------------------------------------------
 
 /// Communicates with an MCP server via HTTP POST (JSON-RPC over HTTP).
+///
+/// Covers the **request/response subset of Streamable HTTP**: responses framed
+/// as `text/event-stream`, `Mcp-Session-Id` capture and replay, `202 Accepted`
+/// with no body, and session teardown on [`close`](McpTransport::close). Plain
+/// JSON-RPC bodies keep working unchanged.
+///
+/// Not covered: the `GET` server→client stream and `Last-Event-ID`
+/// resumability. [`McpTransport`] is strictly request/response, so a
+/// server-initiated message has nowhere to be delivered; supporting those would
+/// need a different transport trait.
 pub struct HttpTransport {
     client: reqwest::Client,
     base_url: String,
+    /// Session assigned by the server on `initialize`, replayed on subsequent
+    /// requests. `Mutex` because [`McpTransport::send`] takes `&self`.
+    session_id: Mutex<Option<String>>,
 }
 
 impl HttpTransport {
@@ -130,17 +143,59 @@ impl HttpTransport {
         Ok(Self {
             client,
             base_url: url.trim_end_matches('/').to_string(),
+            session_id: Mutex::new(None),
         })
+    }
+
+    /// Extract a JSON-RPC response from a body that may be raw JSON or SSE.
+    ///
+    /// Tries JSON first so plain JSON-RPC servers take the same path they
+    /// always did. Otherwise walks SSE frames for the first `data:` line that
+    /// parses — servers may interleave comments, `event:`, and `id:` lines.
+    fn parse_body(body: &str) -> Result<JsonRpcResponse, McpError> {
+        if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(body) {
+            return Ok(response);
+        }
+
+        for frame in body.split("\n\n") {
+            for line in frame.lines() {
+                let Some(data) = line
+                    .strip_prefix("data:")
+                    .map(|d| d.trim_start_matches(' ').trim())
+                else {
+                    continue;
+                };
+                if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(data) {
+                    return Ok(response);
+                }
+            }
+        }
+
+        Err(McpError::Transport(format!(
+            "could not parse a JSON-RPC response from the body (tried JSON and SSE frames): {}",
+            body.chars().take(200).collect::<String>()
+        )))
     }
 }
 
 #[async_trait]
 impl McpTransport for HttpTransport {
     async fn send(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse, McpError> {
-        let resp = self
+        let request_id = request.id;
+
+        let mut builder = self
             .client
             .post(&self.base_url)
-            .json(&request)
+            // Streamable HTTP servers pick their framing from this; JSON-only
+            // servers still match `application/json`.
+            .header("Accept", "application/json, text/event-stream")
+            .json(&request);
+
+        if let Some(session) = self.session_id.lock().await.as_ref() {
+            builder = builder.header("Mcp-Session-Id", session);
+        }
+
+        let resp = builder
             .send()
             .await
             .map_err(|e| McpError::Transport(format!("HTTP error: {}", e)))?;
@@ -152,15 +207,51 @@ impl McpTransport for HttpTransport {
             )));
         }
 
-        let response: JsonRpcResponse = resp
-            .json()
+        // The server assigns the session on `initialize`; hold it for the rest
+        // of the connection.
+        if let Some(session) = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+        {
+            *self.session_id.lock().await = Some(session);
+        }
+
+        let body = resp
+            .text()
             .await
-            .map_err(|e| McpError::Transport(format!("Response parse error: {}", e)))?;
-        Ok(response)
+            .map_err(|e| McpError::Transport(format!("Response read error: {}", e)))?;
+
+        // 202 Accepted with no body is how Streamable HTTP acknowledges a
+        // notification. There is no JSON-RPC response to return, so synthesize
+        // an empty success rather than fail a call that did succeed.
+        if body.trim().is_empty() {
+            return Ok(JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id: Some(request_id),
+                result: None,
+                error: None,
+            });
+        }
+
+        Self::parse_body(&body)
     }
 
     async fn close(&self) -> Result<(), McpError> {
-        // HTTP is stateless; nothing to close.
+        // Without a session there is nothing server-side to release.
+        let session = self.session_id.lock().await.take();
+        if let Some(session) = session {
+            // Best-effort: session teardown is optional in the spec and plenty
+            // of servers reject DELETE. Failing close() over it would turn a
+            // successful run into an error.
+            let _ = self
+                .client
+                .delete(&self.base_url)
+                .header("Mcp-Session-Id", session)
+                .send()
+                .await;
+        }
         Ok(())
     }
 }

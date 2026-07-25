@@ -4,6 +4,30 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- **MCP `HttpTransport` speaks the request/response subset of Streamable HTTP**
+  (#82). Servers returning `text/event-stream` — the emerging MCP standard, used
+  by exa among others — previously failed with `Response parse error`, because
+  the body was parsed as a single JSON object. `HttpTransport` now parses the
+  JSON-RPC payload out of SSE frames (walking past comments, `event:`/`id:`
+  lines, and unrelated frames), advertises
+  `Accept: application/json, text/event-stream`, captures the `Mcp-Session-Id`
+  assigned on `initialize` and replays it on later requests, releases it with a
+  best-effort `DELETE` on close, and treats `202 Accepted` with an empty body as
+  a success rather than a parse failure. Plain JSON-RPC bodies take the same
+  path they always did.
+
+  No API changes: `McpTransport` is unchanged, `HttpTransport`'s fields were
+  already private, and `McpClient::connect_http` is untouched. The `GET`
+  server→client stream and `Last-Event-ID` resumability are out of scope —
+  `McpTransport` is request/response, so a server-initiated message has nowhere
+  to go, and supporting it would need a different trait.
+
+  Reported by @markokocic.
+
 ## 0.13.3
 
 ### Fixed
