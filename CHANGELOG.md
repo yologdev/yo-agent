@@ -9,22 +9,40 @@ adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - **MCP `HttpTransport` speaks the request/response subset of Streamable HTTP**
-  (#82). Servers returning `text/event-stream` — the emerging MCP standard, used
-  by exa among others — previously failed with `Response parse error`, because
-  the body was parsed as a single JSON object. `HttpTransport` now parses the
-  JSON-RPC payload out of SSE frames (walking past comments, `event:`/`id:`
-  lines, and unrelated frames), advertises
-  `Accept: application/json, text/event-stream`, captures the `Mcp-Session-Id`
-  assigned on `initialize` and replays it on later requests, releases it with a
-  best-effort `DELETE` on close, and treats `202 Accepted` with an empty body as
-  a success rather than a parse failure. Plain JSON-RPC bodies take the same
-  path they always did.
+  (#82). Servers that answer a POST with a `text/event-stream` body — the
+  transport introduced in MCP revision 2025-03-26 — previously failed with
+  `Response parse error`, because the body was parsed as a single JSON object.
 
-  No API changes: `McpTransport` is unchanged, `HttpTransport`'s fields were
-  already private, and `McpClient::connect_http` is untouched. The `GET`
-  server→client stream and `Last-Event-ID` resumability are out of scope —
-  `McpTransport` is request/response, so a server-initiated message has nowhere
-  to go, and supporting it would need a different trait.
+  `HttpTransport` now parses the JSON-RPC payload out of SSE events (joining
+  each event's `data:` lines per the SSE spec), advertises
+  `Accept: application/json, text/event-stream`, captures the `Mcp-Session-Id`
+  the server assigns and replays it on later requests, releases it with a
+  best-effort `DELETE` on `McpClient::close()`, and treats `202`/`204` with an
+  empty body as an acknowledgement rather than a parse failure.
+
+  Response selection is structural, not "first frame that parses": a frame is
+  this request's response only if it carries no `method`, carries a `result` or
+  an `error`, and its id matches. That matters because every field of
+  `JsonRpcResponse` except `jsonrpc` is optional, so the `notifications/progress`
+  and `notifications/message` frames a server emits *ahead of* the result
+  deserialize into an empty response — accepting the first frame that parsed
+  would have returned the notification and discarded the answer.
+
+  Diagnostics improve alongside: a non-2xx now carries the server's explanation
+  instead of a bare status, an empty 2xx that is not an acknowledgement is
+  reported rather than dressed up as success, and a `404` on a session-bearing
+  request clears the dead session and says it expired instead of failing every
+  later call with what looks like a bad URL.
+
+  No API-surface changes — `McpTransport` is unchanged, `HttpTransport`'s fields
+  were already private, and `McpClient::connect_http` is untouched. Behavior on
+  the wire does change: every POST now carries an `Accept` header (plus
+  `Mcp-Session-Id` once assigned), and `close()` went from a pure no-op to a
+  network round-trip.
+
+  Not covered: the `GET` server→client stream and `Last-Event-ID` resumability.
+  `McpTransport` is `send`/`close` only, so a server-initiated message has
+  nowhere to be delivered.
 
   Reported by @markokocic.
 

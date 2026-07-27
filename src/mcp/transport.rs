@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use tracing::{debug, warn};
 
 /// Transport trait for MCP communication.
 #[async_trait]
@@ -119,15 +120,19 @@ impl McpTransport for StdioTransport {
 
 /// Communicates with an MCP server via HTTP POST (JSON-RPC over HTTP).
 ///
-/// Covers the **request/response subset of Streamable HTTP**: responses framed
-/// as `text/event-stream`, `Mcp-Session-Id` capture and replay, `202 Accepted`
-/// with no body, and session teardown on [`close`](McpTransport::close). Plain
-/// JSON-RPC bodies keep working unchanged.
+/// Covers the **request/response subset of Streamable HTTP** — servers that
+/// answer a POST with an SSE-framed response and then close the stream:
+/// `text/event-stream` bodies, `Mcp-Session-Id` capture and replay, `202`/`204`
+/// acknowledgements, and session teardown on [`close`](McpTransport::close).
+/// Plain JSON-RPC bodies keep working.
 ///
 /// Not covered: the `GET` server→client stream and `Last-Event-ID`
-/// resumability. [`McpTransport`] is strictly request/response, so a
-/// server-initiated message has nowhere to be delivered; supporting those would
-/// need a different transport trait.
+/// resumability. [`McpTransport`] is `send`/`close` only, so a server-initiated
+/// message has nowhere to be delivered — supporting them would mean growing the
+/// trait an inbound channel.
+///
+/// The body is read to completion, so a server that holds the POST stream open
+/// after answering will block rather than return.
 pub struct HttpTransport {
     client: reqwest::Client,
     base_url: String,
@@ -147,32 +152,113 @@ impl HttpTransport {
         })
     }
 
-    /// Extract a JSON-RPC response from a body that may be raw JSON or SSE.
+    /// Decide whether `payload` is *this request's* JSON-RPC response.
     ///
-    /// Tries JSON first so plain JSON-RPC servers take the same path they
-    /// always did. Otherwise walks SSE frames for the first `data:` line that
-    /// parses — servers may interleave comments, `event:`, and `id:` lines.
-    fn parse_body(body: &str) -> Result<JsonRpcResponse, McpError> {
-        if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(body) {
+    /// Selection is structural rather than "does it deserialize". Every field
+    /// of [`JsonRpcResponse`] except `jsonrpc` is optional and unknown keys are
+    /// ignored, so a server→client notification like
+    /// `{"jsonrpc":"2.0","method":"notifications/progress",...}` deserializes
+    /// cleanly into an all-`None` shell. Streamable HTTP servers routinely emit
+    /// progress and logging notifications on the POST stream *ahead of* the
+    /// result, so accepting the first thing that parses would return the
+    /// notification and silently discard the answer.
+    fn response_for(payload: &str, request_id: u64) -> Option<JsonRpcResponse> {
+        let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+        // Responses never carry `method`; notifications and server→client
+        // requests always do. Redundant with the result-or-error check below
+        // for every frame shape seen in practice — kept because it states the
+        // JSON-RPC invariant directly, so the next reader does not have to
+        // derive it.
+        if value.get("method").is_some() {
+            return None;
+        }
+        // A response carries a result or an error. This is the check that also
+        // rejects a bare `{"jsonrpc":"2.0","id":N}` ack, which carries no
+        // method and would otherwise pass.
+        if value.get("result").is_none() && value.get("error").is_none() {
+            return None;
+        }
+        let response: JsonRpcResponse = serde_json::from_value(value).ok()?;
+        // Correlate. An absent id is tolerated: JSON-RPC allows a null id on
+        // errors the server could not attribute to a request.
+        if response.id.is_some_and(|id| id != request_id) {
+            return None;
+        }
+        Some(response)
+    }
+
+    /// Extract this request's response from a body that may be raw JSON or SSE.
+    ///
+    /// Tries the whole body as JSON first so a plain JSON-RPC body never enters
+    /// the SSE walk. Note this is `text()`-then-parse rather than the previous
+    /// `resp.json()`: the body is now charset-decoded, which sniffs a BOM and
+    /// replaces invalid UTF-8 rather than erroring.
+    ///
+    /// Otherwise walks SSE events, joining each event's `data:` lines with
+    /// newlines as the SSE spec requires, and skipping comments, `event:`, and
+    /// `id:` lines.
+    fn parse_body(
+        body: &str,
+        request_id: u64,
+        method: &str,
+        status: reqwest::StatusCode,
+    ) -> Result<JsonRpcResponse, McpError> {
+        // Normalize CRLF so event splitting works on `\r\n\r\n` too.
+        let body = body.replace("\r\n", "\n");
+
+        if let Some(response) = Self::response_for(&body, request_id) {
             return Ok(response);
         }
 
-        for frame in body.split("\n\n") {
-            for line in frame.lines() {
-                let Some(data) = line
-                    .strip_prefix("data:")
-                    .map(|d| d.trim_start_matches(' ').trim())
-                else {
-                    continue;
+        // Frames that were valid JSON-RPC but not our answer, kept for the
+        // error message — a stalled call is otherwise undiagnosable.
+        let mut skipped: Vec<String> = Vec::new();
+
+        for event in body.split("\n\n") {
+            let data: Vec<&str> = event
+                .lines()
+                .filter_map(|line| {
+                    line.strip_prefix("data:")
+                        .map(|d| d.trim_start_matches(' '))
+                })
+                .collect();
+            if data.is_empty() {
+                continue;
+            }
+            let payload = data.join("\n");
+            let payload = payload.trim();
+            if payload.is_empty() {
+                continue;
+            }
+
+            if let Some(response) = Self::response_for(payload, request_id) {
+                return Ok(response);
+            }
+
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+                let what = match value.get("method").and_then(|m| m.as_str()) {
+                    Some(m) => m.to_string(),
+                    None => match value.get("id").and_then(|i| i.as_u64()) {
+                        Some(id) => format!("response for id {id}"),
+                        None => "unrecognized JSON-RPC frame".to_string(),
+                    },
                 };
-                if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(data) {
-                    return Ok(response);
-                }
+                debug!("skipping SSE frame that is not the response to '{method}': {what}");
+                skipped.push(what);
             }
         }
 
+        let seen = if skipped.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " (skipped {} frame(s): {})",
+                skipped.len(),
+                skipped.join(", ")
+            )
+        };
         Err(McpError::Transport(format!(
-            "could not parse a JSON-RPC response from the body (tried JSON and SSE frames): {}",
+            "HTTP {status}: no JSON-RPC response for '{method}' (id {request_id}) in the body{seen}: {}",
             body.chars().take(200).collect::<String>()
         )))
     }
@@ -182,6 +268,7 @@ impl HttpTransport {
 impl McpTransport for HttpTransport {
     async fn send(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse, McpError> {
         let request_id = request.id;
+        let method = request.method.clone();
 
         let mut builder = self
             .client
@@ -200,57 +287,103 @@ impl McpTransport for HttpTransport {
             .await
             .map_err(|e| McpError::Transport(format!("HTTP error: {}", e)))?;
 
-        if !resp.status().is_success() {
-            return Err(McpError::Transport(format!(
-                "HTTP {} from server",
-                resp.status()
-            )));
+        let status = resp.status();
+        if !status.is_success() {
+            // Per the spec, 404 on a request carrying a session means the
+            // server dropped it. Keeping the dead id would make every later
+            // call fail identically, with an error that reads like a bad URL.
+            if status == reqwest::StatusCode::NOT_FOUND {
+                if let Some(dead) = self.session_id.lock().await.take() {
+                    warn!(
+                        "MCP session {dead} was rejected (HTTP 404); reconnect to start a new one"
+                    );
+                    return Err(McpError::Transport(format!(
+                        "MCP session expired (HTTP 404 on '{method}'); reconnect to start a new session"
+                    )));
+                }
+            }
+            // Carry the body: servers explain themselves in it, and dropping it
+            // leaves the caller with a bare status to guess from.
+            let body = resp.text().await.unwrap_or_default();
+            let detail = body.trim();
+            return Err(McpError::Transport(if detail.is_empty() {
+                format!("HTTP {status} from server on '{method}'")
+            } else {
+                format!(
+                    "HTTP {status} from server on '{method}': {}",
+                    detail.chars().take(200).collect::<String>()
+                )
+            }));
         }
 
-        // The server assigns the session on `initialize`; hold it for the rest
-        // of the connection.
-        if let Some(session) = resp
-            .headers()
-            .get("mcp-session-id")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned)
-        {
-            *self.session_id.lock().await = Some(session);
+        // Servers assign the session on `initialize`; any response carrying one
+        // updates it.
+        match resp.headers().get("mcp-session-id").map(|v| v.to_str()) {
+            Some(Ok(session)) => *self.session_id.lock().await = Some(session.to_owned()),
+            // A header we cannot read means every later request goes out
+            // sessionless — the server then rejects them or silently starts a
+            // fresh session, discarding the handshake. Only the operator can
+            // fix that, so say so.
+            Some(Err(e)) => warn!("ignoring unreadable Mcp-Session-Id header: {e}"),
+            None => {}
         }
 
         let body = resp
             .text()
             .await
-            .map_err(|e| McpError::Transport(format!("Response read error: {}", e)))?;
+            .map_err(|e| McpError::Transport(format!("Response read error on '{method}': {e}")))?;
 
-        // 202 Accepted with no body is how Streamable HTTP acknowledges a
-        // notification. There is no JSON-RPC response to return, so synthesize
-        // an empty success rather than fail a call that did succeed.
         if body.trim().is_empty() {
-            return Ok(JsonRpcResponse {
-                jsonrpc: "2.0".into(),
-                id: Some(request_id),
-                result: None,
-                error: None,
-            });
+            // 202/204 with no body is how Streamable HTTP acknowledges a
+            // notification — there is no JSON-RPC response to return, so
+            // synthesize an empty success. Any other empty 2xx is a real
+            // failure (a proxy answering instead of the MCP server, a drained
+            // upstream) and must not be dressed up as one.
+            if status == reqwest::StatusCode::ACCEPTED || status == reqwest::StatusCode::NO_CONTENT
+            {
+                return Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: Some(request_id),
+                    result: None,
+                    error: None,
+                });
+            }
+            return Err(McpError::Transport(format!(
+                "HTTP {status} with an empty body on '{method}' (expected a JSON-RPC response; \
+                 an empty 2xx usually means a proxy or gateway answered instead of the MCP server)"
+            )));
         }
 
-        Self::parse_body(&body)
+        Self::parse_body(&body, request_id, &method, status)
     }
 
     async fn close(&self) -> Result<(), McpError> {
-        // Without a session there is nothing server-side to release.
         let session = self.session_id.lock().await.take();
         if let Some(session) = session {
             // Best-effort: session teardown is optional in the spec and plenty
             // of servers reject DELETE. Failing close() over it would turn a
-            // successful run into an error.
-            let _ = self
+            // successful run into an error. Best-effort is not the same as
+            // unobservable, though — a rejection is fine, but a DELETE that
+            // never reached the server leaks the session there, and that only
+            // surfaces later as an unrelated connect failure.
+            match self
                 .client
                 .delete(&self.base_url)
-                .header("Mcp-Session-Id", session)
+                .header("Mcp-Session-Id", &session)
                 .send()
-                .await;
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {}
+                Ok(resp) => debug!(
+                    "MCP session teardown rejected with HTTP {}; it is optional, continuing",
+                    resp.status()
+                ),
+                Err(e) => warn!(
+                    "MCP session {session} teardown did not reach {}: {e}; \
+                     the session may leak server-side",
+                    self.base_url
+                ),
+            }
         }
         Ok(())
     }

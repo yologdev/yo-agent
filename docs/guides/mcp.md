@@ -59,23 +59,38 @@ let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Claude
 ```
 
 `HttpTransport` handles both the plain JSON-RPC-over-POST shape and the
-**request/response subset of Streamable HTTP**:
+**request/response subset of Streamable HTTP** — servers that answer a POST with
+an SSE-framed response and then close the stream:
 
 - Responses framed as `text/event-stream` are parsed out of their SSE frames,
-  so servers following the Streamable HTTP spec work without a custom transport.
+  joining each event's `data:` lines as the SSE spec requires.
+- A server may interleave `notifications/progress` and `notifications/message`
+  frames ahead of the result — that is how it reports progress during a
+  `tools/call`. Those are skipped: a frame is this request's response only if it
+  carries no `method`, carries a `result` or an `error`, and its id matches.
 - Requests advertise `Accept: application/json, text/event-stream`, letting the
   server pick its framing.
-- An `Mcp-Session-Id` returned on `initialize` is captured and replayed on every
-  later request, and released with a `DELETE` when the client closes. Servers
-  that reject `DELETE` are tolerated — teardown is best-effort.
-- `202 Accepted` with an empty body (how notifications are acknowledged) is a
-  success, not a parse failure.
+- An `Mcp-Session-Id` returned by the server is captured and replayed on every
+  later request, and released with a `DELETE` on `McpClient::close()`. Servers
+  that reject `DELETE` are tolerated — teardown is best-effort. A `404` on a
+  session-bearing request clears the session and reports that it expired, so a
+  caller can rebuild the client.
+- `202 Accepted` (or `204`) with an empty body — how a notification is
+  acknowledged — is a success, not a parse failure. Any *other* empty 2xx is
+  reported as an error, since it usually means a proxy answered instead of the
+  MCP server.
 
 **Not supported:** the `GET` server→client stream and `Last-Event-ID`
-resumability. `McpTransport` is strictly request/response, so a server-initiated
-message has nowhere to be delivered — those would need a different transport
-trait. In practice this only matters for servers that push notifications
-unprompted; ordinary tool discovery and invocation are unaffected.
+resumability. `McpTransport` is `send`/`close` only, with nowhere to deliver a
+server-initiated message — supporting them would mean growing the trait an
+inbound channel. Note also that the response body is read to completion, so a
+server that holds the POST stream open after answering will block rather than
+return, and the handshake still negotiates `protocolVersion: 2024-11-05` (the
+revision predating Streamable HTTP), which servers generally accept.
+
+`McpClient::close()` is what sends the `DELETE`. `Agent::with_mcp_server_http`
+does not call it, so sessions opened that way are released by the server's own
+timeout rather than explicitly.
 
 ## How MCP Tools Work
 
