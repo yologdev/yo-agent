@@ -2,6 +2,7 @@
 
 use super::types::*;
 use async_trait::async_trait;
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -126,13 +127,16 @@ impl McpTransport for StdioTransport {
 /// acknowledgements, and session teardown on [`close`](McpTransport::close).
 /// Plain JSON-RPC bodies keep working.
 ///
+/// The body is parsed incrementally and [`send`](McpTransport::send) returns at
+/// the frame carrying this request's response, so a server that keeps the POST
+/// stream open after answering does not block the call.
+///
 /// Not covered: the `GET` server→client stream and `Last-Event-ID`
 /// resumability. [`McpTransport`] is `send`/`close` only, so a server-initiated
 /// message has nowhere to be delivered — supporting them would mean growing the
-/// trait an inbound channel.
-///
-/// The body is read to completion, so a server that holds the POST stream open
-/// after answering will block rather than return.
+/// trait an inbound channel. Notifications that arrive on the POST stream
+/// *before* the response are read and skipped; any that trail it are not, since
+/// the call has already returned by then.
 pub struct HttpTransport {
     client: reqwest::Client,
     base_url: String,
@@ -187,64 +191,127 @@ impl HttpTransport {
         Some(response)
     }
 
-    /// Extract this request's response from a body that may be raw JSON or SSE.
+    /// Join an SSE event's `data:` lines into its payload, per the SSE spec.
     ///
-    /// Tries the whole body as JSON first so a plain JSON-RPC body never enters
-    /// the SSE walk. Note this is `text()`-then-parse rather than the previous
-    /// `resp.json()`: the body is now charset-decoded, which sniffs a BOM and
-    /// replaces invalid UTF-8 rather than erroring.
+    /// Returns `None` for events that carry no data — comments, bare `event:`
+    /// or `id:` lines, keep-alives.
+    fn event_payload(event: &str) -> Option<String> {
+        let data: Vec<&str> = event
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("data:")
+                    .map(|d| d.trim_start_matches(' '))
+            })
+            .collect();
+        if data.is_empty() {
+            return None;
+        }
+        let payload = data.join("\n");
+        let payload = payload.trim().to_string();
+        (!payload.is_empty()).then_some(payload)
+    }
+
+    /// Note a frame that was valid JSON-RPC but not our answer, so a call that
+    /// never finds its response can say what it saw instead.
+    fn note_skipped(payload: &str, method: &str, skipped: &mut Vec<String>) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+            let what = match value.get("method").and_then(|m| m.as_str()) {
+                Some(m) => m.to_string(),
+                None => match value.get("id").and_then(|i| i.as_u64()) {
+                    Some(id) => format!("response for id {id}"),
+                    None => "unrecognized JSON-RPC frame".to_string(),
+                },
+            };
+            debug!("skipping SSE frame that is not the response to '{method}': {what}");
+            skipped.push(what);
+        }
+    }
+
+    /// Read the response body, returning as soon as this request's answer
+    /// arrives rather than draining to EOF.
     ///
-    /// Otherwise walks SSE events, joining each event's `data:` lines with
-    /// newlines as the SSE spec requires, and skipping comments, `event:`, and
-    /// `id:` lines.
-    fn parse_body(
-        body: &str,
+    /// The early return is the point: Streamable HTTP permits a server to keep
+    /// the POST stream open after answering (to deliver further notifications),
+    /// so buffering the whole body would block until the server gave up. It
+    /// also means a long `tools/call` that streams progress frames returns the
+    /// moment the result lands, instead of waiting out the trailing traffic.
+    ///
+    /// A plain JSON-RPC body has no event boundaries, so it falls through to
+    /// the whole-body parse at EOF — the same result as before, and the shape
+    /// that made `resp.json()` sufficient until now.
+    async fn read_response(
+        resp: reqwest::Response,
         request_id: u64,
         method: &str,
         status: reqwest::StatusCode,
     ) -> Result<JsonRpcResponse, McpError> {
-        // Normalize CRLF so event splitting works on `\r\n\r\n` too.
-        let body = body.replace("\r\n", "\n");
+        // Scanning happens on bytes, not text: a chunk boundary can split a
+        // multi-byte character, and decoding each chunk independently would
+        // corrupt it. Whole events decode cleanly.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut scanned = 0usize;
+        let mut skipped: Vec<String> = Vec::new();
+        let mut stream = resp.bytes_stream();
 
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| {
+                McpError::Transport(format!("Response read error on '{method}': {e}"))
+            })?;
+            // Drop CR so event boundaries are plain `\n\n` whichever framing the
+            // server uses. A raw CR is illegal inside a JSON string, so this
+            // cannot corrupt a payload.
+            buf.extend(chunk.iter().copied().filter(|b| *b != b'\r'));
+
+            while let Some(pos) = buf[scanned..].windows(2).position(|w| w == b"\n\n") {
+                let event = String::from_utf8_lossy(&buf[scanned..scanned + pos]).into_owned();
+                scanned += pos + 2;
+
+                let Some(payload) = Self::event_payload(&event) else {
+                    continue;
+                };
+                if let Some(response) = Self::response_for(&payload, request_id) {
+                    return Ok(response);
+                }
+                Self::note_skipped(&payload, method, &mut skipped);
+            }
+        }
+
+        let body = String::from_utf8_lossy(&buf).into_owned();
+
+        if body.trim().is_empty() {
+            // 202/204 with no body is how Streamable HTTP acknowledges a
+            // notification — there is no JSON-RPC response to return, so
+            // synthesize an empty success. Any other empty 2xx is a real
+            // failure (a proxy answering instead of the MCP server, a drained
+            // upstream) and must not be dressed up as one.
+            if status == reqwest::StatusCode::ACCEPTED || status == reqwest::StatusCode::NO_CONTENT
+            {
+                return Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: Some(request_id),
+                    result: None,
+                    error: None,
+                });
+            }
+            return Err(McpError::Transport(format!(
+                "HTTP {status} with an empty body on '{method}' (expected a JSON-RPC response; \
+                 an empty 2xx usually means a proxy or gateway answered instead of the MCP server)"
+            )));
+        }
+
+        // Plain JSON-RPC: no event boundaries, so nothing matched above.
         if let Some(response) = Self::response_for(&body, request_id) {
             return Ok(response);
         }
 
-        // Frames that were valid JSON-RPC but not our answer, kept for the
-        // error message — a stalled call is otherwise undiagnosable.
-        let mut skipped: Vec<String> = Vec::new();
-
-        for event in body.split("\n\n") {
-            let data: Vec<&str> = event
-                .lines()
-                .filter_map(|line| {
-                    line.strip_prefix("data:")
-                        .map(|d| d.trim_start_matches(' '))
-                })
-                .collect();
-            if data.is_empty() {
-                continue;
-            }
-            let payload = data.join("\n");
-            let payload = payload.trim();
-            if payload.is_empty() {
-                continue;
-            }
-
-            if let Some(response) = Self::response_for(payload, request_id) {
-                return Ok(response);
-            }
-
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
-                let what = match value.get("method").and_then(|m| m.as_str()) {
-                    Some(m) => m.to_string(),
-                    None => match value.get("id").and_then(|i| i.as_u64()) {
-                        Some(id) => format!("response for id {id}"),
-                        None => "unrecognized JSON-RPC frame".to_string(),
-                    },
-                };
-                debug!("skipping SSE frame that is not the response to '{method}': {what}");
-                skipped.push(what);
+        // A final event the server never terminated with a blank line.
+        if scanned < buf.len() {
+            let tail = String::from_utf8_lossy(&buf[scanned..]).into_owned();
+            if let Some(payload) = Self::event_payload(&tail) {
+                if let Some(response) = Self::response_for(&payload, request_id) {
+                    return Ok(response);
+                }
+                Self::note_skipped(&payload, method, &mut skipped);
             }
         }
 
@@ -328,33 +395,7 @@ impl McpTransport for HttpTransport {
             None => {}
         }
 
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| McpError::Transport(format!("Response read error on '{method}': {e}")))?;
-
-        if body.trim().is_empty() {
-            // 202/204 with no body is how Streamable HTTP acknowledges a
-            // notification — there is no JSON-RPC response to return, so
-            // synthesize an empty success. Any other empty 2xx is a real
-            // failure (a proxy answering instead of the MCP server, a drained
-            // upstream) and must not be dressed up as one.
-            if status == reqwest::StatusCode::ACCEPTED || status == reqwest::StatusCode::NO_CONTENT
-            {
-                return Ok(JsonRpcResponse {
-                    jsonrpc: "2.0".into(),
-                    id: Some(request_id),
-                    result: None,
-                    error: None,
-                });
-            }
-            return Err(McpError::Transport(format!(
-                "HTTP {status} with an empty body on '{method}' (expected a JSON-RPC response; \
-                 an empty 2xx usually means a proxy or gateway answered instead of the MCP server)"
-            )));
-        }
-
-        Self::parse_body(&body, request_id, &method, status)
+        Self::read_response(resp, request_id, &method, status).await
     }
 
     async fn close(&self) -> Result<(), McpError> {

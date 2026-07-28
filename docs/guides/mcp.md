@@ -80,13 +80,18 @@ an SSE-framed response and then close the stream:
   reported as an error, since it usually means a proxy answered instead of the
   MCP server.
 
+- The body is parsed incrementally, so a call returns at the frame carrying its
+  response rather than at end-of-stream. A server that holds the POST stream
+  open after answering — which Streamable HTTP permits — does not block it.
+
 **Not supported:** the `GET` server→client stream and `Last-Event-ID`
 resumability. `McpTransport` is `send`/`close` only, with nowhere to deliver a
 server-initiated message — supporting them would mean growing the trait an
-inbound channel. Note also that the response body is read to completion, so a
-server that holds the POST stream open after answering will block rather than
-return, and the handshake still negotiates `protocolVersion: 2024-11-05` (the
-revision predating Streamable HTTP), which servers generally accept.
+inbound channel. Notifications arriving on the POST stream *before* the response
+are read and skipped; any that trail it are not, since the call has already
+returned. Note also that the handshake still negotiates
+`protocolVersion: 2024-11-05` (the revision predating Streamable HTTP), which
+servers generally accept.
 
 `McpClient::close()` is what sends the `DELETE`. `Agent::with_mcp_server_http`
 does not call it, so sessions opened that way are released by the server's own

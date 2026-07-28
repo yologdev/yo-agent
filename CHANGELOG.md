@@ -40,6 +40,11 @@ adheres to [Semantic Versioning](https://semver.org/).
   `Mcp-Session-Id` once assigned), and `close()` went from a pure no-op to a
   network round-trip.
 
+  The body is parsed incrementally: a call returns at the frame carrying its
+  response rather than at end-of-stream, so a server that holds the POST stream
+  open after answering (which the spec permits) does not block it, and a long
+  `tools/call` streaming progress frames returns the moment its result lands.
+
   Not covered: the `GET` server→client stream and `Last-Event-ID` resumability.
   `McpTransport` is `send`/`close` only, so a server-initiated message has
   nowhere to be delivered.
