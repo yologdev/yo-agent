@@ -4,6 +4,57 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- **MCP `HttpTransport` speaks the request/response subset of Streamable HTTP**
+  (#82). Servers that answer a POST with a `text/event-stream` body — the
+  transport introduced in MCP revision 2025-03-26 — previously failed with
+  `Response parse error`, because the body was parsed as a single JSON object.
+
+  `HttpTransport` now parses the JSON-RPC payload out of SSE events (joining
+  each event's `data:` lines per the SSE spec), advertises
+  `Accept: application/json, text/event-stream`, captures the `Mcp-Session-Id`
+  the server assigns and replays it on later requests, releases it with a
+  best-effort `DELETE` on `McpClient::close()`, and treats `202`/`204` with an
+  empty body as an acknowledgement rather than a parse failure.
+
+  Response selection is structural, not "first frame that parses": a frame is
+  this request's response only if it carries no `method`, carries a `result` or
+  an `error`, and its id matches. That matters because every field of
+  `JsonRpcResponse` except `jsonrpc` is optional, so the `notifications/progress`
+  and `notifications/message` frames a server emits *ahead of* the result
+  deserialize into an empty response — accepting the first frame that parsed
+  would have returned the notification and discarded the answer.
+
+  Diagnostics improve alongside: a non-2xx now carries the server's explanation
+  instead of a bare status, an empty 2xx that is not an acknowledgement is
+  reported rather than dressed up as success, and a `404` on a session-bearing
+  request clears the dead session and says it expired instead of failing every
+  later call with what looks like a bad URL.
+
+  The body is parsed incrementally: a call returns at the blank-line-terminated
+  frame carrying its response rather than at end-of-stream, so a server that
+  holds the POST stream open after answering does not block it, and a long
+  `tools/call` streaming progress frames returns the moment its result lands. A
+  stalled server is bounded by an idle read timeout (120s, reset on every read,
+  so a slow-but-progressing call is never cut off) rather than hanging.
+
+  No API-surface changes — `McpTransport` is unchanged, `HttpTransport`'s fields
+  were already private, and `McpClient::connect_http` is untouched. Behavior on
+  the wire does change: every POST now carries an `Accept` header (plus
+  `Mcp-Session-Id` once assigned), `close()` went from a pure no-op to a network
+  round-trip, and returning mid-body means an SSE response forgoes connection
+  reuse unless the server had already closed the body — a fresh connection, and
+  TLS handshake, on the next call to such a server.
+
+  Not covered: the `GET` server→client stream and `Last-Event-ID` resumability.
+  `McpTransport` is `send`/`close` only, so a server-initiated message has
+  nowhere to be delivered.
+
+  Reported by @markokocic.
+
 ## 0.13.3
 
 ### Fixed

@@ -5,7 +5,8 @@
 The [Model Context Protocol (MCP)](https://modelcontextprotocol.io) is a JSON-RPC 2.0 protocol that lets AI agents discover and call tools from external servers. It defines a standard way for agents to connect to tool providers over two transports:
 
 - **Stdio** — spawn a child process, communicate via stdin/stdout (newline-delimited JSON)
-- **HTTP** — POST JSON-RPC requests to an HTTP endpoint
+- **HTTP** — POST JSON-RPC requests to an HTTP endpoint, including the
+  request/response subset of Streamable HTTP
 
 ## Connecting to MCP Servers
 
@@ -56,6 +57,51 @@ let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Claude
     .with_mcp_server_http("http://localhost:8080/mcp")
     .await?;
 ```
+
+`HttpTransport` handles both the plain JSON-RPC-over-POST shape and the
+**request/response subset of Streamable HTTP** — servers that answer a POST with
+an SSE-framed response, whether or not they then close the stream:
+
+- Responses framed as `text/event-stream` are parsed out of their SSE frames,
+  joining each event's `data:` lines as the SSE spec requires.
+- A server may interleave `notifications/progress` and `notifications/message`
+  frames ahead of the result — that is how it reports progress during a
+  `tools/call`. Those are skipped: a frame is this request's response only if it
+  carries no `method`, carries a `result` or an `error`, and its id matches.
+- Requests advertise `Accept: application/json, text/event-stream`, letting the
+  server pick its framing.
+- An `Mcp-Session-Id` returned by the server is captured and replayed on every
+  later request, and released with a `DELETE` on `McpClient::close()`. Servers
+  that reject `DELETE` are tolerated — teardown is best-effort. A `404` on a
+  session-bearing request clears the session and reports that it expired, so a
+  caller can rebuild the client.
+- `202 Accepted` (or `204`) with an empty body — how a notification is
+  acknowledged — is a success, not a parse failure. Any *other* empty 2xx is
+  reported as an error, since it usually means a proxy answered instead of the
+  MCP server.
+- The body is parsed incrementally, so a call returns at the blank-line-terminated
+  frame carrying its response rather than at end-of-stream. A server that holds
+  the POST stream open after answering does not block it. Two trade-offs come
+  with that: returning mid-body forgoes connection reuse (a fresh connection,
+  and TLS handshake, on the next call to such a server), and a plain JSON-RPC
+  body has no frames to return early at, so it is read to the end as before.
+- A stalled server — one that accepts the POST then sends nothing — is bounded
+  by an idle read timeout (120s) rather than hanging. The timer resets on every
+  read, so a long `tools/call` streaming progress frames is never cut off.
+
+**Not supported:** the `GET` server→client stream and `Last-Event-ID`
+resumability. `McpTransport` is `send`/`close` only, with nowhere to deliver a
+server-initiated message — supporting them would mean growing the trait an
+inbound channel. Notifications arriving on the POST stream *before* the response
+are read and skipped; any that trail it are not, since the call has already
+returned — so a server that blocks awaiting a reply to a `sampling/createMessage`
+it sent on this stream will time out rather than be answered. Note also that the
+handshake still negotiates `protocolVersion: 2024-11-05` (the revision predating
+Streamable HTTP), which servers generally accept.
+
+`McpClient::close()` is what sends the `DELETE`. `Agent::with_mcp_server_http`
+does not call it, so sessions opened that way are released by the server's own
+timeout rather than explicitly.
 
 ## How MCP Tools Work
 
