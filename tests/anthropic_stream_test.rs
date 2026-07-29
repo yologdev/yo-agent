@@ -573,6 +573,100 @@ async fn content_block_stop_without_an_index_does_not_close_block_zero() {
     );
 }
 
+/// Captures `tracing` events on this thread so a test can assert on what was
+/// *not* logged.
+///
+/// This is the crate's only log-asserting harness, and it earns its place: the
+/// regression it guards — a `warn!` firing on every healthy turn — is invisible
+/// to every behavioral assertion, because the stop reason is `Stop` either way.
+/// It shipped once for exactly that reason. `set_default` is thread-local and
+/// `#[tokio::test]` keeps the task on one thread, so parallel tests do not
+/// interfere.
+#[derive(Clone, Default)]
+struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl CapturedLogs {
+    fn contains(&self, needle: &str) -> bool {
+        self.0.lock().unwrap().iter().any(|l| l.contains(needle))
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Msg(String);
+        impl tracing::field::Visit for Msg {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut msg = Msg(String::new());
+        event.record(&mut msg);
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("{}: {}", event.metadata().level(), msg.0));
+    }
+}
+
+/// Run a canned stream with `tracing` captured.
+async fn run_stream_capturing_logs(stop_reason: &str) -> CapturedLogs {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let logs = CapturedLogs::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(sse_empty_with_stop(stop_reason), "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    run_stream(stream_config(&server.uri(), None))
+        .await
+        .unwrap_or_else(|e| panic!("[{stop_reason}] stream should succeed: {e}"));
+
+    logs
+}
+
+/// The regression that motivated listing every stop reason explicitly: with
+/// `end_turn` folded into the catch-all, the "unrecognized stop reason" warning
+/// fired on every successful turn, burying the signal it exists to give. No
+/// behavioral assertion can see this — `end_turn` maps to `Stop` either way.
+#[tokio::test]
+async fn a_healthy_turn_logs_no_stop_reason_warning() {
+    for reason in ["end_turn", "stop_sequence"] {
+        let logs = run_stream_capturing_logs(reason).await;
+        assert!(
+            !logs.contains("unrecognized Anthropic stop_reason"),
+            "[{reason}] a recognized stop reason must not warn; captured: {:?}",
+            logs.0.lock().unwrap()
+        );
+    }
+}
+
+/// The other half: a genuinely unrecognized reason must still be reported, or
+/// the arm is silent again.
+#[tokio::test]
+async fn an_unrecognized_stop_reason_is_logged() {
+    let logs = run_stream_capturing_logs("reason_that_does_not_exist").await;
+    assert!(
+        logs.contains("unrecognized Anthropic stop_reason"),
+        "an unrecognized stop reason must be logged; captured: {:?}",
+        logs.0.lock().unwrap()
+    );
+}
+
 /// Issue #89 follow-up: `end_turn` is what an ordinary completion carries. It
 /// must be matched explicitly — folding it into the unknown-reason arm makes the
 /// "we hit a stop reason we don't handle" warning fire on every healthy turn,
