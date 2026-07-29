@@ -17,7 +17,7 @@
 - [Prompt Caching](concepts/prompt-caching.md)
 - [Retry with Backoff](concepts/retry.md)
 - [Skills](concepts/skills.md)
-- [Sub-Agents](concepts/sub-agents.md)
+- [Sub-Agents & Shared State](concepts/sub-agents.md)
 - [State Persistence](concepts/persistence.md)
 - [Session Trees](concepts/session-trees.md)
 - [GASP: Your Agent Is a Git Repo](concepts/gasp.md)
