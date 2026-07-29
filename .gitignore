@@ -1,3 +1,5 @@
 /target
 Cargo.lock
 .DS_Store
+# mdbook build output (`mdbook build`); the site is published by CI
+/book

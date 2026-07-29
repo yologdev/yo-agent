@@ -1,0 +1,55 @@
+name: Feature request
+description: Suggest a capability or an improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        yoagent is deliberately narrow — the loop, tool execution, and what's needed to run it in
+        production. Retrieval, vector stores, and task-graph orchestration are intentionally out of
+        scope. That doesn't mean don't ask; it just helps to say how the idea fits the loop.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that yoagent makes hard or impossible today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you'd like
+      description: A sketch of the API or behaviour you have in mind.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - The agent loop
+        - A provider / protocol
+        - Tools (built-in or the AgentTool trait)
+        - MCP
+        - OpenAPI
+        - Sub-agents / shared state
+        - Context management / sessions
+        - Telemetry / cost tracking
+        - GASP recording
+        - Docs
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Workarounds you've tried
+      description: >-
+        Including "none" is fine. If you solved it outside yoagent, knowing how helps judge whether
+        this belongs in the crate.
+    validations:
+      required: false

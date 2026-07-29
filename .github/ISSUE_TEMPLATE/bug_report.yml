@@ -1,0 +1,90 @@
+name: Bug report
+description: Something in yoagent behaves incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Most yoagent bugs turn out to be provider-specific, so the
+        protocol and model id below usually save a round-trip.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what did you get instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >-
+        Ideally a minimal snippet. A `MockProvider` repro is the fastest path to a fix, but a
+        description of the failing request works too.
+      render: rust
+    validations:
+      required: false
+
+  - type: dropdown
+    id: protocol
+    attributes:
+      label: API protocol
+      description: Which wire protocol was in use?
+      options:
+        - Anthropic Messages
+        - OpenAI Completions (incl. Groq, xAI, DeepSeek, Ollama, local, ...)
+        - OpenAI Responses
+        - Azure OpenAI
+        - Google Generative AI (Gemini)
+        - Google Vertex
+        - Bedrock ConverseStream
+        - Not provider-related / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: provider-model
+    attributes:
+      label: Provider and model id
+      description: e.g. `anthropic` / `claude-sonnet-5`, or `ollama` / `llama3.1:8b`
+      placeholder: provider / model-id
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: yoagent version
+      placeholder: "0.14.1"
+    validations:
+      required: true
+
+  - type: input
+    id: rust-version
+    attributes:
+      label: Rust version
+      description: Output of `rustc --version` (MSRV is 1.86)
+      placeholder: "rustc 1.86.0"
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: features
+    attributes:
+      label: Cargo features enabled
+      options:
+        - label: "`openapi`"
+        - label: "`gasp`"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >-
+        Any relevant `tracing` output or error text. Please redact API keys — yoagent never logs
+        them, but pasted request dumps sometimes contain them.
+      render: shell
+    validations:
+      required: false

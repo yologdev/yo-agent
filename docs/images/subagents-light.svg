@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 620" width="1040" height="620">
+  <style>
+    text { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Menlo', 'Courier New', monospace; fill: #0f172a; }
+    .t  { font-size: 18px; font-weight: 700; }
+    .st { font-size: 12px; fill: #475569; }
+    .n  { font-size: 14px; font-weight: 700; }
+    .s  { font-size: 11px; fill: #475569; }
+    .lg { font-size: 11px; fill: #475569; }
+    .al { font-size: 11px; fill: #475569; }
+  </style>
+  <defs>
+    <linearGradient id="bg" x1="0%%" y1="0%%" x2="100%%" y2="100%%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#f8fafc"/>
+    </linearGradient>
+    <marker id="a-purple" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+      <polygon points="0 0, 9 3.5, 0 7" fill="#7c3aed"/>
+    </marker>
+    <marker id="a-orange" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+      <polygon points="0 0, 9 3.5, 0 7" fill="#ea580c"/>
+    </marker>
+    <marker id="a-green" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+      <polygon points="0 0, 9 3.5, 0 7" fill="#059669"/>
+    </marker>
+    <marker id="a-blue" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+      <polygon points="0 0, 9 3.5, 0 7" fill="#2563eb"/>
+    </marker>
+    <marker id="a-gold" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+      <polygon points="0 0, 9 3.5, 0 7" fill="#ca8a04"/>
+    </marker>
+    <filter id="glow" x="-30%%" y="-30%%" width="160%%" height="160%%">
+      <feGaussianBlur stdDeviation="4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1040" height="620" fill="url(#bg)"/>
+  <text class="t" x="40" y="46">Sub-agents share artifacts by reference</text>
+  <text class="st" x="40" y="70">Each sub-agent runs its own model. Large results never re-enter a prompt.</text>
+  <rect x="40" y="98" width="340" height="92" rx="6" ry="6" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4,3"/>
+  <text class="s" x="54" y="120" style="font-weight:700;fill:#0f172a">the problem it solves</text>
+  <text class="lg" x="54" y="140">A 40k-token artifact is stored once,</text>
+  <text class="lg" x="54" y="158">then read by key — not re-pasted into</text>
+  <text class="lg" x="54" y="176">every sub-agent's context window.</text>
+  <rect x="660" y="98" width="340" height="92" rx="6" ry="6" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4,3"/>
+  <text class="s" x="674" y="120" style="font-weight:700;fill:#0f172a">arrows</text>
+  <line x1="674" y1="136" x2="700" y2="136" stroke="#7c3aed" stroke-width="2.5" stroke-linecap="round"/>
+  <text class="lg" x="710" y="140">spawn (own model + tools)</text>
+  <line x1="674" y1="154" x2="700" y2="154" stroke="#059669" stroke-width="2.5" stroke-linecap="round"/>
+  <text class="lg" x="710" y="158">read / write by key</text>
+  <rect x="420" y="110" width="200" height="70" rx="6" ry="6" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.5" filter="url(#glow)"/>
+  <text class="n" x="520" y="143" text-anchor="middle">Agent</text>
+  <text class="s" x="520" y="161" text-anchor="middle">SubAgentTool</text>
+  <rect x="80" y="300" width="200" height="80" rx="6" ry="6" fill="#fff7ed" stroke="#ea580c" stroke-width="1.5"/>
+  <text class="n" x="180" y="338" text-anchor="middle">reviewer</text>
+  <text class="s" x="180" y="356" text-anchor="middle">claude-opus-5</text>
+  <rect x="420" y="300" width="200" height="80" rx="6" ry="6" fill="#fff7ed" stroke="#ea580c" stroke-width="1.5"/>
+  <text class="n" x="520" y="338" text-anchor="middle">tester</text>
+  <text class="s" x="520" y="356" text-anchor="middle">claude-haiku-4-5</text>
+  <rect x="760" y="300" width="200" height="80" rx="6" ry="6" fill="#fff7ed" stroke="#ea580c" stroke-width="1.5"/>
+  <text class="n" x="860" y="338" text-anchor="middle">docs</text>
+  <text class="s" x="860" y="356" text-anchor="middle">ollama / local</text>
+  <rect x="420" y="470" width="200" height="90" rx="6" ry="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <text class="n" x="520" y="513" text-anchor="middle">SharedState</text>
+  <text class="s" x="520" y="531" text-anchor="middle">Memory | File | custom</text>
+  <path d="M 470,180 L 470,240 L 180,240 L 180,292" fill="none" stroke="#7c3aed" stroke-width="1.8" marker-end="url(#a-purple)"/>
+  <rect x="300" y="222" width="40" height="16" rx="3" fill="#ffffff" opacity="0.95"/>
+  <text class="al" x="320" y="234" text-anchor="middle">spawn</text>
+  <path d="M 520,180 L 520,292" fill="none" stroke="#7c3aed" stroke-width="1.8" marker-end="url(#a-purple)"/>
+  <path d="M 570,180 L 570,240 L 860,240 L 860,292" fill="none" stroke="#7c3aed" stroke-width="1.8" marker-end="url(#a-purple)"/>
+  <path d="M 412,510 L 180,510 L 180,388" fill="none" stroke="#059669" stroke-width="1.8" marker-end="url(#a-green)"/>
+  <rect x="286" y="492" width="28" height="16" rx="3" fill="#ffffff" opacity="0.95"/>
+  <text class="al" x="300" y="504" text-anchor="middle">get</text>
+  <path d="M 520,380 L 520,462" fill="none" stroke="#059669" stroke-width="1.8" marker-end="url(#a-green)"/>
+  <rect x="506" y="416" width="28" height="16" rx="3" fill="#ffffff" opacity="0.95"/>
+  <text class="al" x="520" y="428" text-anchor="middle">set</text>
+  <path d="M 628,510 L 860,510 L 860,388" fill="none" stroke="#059669" stroke-width="1.8" marker-end="url(#a-green)"/>
+  <rect x="730" y="492" width="28" height="16" rx="3" fill="#ffffff" opacity="0.95"/>
+  <text class="al" x="744" y="504" text-anchor="middle">get</text>
+</svg>

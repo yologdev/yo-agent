@@ -1,3 +1,6 @@
+// Enables the `doc_cfg` feature badges on docs.rs only; a no-op on stable.
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 //! **yoagent** — the agent runtime for Rust.
 //!
 //! A simple, effective agent loop with tool execution and event streaming:
@@ -46,6 +49,8 @@
 //! - **Permissions** ([`ToolMiddleware`]) — async approve/deny/modify hooks
 //!   gating every tool call; the mechanism behind approval prompts and
 //!   policy engines (yoagent ships no policy — you install it).
+//! - **Input filtering** ([`InputFilter`]) — rewrite or reject user input
+//!   before it reaches the model (PII redaction, prompt-injection guards).
 //! - **Sub-agents** ([`SubAgentTool`]) — delegation with per-sub-agent models
 //!   and [`SharedState`] for passing artifacts by reference.
 //! - **GASP** (feature `gasp`) — record runs into a
@@ -60,6 +65,9 @@
 //!   [AgentSkills](https://agentskills.io) standard.
 //! - **Telemetry** — `tracing` spans per loop/LLM-stream/tool with token and
 //!   cost fields; bridge to OpenTelemetry app-side, negligible cost otherwise.
+//! - **Testing** ([`provider::mock::MockProvider`]) — script a whole multi-turn
+//!   tool-calling conversation with no network. It honours the cancellation
+//!   token, so abort and steering paths are testable too.
 //!
 //! The [book](https://yologdev.github.io/yoagent/) covers concepts and
 //! provider-specific guides.
@@ -78,9 +86,11 @@ pub mod tools;
 pub mod types;
 
 #[cfg(feature = "openapi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "openapi")))]
 pub mod openapi;
 
 #[cfg(feature = "gasp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "gasp")))]
 pub mod gasp;
 
 pub use agent::{Agent, AgentBuildError, StructuredPromptError};

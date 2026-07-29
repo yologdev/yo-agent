@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 620" width="980" height="620">
+  <style>
+    text { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Menlo', 'Courier New', monospace; fill: #e2e8f0; }
+    .t  { font-size: 18px; font-weight: 700; }
+    .st { font-size: 12px; fill: #94a3b8; }
+    .n  { font-size: 14px; font-weight: 700; }
+    .s  { font-size: 11px; fill: #94a3b8; }
+    .lg { font-size: 11px; fill: #94a3b8; }
+    .al { font-size: 11px; fill: #94a3b8; }
+  </style>
+  <defs>
+    <linearGradient id="bg" x1="0%%" y1="0%%" x2="100%%" y2="100%%">
+      <stop offset="0%" stop-color="#0f0f1a"/>
+      <stop offset="100%" stop-color="#1a1a2e"/>
+    </linearGradient>
+    <marker id="a-purple" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+      <polygon points="0 0, 9 3.5, 0 7" fill="#a855f7"/>
+    </marker>
+    <marker id="a-orange" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+      <polygon points="0 0, 9 3.5, 0 7" fill="#f97316"/>
+    </marker>
+    <marker id="a-green" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+      <polygon points="0 0, 9 3.5, 0 7" fill="#10b981"/>
+    </marker>
+    <marker id="a-blue" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+      <polygon points="0 0, 9 3.5, 0 7" fill="#3b82f6"/>
+    </marker>
+    <marker id="a-gold" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+      <polygon points="0 0, 9 3.5, 0 7" fill="#eab308"/>
+    </marker>
+    <filter id="glow" x="-30%%" y="-30%%" width="160%%" height="160%%">
+      <feGaussianBlur stdDeviation="4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="980" height="620" fill="url(#bg)"/>
+  <text class="t" x="40" y="46">yoagent — the loop is the product</text>
+  <text class="st" x="40" y="70">agent_loop() is a free function. Agent is the optional stateful wrapper.</text>
+  <rect x="40" y="130" width="120" height="66" rx="6" ry="6" fill="#1e3a5f" stroke="#3b82f6" stroke-width="1.5"/>
+  <text class="n" x="100" y="168" text-anchor="middle">Prompt</text>
+  <rect x="210" y="130" width="150" height="66" rx="6" ry="6" fill="#052e16" stroke="#10b981" stroke-width="1.5"/>
+  <text class="n" x="285" y="161" text-anchor="middle">Context</text>
+  <text class="s" x="285" y="179" text-anchor="middle">compact + track</text>
+  <rect x="410" y="130" width="170" height="66" rx="6" ry="6" fill="#1e1b4b" stroke="#a855f7" stroke-width="1.5" filter="url(#glow)"/>
+  <text class="n" x="495" y="161" text-anchor="middle">LLM Stream</text>
+  <text class="s" x="495" y="179" text-anchor="middle">7 protocols · SSE</text>
+  <rect x="630" y="130" width="140" height="66" rx="6" ry="6" fill="#292524" stroke="#eab308" stroke-width="1.5"/>
+  <text class="n" x="700" y="168" text-anchor="middle">tool calls?</text>
+  <rect x="820" y="130" width="110" height="66" rx="6" ry="6" fill="#052e16" stroke="#10b981" stroke-width="1.5"/>
+  <text class="n" x="875" y="168" text-anchor="middle">Done</text>
+  <rect x="610" y="320" width="180" height="70" rx="6" ry="6" fill="#1c1917" stroke="#f97316" stroke-width="1.5"/>
+  <text class="n" x="700" y="353" text-anchor="middle">ToolMiddleware</text>
+  <text class="s" x="700" y="371" text-anchor="middle">allow · deny · modify</text>
+  <rect x="350" y="320" width="190" height="70" rx="6" ry="6" fill="#1c1917" stroke="#f97316" stroke-width="1.5"/>
+  <text class="n" x="445" y="353" text-anchor="middle">Tool Execution</text>
+  <text class="s" x="445" y="371" text-anchor="middle">parallel by default</text>
+  <rect x="380" y="470" width="190" height="58" rx="6" ry="6" fill="#292524" stroke="#eab308" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <text class="n" x="475" y="497" text-anchor="middle">Steering</text>
+  <text class="s" x="475" y="515" text-anchor="middle">inject mid-run</text>
+  <path d="M 160,163 L 202,163" fill="none" stroke="#3b82f6" stroke-width="1.8" marker-end="url(#a-blue)"/>
+  <path d="M 360,163 L 402,163" fill="none" stroke="#10b981" stroke-width="1.8" marker-end="url(#a-green)"/>
+  <path d="M 580,163 L 622,163" fill="none" stroke="#a855f7" stroke-width="1.8" marker-end="url(#a-purple)"/>
+  <path d="M 770,163 L 812,163" fill="none" stroke="#eab308" stroke-width="1.8" marker-end="url(#a-gold)"/>
+  <rect x="780" y="136" width="22" height="16" rx="3" fill="#0f0f1a" opacity="0.95"/>
+  <text class="al" x="791" y="148" text-anchor="middle">no</text>
+  <path d="M 700,196 L 700,312" fill="none" stroke="#eab308" stroke-width="1.8" marker-end="url(#a-gold)"/>
+  <rect x="686" y="242" width="28" height="16" rx="3" fill="#0f0f1a" opacity="0.95"/>
+  <text class="al" x="700" y="254" text-anchor="middle">yes</text>
+  <path d="M 610,355 L 548,355" fill="none" stroke="#f97316" stroke-width="1.8" marker-end="url(#a-orange)"/>
+  <path d="M 350,355 L 285,355 L 285,204" fill="none" stroke="#a855f7" stroke-width="1.8" marker-end="url(#a-purple)"/>
+  <rect x="259" y="256" width="52" height="16" rx="3" fill="#0f0f1a" opacity="0.95"/>
+  <text class="al" x="285" y="268" text-anchor="middle">results</text>
+  <path d="M 475,470 L 475,398" fill="none" stroke="#eab308" stroke-width="1.8" marker-end="url(#a-gold)"/>
+  <rect x="650" y="446" width="290" height="124" rx="6" ry="6" fill="#0f172a" stroke="#334155" stroke-width="1" stroke-dasharray="4,3"/>
+  <text class="s" x="664" y="468" style="font-weight:700;fill:#e2e8f0">arrows</text>
+  <line x1="664" y1="484" x2="690" y2="484" stroke="#a855f7" stroke-width="2.5" stroke-linecap="round"/>
+  <text class="lg" x="700" y="488">loop back into the model</text>
+  <line x1="664" y1="502" x2="690" y2="502" stroke="#f97316" stroke-width="2.5" stroke-linecap="round"/>
+  <text class="lg" x="700" y="506">tool path, gated per call</text>
+  <line x1="664" y1="520" x2="690" y2="520" stroke="#eab308" stroke-width="2.5" stroke-linecap="round"/>
+  <text class="lg" x="700" y="524">branch / user injection</text>
+  <line x1="664" y1="538" x2="690" y2="538" stroke="#10b981" stroke-width="2.5" stroke-linecap="round"/>
+  <text class="lg" x="700" y="542">context + exit</text>
+</svg>

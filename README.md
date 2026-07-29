@@ -4,168 +4,42 @@
   <img alt="yoagent" src="docs/images/banner.png" width="100%" height="auto">
 </picture>
 
-<a href="https://crates.io/crates/yoagent">crates.io</a> · <a href="https://yologdev.github.io/yoagent/">Docs</a> · <a href="https://github.com/yologdev/yoagent">GitHub</a> · <a href="https://deepwiki.com/yologdev/yoagent">DeepWiki</a> · <a href="https://github.com/yologdev/yoagent/issues">Issues</a> · <a href="https://github.com/yologdev/yoagent/releases">Releases</a>
+<a href="https://crates.io/crates/yoagent">crates.io</a> · <a href="https://yologdev.github.io/yoagent/">Docs</a> · <a href="https://docs.rs/yoagent">API</a> · <a href="https://github.com/yologdev/yoagent">GitHub</a> · <a href="https://deepwiki.com/yologdev/yoagent">DeepWiki</a> · <a href="CHANGELOG.md">Changelog</a>
 
 [![][crates-shield]][crates-link]
+[![][docsrs-shield]][docsrs-link]
 [![][ci-shield]][ci-link]
+[![][msrv-shield]][msrv-link]
 [![][license-shield]][license-link]
-[![][docs-shield]][docs-link]
-[![][last-commit-shield]][last-commit-link]
+
+**The agent loop for Rust.** Stream from any of 7 LLM protocols, run tools, loop until done.
 
 </div>
 
----
-
-## Overview
-
-yoagent is a simple, effective agent loop with tool execution and event streaming in Rust. Inspired by [pi-agent-core](https://github.com/badlogic/pi-mono/tree/main/packages/agent).
-
-The loop is the product. No over-engineered planning/reflection/RAG layers — just:
-
-```
-Prompt → LLM Stream → Tool Execution → Loop if tool calls → Done
-```
-
-Everything is observable via events. Supports 7 API protocols covering 20+ LLM providers out of the box.
-
-## Features
-
-**Agent Loop**
-- Stateful agent with steering (interrupt mid-run) and follow-up (queue work after completion)
-- Full event stream: `AgentStart` → `TurnStart` → `MessageUpdate` (deltas) → `ToolExecution` → `TurnEnd` → `AgentEnd`
-- Parallel tool execution by default — sequential and batched strategies also available
-- Sub-agents via `SubAgentTool` — delegate tasks to child agent loops with their own tools and system prompts
-- Tool middleware — async approve/deny/modify hooks gating every tool call (`with_tool_middleware`), the mechanism for permission prompts and policy engines
-- Structured outputs — `prompt_structured::<T>()` returns typed, schema-validated replies, enforced natively where supported (Anthropic tool-forcing, OpenAI `json_schema`, Gemini `responseSchema`; other protocols log a warning)
-- Real-time event streaming — `prompt()` spawns the loop concurrently and returns events immediately; `prompt_with_sender()` accepts a caller-provided channel for custom consumption
-- Streaming tool output — tools emit real-time progress via `on_update` callback
-- Multimodal support — `Content::Image` flows through tool results across all providers
-- Automatic retry with exponential backoff and jitter for rate limits and network errors
-- Custom message types via `AgentMessage::Extension` — app-specific messages that don't pollute LLM context
-- State persistence — `save_messages()` / `restore_messages()` for pause/resume workflows
-- Session trees — branching history with fork, checkpoints, and JSONL persistence (`Session`); edit an earlier turn and re-run without losing the original branch
-- Lifecycle callbacks — `before_turn`, `after_turn`, `on_error` for observability and control
-- Telemetry — `tracing` spans for the loop, each LLM stream (tokens + cost fields), and each tool execution; bridge to OpenTelemetry via `tracing-opentelemetry`, negligible overhead when no subscriber is installed
-- Full serde support — all core types implement `Serialize`/`Deserialize`/`PartialEq`
-- [AgentSkills](https://agentskills.io)-compatible skills — load skill directories, inject into system prompt, agent activates on demand
-
-**Multi-Provider**
-- 7 API protocols, 20+ providers behind one `StreamProvider` trait
-- One OpenAI-compatible implementation covers OpenAI, xAI, Groq, Cerebras, OpenRouter, Mistral, and more
-- Per-provider quirk flags (`OpenAiCompat`, `AnthropicCompat`) handle auth, reasoning format, and tool handling differences
-- Capability notes: thinking/reasoning controls are wired for **all 7 protocols** — Anthropic (adaptive/budget), OpenAI-compatible where the `ModelConfig` opts in (the `openai()`/`deepseek()`/`meta()` presets do; other compat presets silently drop `thinking_level`), OpenAI Responses & Azure (reasoning effort), Gemini & Vertex (`thinkingConfig` with thought summaries streamed back), Bedrock (Anthropic-style budgets, reasoning deltas streamed back). Client-side prompt-cache breakpoints are Anthropic-specific; most other providers cache server-side automatically, but Bedrock has no automatic caching
-
-**Built-in Tools**
-- `bash` — Shell execution with timeout, output truncation, command deny patterns
-- `read_file` / `write_file` — File I/O with line numbers, path restrictions, auto-mkdir
-- `edit_file` — Surgical search/replace with fuzzy match error hints
-- `list_files` — Directory exploration via `find`
-- `search` — Pattern search via ripgrep/grep with context lines
-
-**Integrations**
-- OpenAPI tool adapter — auto-generate tools from any OpenAPI 3.0 spec (`features = ["openapi"]`)
-- MCP (Model Context Protocol) — connect to MCP tool servers via stdio or HTTP
-- GASP (`features = ["gasp"]`) — record runs into a [GASP](https://github.com/yologdev/gasp) agent repo (append-only semantic event log; restore = clone + replay); yoagent is a **tested** GASP-conformant runtime — the protocol's 7-check conformance suite runs in CI
-
-**Context Management**
-- Context overflow detection across all major providers (Anthropic, OpenAI, Google, Bedrock, xAI, Groq, OpenRouter, llama.cpp, and more)
-- `ContextTracker` — hybrid real-usage + estimation for accurate token tracking
-- Tiered compaction: truncate tool outputs → summarize old turns → drop middle
-- Execution limits (max turns, max tokens, timeout)
-- Building blocks for LLM-based summarization (`replace_messages()`, `compact_messages()`)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/loop.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/images/loop-light.svg">
+  <img alt="The yoagent loop: prompt, LLM stream, tool execution, loop" src="docs/images/loop.svg" width="100%">
+</picture>
 
 ---
 
-## Quick Start
-
-### Install
+## Try it in one command — no API key
 
 ```bash
-cargo add yoagent tokio --features tokio/full
+git clone https://github.com/yologdev/yoagent && cd yoagent
+ollama serve &                                    # any local model works
+cargo run --example cli -- --provider ollama
 ```
 
-Or add to `Cargo.toml`:
-
-```toml
-[dependencies]
-yoagent = "0.14"
-tokio = { version = "1", features = ["full"] }
-```
-
-### Basic Usage
-
-```rust
-use yoagent::agent::Agent;
-use yoagent::provider::ModelConfig;
-use yoagent::types::*;
-
-#[tokio::main]
-async fn main() {
-    // Provider is selected from the config's protocol; the key is read from
-    // ANTHROPIC_API_KEY. Call `.with_api_key(key)` to pass one explicitly.
-    let mut agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"))
-        .with_system_prompt("You are a helpful assistant.");
-
-    let mut rx = agent.prompt("What is Rust's ownership model?").await;
-
-    while let Some(event) = rx.recv().await {
-        match event {
-            AgentEvent::MessageUpdate {
-                delta: StreamDelta::Text { delta }, ..
-            } => print!("{}", delta),
-            AgentEvent::AgentEnd { .. } => break,
-            _ => {}
-        }
-    }
-}
-```
-
-### Skills ([AgentSkills](https://agentskills.io) compatible)
-
-Skills extend the agent with domain expertise. A skill is a directory with a `SKILL.md`:
-
-```
-skills/
-└── git/
-    ├── SKILL.md       # YAML frontmatter + instructions
-    └── scripts/       # Optional resources
-```
-
-```rust
-use yoagent::SkillSet;
-
-let skills = SkillSet::load(&["./skills"])?;
-
-let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"))
-    .with_system_prompt("You are a coding assistant.")
-    .with_skills(skills)   // Injects skill index into system prompt
-    .with_tools(tools);
-```
-
-The agent sees a compact index of available skills. When a task matches, it reads the full SKILL.md using the `read_file` tool — no special infrastructure needed. Skills are cross-compatible with Claude Code, Codex CLI, Gemini CLI, Cursor, and other AgentSkills-compatible agents.
-
-See [docs/concepts/skills.md](docs/concepts/skills.md) for the full guide.
-
-### Interactive CLI (mini coding agent)
-
-```bash
-ANTHROPIC_API_KEY=sk-... cargo run --example cli
-# With skills:
-ANTHROPIC_API_KEY=sk-... cargo run --example cli -- --skills ./skills
-# With Ollama:
-cargo run --example cli -- --provider ollama --model llama3.1:8b
-# With another local server (LM Studio, llama.cpp, vLLM):
-cargo run --example cli -- --api-url http://localhost:1234/v1 --model my-model
-```
-
-A ~250-line interactive coding agent with all built-in tools, skills support, streaming output, and colored tool feedback. Like a baby Claude Code.
+That's a working coding agent in your terminal — file read/write/edit, shell, ripgrep search,
+streaming output, skills. No signup, no key, nothing to configure.
 
 ```
   yoagent cli — mini coding agent
   Type /quit to exit, /clear to reset
 
-  model: claude-sonnet-5
-  skills: 3 loaded
+  model: llama3.1:8b
   cwd:   /home/user/my-project
 
 > find all TODO comments in src/
@@ -180,96 +54,318 @@ Found 3 TODOs:
   tokens: 1250 in / 89 out
 ```
 
-<details>
-<summary>OpenAI-compatible provider example</summary>
+Point it at a hosted model instead by swapping the flag:
 
-```rust
-use yoagent::{Agent, provider::ModelConfig};
-
-// Pick a first-class preset — the provider is inferred from it, and the API
-// key is read from that provider's conventional env var (GROQ_API_KEY here).
-let mut agent = Agent::from_config(ModelConfig::groq("llama-3.3-70b-versatile", "Llama 3.3 70B"));
-
-// Or Qwen / DashScope (DASHSCOPE_API_KEY):
-let mut agent = Agent::from_config(ModelConfig::qwen("qwen3.6-plus", "Qwen 3.6 Plus"));
-
-// Or Google Gemini (GEMINI_API_KEY):
-let mut agent = Agent::from_config(ModelConfig::google("gemini-2.5-pro", "Gemini 2.5 Pro"));
+```bash
+ANTHROPIC_API_KEY=sk-... cargo run --example cli
+GROQ_API_KEY=...        cargo run --example cli -- --provider groq --model llama-3.3-70b-versatile
+cargo run --example cli -- --api-url http://localhost:1234/v1 --model my-model   # LM Studio, llama.cpp, vLLM
 ```
-
-</details>
 
 ---
 
-## Providers
+## Install
+
+```toml
+[dependencies]
+yoagent = "0.14"
+tokio = { version = "1", features = ["full"] }
+```
+
+## Quick start
+
+An agent that actually uses a tool — the thing the crate exists for:
+
+```rust
+use yoagent::provider::ModelConfig;
+use yoagent::{tools, Agent, AgentEvent, StreamDelta};
+
+#[tokio::main]
+async fn main() {
+    // The provider is selected from the config's protocol and the key is read
+    // from ANTHROPIC_API_KEY. Call `.with_api_key(k)` to pass one explicitly.
+    let mut agent = Agent::from_config(ModelConfig::claude_sonnet_5())
+        .with_system_prompt("You are a coding assistant.")
+        .with_tools(tools::default_tools());
+
+    let mut events = agent.prompt("Find every TODO in src/ and summarise them").await;
+
+    while let Some(event) = events.recv().await {
+        match event {
+            AgentEvent::MessageUpdate { delta: StreamDelta::Text { delta }, .. } => print!("{delta}"),
+            AgentEvent::ToolExecutionStart { tool_name, .. } => println!("\n▶ {tool_name}"),
+            AgentEvent::AgentEnd { .. } => break,
+            _ => {}
+        }
+    }
+    agent.finish().await;
+}
+```
+
+Swap the model by swapping the config — the provider follows, and the key is read from that
+provider's conventional env var:
+
+```rust
+Agent::from_config(ModelConfig::groq("llama-3.3-70b-versatile", "Llama 3.3 70B")); // GROQ_API_KEY
+Agent::from_config(ModelConfig::google("gemini-2.5-pro", "Gemini 2.5 Pro"));       // GEMINI_API_KEY
+Agent::from_config(ModelConfig::ollama("http://localhost:11434", "llama3.1:8b"));  // no key
+```
+
+---
+
+## How yoagent differs
+
+yoagent is deliberately narrow. It is the loop, tool execution, and the machinery you need to
+run that loop in production. It ships **no** vector stores, embedding pipelines, or task-graph
+layer — if your problem is retrieval or orchestration, one of these is the better fit:
+
+| If you need | Look at |
+|---|---|
+| RAG pipelines, vector stores, embeddings, transcription and image generation | [`rig`](https://github.com/0xPlaygrounds/rig) — *"Build modular and scalable LLM Applications in Rust"* |
+| Typed task graphs and streaming RAG indexing alongside agents | [`swiftide`](https://github.com/bosun-ai/swiftide) — *"Composable LLM agents and harness, typed task graphs, and streaming RAG pipelines in Rust"* |
+| A tool-calling loop you host, gate, steer, branch, and record | yoagent |
+
+What that focus bought:
+
+- **The loop is a free function.** [`agent_loop()`](src/agent_loop.rs) is stateless and takes
+  everything it needs as arguments. `Agent` is an *optional* wrapper that adds history and queues.
+  You can drive the loop yourself without adopting our state model.
+- **7 native wire protocols**, not one OpenAI-compat shim with adapters bolted on. Anthropic
+  Messages, OpenAI Completions, OpenAI Responses, Azure, Gemini, Vertex, and Bedrock each have a
+  real implementation, so provider-specific features (thinking budgets, prompt-cache breakpoints,
+  reasoning deltas) survive instead of being flattened away.
+- **Every tool call passes one gate.** `ToolMiddleware` can allow, **modify**, or deny each call
+  at a single choke point shared by all execution strategies — the mechanism behind approval
+  prompts and policy engines.
+- **Steer a run that's already going.** Inject guidance mid-flight; it's picked up between tool
+  batches without restarting the turn.
+- **History is a tree, not a list.** [`Session`](src/session.rs) forks, checkpoints, and seeks.
+  Edit an earlier turn and re-run it without destroying the original branch.
+- **Runs are recordable.** With `features = ["gasp"]`, a run becomes an append-only semantic
+  event log in a git repo — restore is clone + replay. Conformance-checked in CI.
+- **The whole loop is testable offline.** `MockProvider` scripts multi-turn tool-calling
+  conversations and honours cancellation, so abort and steering paths are testable with no
+  network. 456 of our 463 tests need no key.
+
+---
+
+## What's in the box
+
+<details open>
+<summary><b>The loop &amp; control</b></summary>
+
+- Full event stream: `AgentStart` → `TurnStart` → `MessageUpdate` (deltas) → `ToolExecution*` → `TurnEnd` → `AgentEnd`
+- Parallel tool execution by default; `Sequential` and `Batched { size }` strategies available
+- **Steering** — interrupt mid-run; **follow-ups** — queue work after completion; both queues are inspectable and editable
+- **`ToolMiddleware`** — async `Allow` / `Modify(args)` / `Deny(reason)` hooks gating every call. A denial becomes an error tool result the model sees, so the loop keeps going
+- **`InputFilter`** — rewrite or reject user input before it reaches the model (PII redaction, prompt-injection guards)
+- Execution limits (max turns, max tokens, wall-clock timeout), `abort()`, and lifecycle callbacks (`before_turn`, `after_turn`, `on_error`)
+- Automatic retry with exponential backoff and ±20% jitter, for rate-limit and network errors only
+
+</details>
+
+<details>
+<summary><b>Providers</b> — 7 protocols, 20+ providers</summary>
 
 | Protocol | Providers |
 |----------|-----------|
 | Anthropic Messages | Anthropic (Claude) |
-| OpenAI Completions | OpenAI, xAI, Groq, Mistral, DeepSeek, MiniMax, Z.ai, Qwen, Meta (Muse Spark), Ollama, local servers, and custom compatible APIs |
-| OpenAI Responses | OpenAI (newer API) |
+| OpenAI Completions | OpenAI, xAI, Groq, Cerebras, OpenRouter, Mistral, DeepSeek, MiniMax, Z.ai, Qwen, Meta (Muse Spark), Ollama, local servers, custom compatible APIs |
+| OpenAI Responses | OpenAI (Responses API) |
 | Azure OpenAI | Azure OpenAI |
 | Google Generative AI | Google Gemini |
 | Google Vertex | Google Vertex AI |
 | Bedrock ConverseStream | Amazon Bedrock |
 
-OpenAI-compatible providers share one implementation with per-provider quirk flags for differences in auth, reasoning format, tool handling, and more. Adding a new compatible provider is just a `ModelConfig` with the right `base_url`.
+`ModelConfig` presets cover the common providers; `ModelConfig::openai_compat(..)` handles anything
+else with a `base_url`. Per-provider quirks (auth style, reasoning format, `max_tokens` field name)
+live in `OpenAiCompat` / `AnthropicCompat` flags — 12 compat profiles ship in the box.
+
+The `opencode_zen(..)` / `opencode_go(..)` gateways pick the wire protocol from the model id
+automatically, so one config reaches models across several vendors.
+
+Thinking/reasoning controls are wired for all 7 protocols. Client-side prompt-cache breakpoints are
+Anthropic-specific; most other providers cache server-side, and Bedrock does not cache automatically.
+Context-overflow detection is centralised across 15+ provider-specific error strings.
+
+</details>
+
+<details>
+<summary><b>Tools</b> — built-in, custom, MCP, OpenAPI</summary>
+
+Built in: `bash` (timeout, deny patterns), `read_file` / `write_file` (line numbers, path
+restrictions), `edit_file` (fuzzy-match hints on failure), `list_files`, `search` (ripgrep).
+Tools return stdout *and* stderr even on failure, so the model can self-correct.
+
+Custom tools implement one trait:
+
+```rust
+#[async_trait::async_trait]
+impl AgentTool for GreetTool {
+    fn name(&self) -> &str { "greet" }
+    fn label(&self) -> &str { "Greet" }
+    fn description(&self) -> &str { "Greets someone" }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": { "name": { "type": "string" } } })
+    }
+    async fn execute(&self, params: serde_json::Value, _ctx: ToolContext)
+        -> Result<ToolResult, ToolError>
+    {
+        let name = params["name"].as_str().unwrap_or("stranger");
+        Ok(ToolResult {
+            content: vec![Content::Text { text: format!("Hello, {name}!") }],
+            details: serde_json::Value::Null,
+        })
+    }
+}
+```
+
+**MCP** — `with_mcp_server_stdio()` / `with_mcp_server_http()` connect to Model Context Protocol
+servers over stdio or Streamable HTTP (session ids, SSE framing, incremental parsing) and register
+their tools transparently.
+
+**OpenAPI** (`features = ["openapi"]`) — point `with_openapi_url()` at a spec and every operation
+becomes a tool, filtered by `OperationFilter`.
+
+</details>
+
+<details>
+<summary><b>Sub-agents &amp; shared state</b></summary>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/subagents.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/images/subagents-light.svg">
+  <img alt="Sub-agents sharing artifacts by reference through SharedState" src="docs/images/subagents.svg" width="100%">
+</picture>
+
+`SubAgentTool` delegates to a child loop with its own model, system prompt, tools, skills,
+middleware, retry policy, and turn limits — a fully independent configuration, not a thin shim.
+Run a cheap model for triage and an expensive one for the hard step in the same session.
+
+`SharedState` is a pluggable key-value store (`MemoryBackend`, `FileBackend`, or your own via the
+`SharedStateBackend` trait). A parent stores a large artifact once and sub-agents read it by key,
+so it never gets re-pasted into every context window. Opt in with `.with_shared_state(state)` —
+it injects the `shared_state` tool and a state summary into the sub-agent's system prompt.
+
+</details>
+
+<details>
+<summary><b>Context, sessions &amp; skills</b></summary>
+
+- **`ContextTracker`** — hybrid real-usage + estimation, calibrated against actual provider usage
+- **Tiered compaction** — truncate tool outputs → summarise old turns → drop middle turns
+- **`Session`** — history as an id/parent tree with `append`, `seek`, `checkpoint`, `branch_tips`, and JSONL persistence. Appending after a seek forks a branch; it never overwrites
+- **Skills** — load [AgentSkills](https://agentskills.io)-standard `SKILL.md` directories. The agent sees a compact index and reads the full skill on demand, so skills stay cross-compatible with Claude Code, Codex CLI, Cursor, and others
+- **Structured outputs** — `prompt_structured::<T>()` returns typed, schema-validated replies, enforced natively where supported (Anthropic tool-forcing, OpenAI `json_schema`, Gemini `responseSchema`)
+
+</details>
+
+<details>
+<summary><b>Production concerns</b></summary>
+
+- **Cost tracking** — `CostConfig` carries separate input/output/cache-read/cache-write rates; `session_cost_usd()` gives a running total, and `is_configured()` distinguishes "free" from "pricing unknown"
+- **Telemetry** — `tracing` spans per loop / LLM stream / tool, recording tokens and cost. OpenTelemetry is bridged app-side via `tracing-opentelemetry`; the library carries no OTel dependency by design
+- **GASP** (`features = ["gasp"]`) — record runs into a [GASP](https://github.com/yologdev/gasp) agent repo; yoagent is a tested-conformant runtime, with the 7-check suite running in CI
+- **Serde throughout** — every core type is `Serialize` / `Deserialize` / `PartialEq`, so sessions persist and replay
+- **`set_model()`** — hot-swap the model mid-session without rebuilding the agent
+
+</details>
 
 ---
 
-## Architecture
+## Examples
 
-```
-yoagent/
-├── src/
-│   ├── types.rs            # Message, AgentMessage, AgentEvent, AgentTool trait
-│   ├── agent_loop.rs       # Core loop (agent_loop + agent_loop_continue)
-│   ├── agent.rs            # Stateful Agent with steering/follow-up queues
-│   ├── context.rs          # Token estimation, smart truncation, execution limits
-│   ├── sub_agent.rs        # SubAgentTool — delegate tasks to child agent loops
-│   ├── tools/
-│   │   ├── bash.rs         # Shell execution (timeout, deny patterns, confirm_fn)
-│   │   ├── file.rs         # Read/write files (line numbers, path restrictions)
-│   │   ├── edit.rs         # Search/replace editing with fuzzy match hints
-│   │   ├── list.rs         # Directory listing via find
-│   │   └── search.rs       # Pattern search via ripgrep/grep
-│   └── provider/
-│       ├── traits.rs           # StreamProvider trait, StreamEvent, ProviderError
-│       ├── model.rs            # ModelConfig, ApiProtocol, OpenAiCompat
-│       ├── registry.rs         # ProviderRegistry — dispatch by protocol
-│       ├── anthropic.rs        # Anthropic Messages API
-│       ├── openai_compat.rs    # OpenAI Chat Completions (15+ providers)
-│       ├── openai_responses.rs # OpenAI Responses API
-│       ├── azure_openai.rs     # Azure OpenAI
-│       ├── google.rs           # Google Generative AI (Gemini)
-│       ├── google_vertex.rs    # Google Vertex AI
-│       ├── bedrock.rs          # Amazon Bedrock (ConverseStream)
-│       ├── sse.rs              # Shared SSE parsing utility
-│       └── mock.rs             # Mock provider for testing
-├── docs/                   # mdBook documentation
-├── examples/               # Usage examples
-└── tests/                  # Integration tests
-```
+Ten runnable examples in [`examples/`](examples/). Five need no API key at all.
+
+| Example | What it shows | Key needed |
+|---|---|---|
+| [`cli`](examples/cli.rs) | A 370-line coding agent — all tools, skills, streaming, colored output. Like a baby Claude Code | optional¹ |
+| [`rlm`](examples/rlm.rs) | An LLM that explores a codebase on its own by spawning sub-agents | yes |
+| [`code_review`](examples/code_review.rs) | Three sub-agents reviewing a diff in parallel, results merged | yes |
+| [`shared_state`](examples/shared_state.rs) | Passing a large artifact between sub-agents by reference | yes |
+| [`sub_agent`](examples/sub_agent.rs) | Delegation basics with a per-sub-agent model | yes |
+| [`basic`](examples/basic.rs) | The smallest possible agent | yes |
+| [`callbacks`](examples/callbacks.rs) | Lifecycle hooks and a custom tool | **no** |
+| [`persistence`](examples/persistence.rs) | Save and restore a session | **no** |
+| [`telemetry`](examples/telemetry.rs) | `tracing` spans with token and cost fields | **no** |
+| [`gasp_emit`](examples/gasp_emit.rs) | Recording a run into a GASP repo | **no** |
+
+¹ `--provider ollama` or `--api-url` needs no key; hosted providers read their conventional env var.
 
 ---
+
+## Testing & CI
+
+`MockProvider` scripts a whole multi-turn tool-calling conversation with no network:
+
+```rust
+use yoagent::provider::mock::{MockProvider, MockResponse, MockToolCall};
+
+let provider = MockProvider::new(vec![
+    MockResponse::ToolCalls(vec![MockToolCall {
+        name: "search".into(),
+        arguments: serde_json::json!({ "pattern": "TODO" }),
+        provider_metadata: None,
+    }]),
+    MockResponse::Text("Found 3 TODOs.".into()),
+]);
+let agent = Agent::from_provider(provider, ModelConfig::mock());
+```
+
+It emits real `StreamEvent`s and honours the `CancellationToken`, so abort and steering paths are
+testable too.
+
+- **463 tests**, of which **456 run with no network and no API keys** — `cargo test --all-features`
+- Provider SSE streams tested at the HTTP level with `wiremock` across 8 suites
+- `clippy --all-targets --all-features` with `-Dwarnings`, `cargo fmt --check`
+- Linux + macOS test matrix, a Windows compile check, a pinned **MSRV 1.86** job, and a GASP conformance job
+
+---
+
+## Module map
+
+| Module | What lives there |
+|---|---|
+| [`agent_loop`](src/agent_loop.rs) | The loop itself — `agent_loop`, `agent_loop_continue`, `AgentLoopConfig`, execution strategies |
+| [`agent`](src/agent.rs) | Optional stateful wrapper — history, tool registry, steering/follow-up queues |
+| [`types`](src/types.rs) | `Message`, `Content`, `AgentEvent`, `AgentTool`, `ToolMiddleware`, `InputFilter` |
+| [`provider/`](src/provider/) | `StreamProvider` trait, `ModelConfig`, registry, and the 7 protocol implementations + `MockProvider` |
+| [`tools/`](src/tools/) | `bash`, `file`, `edit`, `list`, `search`, `shared_state_tool` |
+| [`sub_agent`](src/sub_agent.rs) | `SubAgentTool` — delegation to child loops |
+| [`shared_state`](src/shared_state.rs) | `SharedState` + pluggable backends |
+| [`session`](src/session.rs) | Branching conversation trees with JSONL persistence |
+| [`context`](src/context.rs) | Token tracking, tiered compaction, execution limits |
+| [`skills`](src/skills.rs) | AgentSkills `SKILL.md` loading |
+| [`retry`](src/retry.rs) | Backoff with jitter |
+| [`mcp/`](src/mcp/) | MCP client, stdio + HTTP transports, tool adapter |
+| [`openapi/`](src/openapi/) | OpenAPI 3.0 → tools (feature `openapi`) |
+| [`gasp`](src/gasp.rs) | Run recording into a GASP repo (feature `gasp`) |
+
+---
+
+## Documentation
+
+- **[The book](https://yologdev.github.io/yoagent/)** — concepts, guides, and a page per provider ([source](docs/))
+- **[API reference](https://docs.rs/yoagent)** — built with all features enabled
+- **[CHANGELOG](CHANGELOG.md)** — every release
+- **[CONTRIBUTING](CONTRIBUTING.md)** — how to build, test, and send a PR
+
+MSRV is **1.86**, enforced in CI. Raising it is a minor-version change.
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE).
 
-## Links
-
-- [Documentation](https://yologdev.github.io/yoagent/) — Full reference
-- [pi-agent-core](https://github.com/badlogic/pi-mono/tree/main/packages/agent) — Original inspiration (TypeScript)
+Inspired by [pi-agent-core](https://github.com/badlogic/pi-mono/tree/main/packages/agent) (TypeScript).
 
 <!-- Badge link definitions -->
 [crates-shield]: https://img.shields.io/crates/v/yoagent?labelColor=black&style=flat-square&logo=rust&color=orange
 [crates-link]: https://crates.io/crates/yoagent
+[docsrs-shield]: https://img.shields.io/docsrs/yoagent?labelColor=black&style=flat-square&logo=docsdotrs&label=docs.rs
+[docsrs-link]: https://docs.rs/yoagent
 [ci-shield]: https://img.shields.io/github/actions/workflow/status/yologdev/yoagent/ci.yml?labelColor=black&style=flat-square&logo=github&label=CI
 [ci-link]: https://github.com/yologdev/yoagent/actions/workflows/ci.yml
+[msrv-shield]: https://img.shields.io/badge/MSRV-1.86-blue?labelColor=black&style=flat-square&logo=rust
+[msrv-link]: https://github.com/yologdev/yoagent/blob/main/Cargo.toml
 [license-shield]: https://img.shields.io/badge/license-MIT-white?labelColor=black&style=flat-square
 [license-link]: https://github.com/yologdev/yoagent/blob/main/LICENSE
-[docs-shield]: https://img.shields.io/badge/docs-mdBook-blue?labelColor=black&style=flat-square
-[docs-link]: https://yologdev.github.io/yoagent/
-[last-commit-shield]: https://img.shields.io/github/last-commit/yologdev/yoagent?color=c4f042&labelColor=black&style=flat-square
-[last-commit-link]: https://github.com/yologdev/yoagent/commits/main
