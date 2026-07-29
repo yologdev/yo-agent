@@ -800,6 +800,7 @@ fn unwrap_structured_tool_call(
         provider,
         usage,
         stop_reason,
+        error_message,
         ..
     } = &message
     else {
@@ -834,13 +835,21 @@ fn unwrap_structured_tool_call(
     } else {
         stop_reason.clone()
     };
-    Message::assistant(
+    let rebuilt = Message::assistant(
         new_content,
         new_stop,
         model.clone(),
         provider.clone(),
         usage.clone(),
-    )
+    );
+    // `Message::assistant` nulls `error_message`, so carry it across explicitly.
+    // The stop reason is preserved a few lines up for the same reason; dropping
+    // the explanation with it leaves the caller a bare `Error` and
+    // `StructuredPromptError::Provider { message: "provider error (no detail)" }`.
+    match error_message {
+        Some(msg) => rebuilt.with_error_message(msg.clone()),
+        None => rebuilt,
+    }
 }
 
 async fn execute_tool_calls(

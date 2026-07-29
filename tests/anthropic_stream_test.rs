@@ -486,6 +486,29 @@ async fn malformed_tool_arguments_fail_the_turn_instead_of_defaulting() {
         !format!("{content:?}").contains("__partial_json"),
         "the accumulator sentinel must not escape: {content:?}"
     );
+
+    // Replaced, not removed. Removing would shift `content.len()` out of step
+    // with the provider's block indices, so a later `content_block_start` pads
+    // with duplicate placeholders; it would also erase the turn from the
+    // transcript, since an assistant message with no blocks is dropped whole
+    // from the next request.
+    let Some(Content::Text { text }) = content.first() else {
+        panic!("the dropped tool call must leave a text block behind: {content:?}");
+    };
+    assert!(
+        text.contains("bash"),
+        "the replacement must record which tool was dropped, got: {text}"
+    );
+    assert_eq!(content.len(), 1, "no other blocks expected: {content:?}");
+
+    // The quoted input is what makes the error actionable in a log.
+    assert!(
+        error_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("{not valid json"),
+        "the error must quote the unparseable input, got: {error_message:?}"
+    );
 }
 
 /// Issue #89: `content_block_stop` used to default a missing index to 0, closing
@@ -550,12 +573,39 @@ async fn content_block_stop_without_an_index_does_not_close_block_zero() {
     );
 }
 
-/// Issue #89: an unrecognized `stop_reason` used to be silently reported as a
-/// normal finish. It still maps to `Stop` — that is the safe default — but is
-/// now logged, so a stop reason added by Anthropic later surfaces as a visible
-/// change rather than a silent behavior shift.
+/// Issue #89 follow-up: `end_turn` is what an ordinary completion carries. It
+/// must be matched explicitly — folding it into the unknown-reason arm makes the
+/// "we hit a stop reason we don't handle" warning fire on every healthy turn,
+/// which buries the signal it exists to give.
 #[tokio::test]
-async fn unknown_stop_reason_still_completes_as_a_normal_stop() {
+async fn end_turn_and_stop_sequence_are_recognized_stop_reasons() {
+    for reason in ["end_turn", "stop_sequence"] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(sse_empty_with_stop(reason), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let message = run_stream(stream_config(&server.uri(), None))
+            .await
+            .unwrap_or_else(|e| panic!("[{reason}] stream should succeed: {e}"));
+        let Message::Assistant { stop_reason, .. } = &message else {
+            panic!("[{reason}] expected assistant message");
+        };
+        assert_eq!(*stop_reason, StopReason::Stop, "[{reason}]");
+    }
+}
+
+/// `pause_turn` means the model stopped mid-turn and expects the conversation
+/// to be re-sent to continue — it is a shipped Anthropic stop reason, not a
+/// hypothetical. Reporting it as a normal stop hands back a truncated answer as
+/// though it were complete; this transport cannot resume, so it must say so.
+#[tokio::test]
+async fn pause_turn_is_reported_as_incomplete_rather_than_finished() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/messages"))
@@ -568,10 +618,200 @@ async fn unknown_stop_reason_still_completes_as_a_normal_stop() {
 
     let message = run_stream(stream_config(&server.uri(), None))
         .await
-        .expect("an unknown stop reason must not fail the stream");
+        .expect("stream should succeed");
+    let Message::Assistant {
+        stop_reason,
+        error_message,
+        ..
+    } = &message
+    else {
+        panic!("expected assistant message");
+    };
+    assert_eq!(
+        *stop_reason,
+        StopReason::Error,
+        "a paused turn is not a finished one"
+    );
+    assert!(
+        error_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("pause_turn"),
+        "the error must name the cause, got: {error_message:?}"
+    );
+}
 
+/// A stop reason we genuinely do not recognize still maps to `Stop` — the safe
+/// default — and is logged. Uses a string Anthropic does not define, so this
+/// keeps testing the fallback rather than a value that later gains meaning.
+#[tokio::test]
+async fn unrecognized_stop_reason_falls_back_to_a_normal_stop() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            sse_empty_with_stop("reason_that_does_not_exist"),
+            "text/event-stream",
+        ))
+        .mount(&server)
+        .await;
+
+    let message = run_stream(stream_config(&server.uri(), None))
+        .await
+        .expect("an unrecognized stop reason must not fail the stream");
     let Message::Assistant { stop_reason, .. } = &message else {
         panic!("expected assistant message");
     };
     assert_eq!(*stop_reason, StopReason::Stop);
+}
+
+/// Issue #89 follow-up: a `content_block_stop` that is unusable — not JSON, or
+/// carrying no index — leaves the block holding the streaming accumulator. If
+/// that reaches the caller, the loop executes the tool with
+/// `{"__partial_json": ...}` as its input, and the tool falls back to its
+/// defaults: `list_files` asked for `/etc` lists the process's cwd instead.
+/// That is the wrong-arguments execution this whole fix exists to stop.
+#[tokio::test]
+async fn an_unfinalized_tool_call_never_reaches_the_caller() {
+    for (label, stop_line) in [
+        ("index-less", r#"data: {"type":"content_block_stop"}"#),
+        ("non-JSON body", "data: not-json-at-all"),
+    ] {
+        let server = MockServer::start().await;
+        let body = format!(
+            "event: message_start\n\
+             data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":10,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}}}\n\n\
+             event: content_block_start\n\
+             data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"bash\",\"input\":{{}}}}}}\n\n\
+             event: content_block_delta\n\
+             data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"cmd\\\":\\\"ls\\\"}}\"}}}}\n\n\
+             event: content_block_stop\n\
+             {stop_line}\n\n\
+             event: message_delta\n\
+             data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":9}}}}\n\n\
+             event: message_stop\n\
+             data: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let message = run_stream(stream_config(&server.uri(), None))
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] stream should not error: {e}"));
+        let Message::Assistant {
+            content,
+            stop_reason,
+            ..
+        } = &message
+        else {
+            panic!("[{label}] expected assistant message");
+        };
+        assert!(
+            !format!("{content:?}").contains("__partial_json"),
+            "[{label}] the accumulator escaped as tool arguments: {content:?}"
+        );
+        assert_ne!(
+            *stop_reason,
+            StopReason::ToolUse,
+            "[{label}] an unfinalized tool call must not be presented as runnable"
+        );
+    }
+}
+
+/// Issue #89 follow-up: the malformed block is replaced precisely because a
+/// `tool_use` with no matching `tool_result` is rejected on the next request.
+/// The turn executes nothing, so a *healthy* sibling would never get a
+/// `tool_result` either — leaving it would move the same 400 one turn later.
+#[tokio::test]
+async fn a_healthy_sibling_tool_call_does_not_dangle() {
+    let server = MockServer::start().await;
+    let body = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n\n\
+         event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_0\",\"name\":\"read\",\"input\":{}}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"p\\\":\\\"a\\\"}\"}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+         event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"bash\",\"input\":{}}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{not valid\"}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}\n\n\
+         event: message_stop\n\
+         data: {\"type\":\"message_stop\"}\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let message = run_stream(stream_config(&server.uri(), None))
+        .await
+        .expect("stream should succeed");
+    let Message::Assistant {
+        content,
+        stop_reason,
+        error_message,
+        ..
+    } = &message
+    else {
+        panic!("expected assistant message");
+    };
+    assert_eq!(*stop_reason, StopReason::Error);
+    assert!(error_message.as_deref().unwrap_or("").contains("bash"));
+    assert!(
+        !content
+            .iter()
+            .any(|c| matches!(c, Content::ToolCall { .. })),
+        "no tool_use may survive an errored turn unanswered: {content:?}"
+    );
+}
+
+/// A trailing `message_delta` carrying neither a stop reason nor usage must not
+/// downgrade what an earlier one established. Gateways relaying this protocol
+/// emit such deltas.
+#[tokio::test]
+async fn a_trailing_empty_delta_preserves_stop_reason_and_usage() {
+    let server = MockServer::start().await;
+    let body = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":42}}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{}}\n\n\
+         event: message_stop\n\
+         data: {\"type\":\"message_stop\"}\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let message = run_stream(stream_config(&server.uri(), None))
+        .await
+        .expect("stream should succeed");
+    let Message::Assistant {
+        stop_reason, usage, ..
+    } = &message
+    else {
+        panic!("expected assistant message");
+    };
+    assert_eq!(
+        *stop_reason,
+        StopReason::Refusal,
+        "a trailing delta must not downgrade a terminal stop reason"
+    );
+    assert_eq!(
+        usage.output, 42,
+        "a usage-less trailing delta must not zero the count"
+    );
 }
