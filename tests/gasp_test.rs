@@ -60,6 +60,23 @@ fn tool_then_text_provider() -> MockProvider {
     ])
 }
 
+/// Like `event_kinds`, but tolerant of a file that is still being written:
+/// missing file, or a torn final line, yield what is readable so far. Used by
+/// barriers that poll while the recorder appends.
+fn event_kinds_lenient(repo: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(repo.join("state/events.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .ok()?
+                .get("kind")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 fn event_kinds(repo: &std::path::Path) -> Vec<String> {
     std::fs::read_to_string(repo.join("state/events.jsonl"))
         .expect("events.jsonl exists")
@@ -362,12 +379,31 @@ async fn reopen_after_crash_closes_stale_run_and_records_again() {
     // it — a faithful crash simulation.
     let (tx, handle) = recorder.recording_sender("doomed", None);
     tx.send(AgentEvent::AgentStart).unwrap();
-    while !std::fs::read_to_string(dir.path().join("state/events.jsonl"))
-        .unwrap_or_default()
-        .contains("run.started")
-    {
+
+    // Wait for the run to be *fully* open, not just logged. `record_run_started`
+    // writes the `run.started` event, opens the run marker, and only then
+    // applies the ops that create the run node — a window its own source
+    // comments call out. Aborting on `run.started` alone can land inside it,
+    // leaving a run whose node was never written; the reopen below then fails
+    // with "node not found" instead of exercising the stale-run recovery this
+    // test is about. The node-creating ops arrive as the `state.ops_applied`
+    // event that follows, so that is the barrier.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let kinds = event_kinds_lenient(dir.path());
+        if let Some(started) = kinds.iter().position(|k| k == "run.started") {
+            if kinds[started..].iter().any(|k| k == "state.ops_applied") {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "run never opened fully; saw events: {:?}",
+            event_kinds_lenient(dir.path())
+        );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+
     handle.abort();
     let _ = handle.await;
     drop(tx);
