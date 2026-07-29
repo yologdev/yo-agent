@@ -34,16 +34,20 @@ adheres to [Semantic Versioning](https://semver.org/).
   request clears the dead session and says it expired instead of failing every
   later call with what looks like a bad URL.
 
+  The body is parsed incrementally: a call returns at the blank-line-terminated
+  frame carrying its response rather than at end-of-stream, so a server that
+  holds the POST stream open after answering does not block it, and a long
+  `tools/call` streaming progress frames returns the moment its result lands. A
+  stalled server is bounded by an idle read timeout (120s, reset on every read,
+  so a slow-but-progressing call is never cut off) rather than hanging.
+
   No API-surface changes — `McpTransport` is unchanged, `HttpTransport`'s fields
   were already private, and `McpClient::connect_http` is untouched. Behavior on
   the wire does change: every POST now carries an `Accept` header (plus
-  `Mcp-Session-Id` once assigned), and `close()` went from a pure no-op to a
-  network round-trip.
-
-  The body is parsed incrementally: a call returns at the frame carrying its
-  response rather than at end-of-stream, so a server that holds the POST stream
-  open after answering (which the spec permits) does not block it, and a long
-  `tools/call` streaming progress frames returns the moment its result lands.
+  `Mcp-Session-Id` once assigned), `close()` went from a pure no-op to a network
+  round-trip, and returning mid-body means an SSE response forgoes connection
+  reuse unless the server had already closed the body — a fresh connection, and
+  TLS handshake, on the next call to such a server.
 
   Not covered: the `GET` server→client stream and `Last-Event-ID` resumability.
   `McpTransport` is `send`/`close` only, so a server-initiated message has

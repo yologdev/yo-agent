@@ -99,6 +99,80 @@ async fn sse_framed_response_parses() {
     assert!(response.result.unwrap()["tools"].is_array());
 }
 
+/// A UTF-8 BOM is legal at the head of a JSON document and .NET/JVM servers
+/// emit one. `Response::text()` sniffed it away; reading the body as bytes does
+/// not, and `trim()` will not remove it either — U+FEFF stopped being
+/// White_Space in Unicode 4.0 — so it breaks the parse and the error names a
+/// body that visibly contains the response.
+#[tokio::test]
+async fn bom_prefixed_plain_json_body_still_parses() {
+    let server = MockServer::start().await;
+    let request = JsonRpcRequest::new("ping", None);
+    mount_body(
+        &server,
+        format!(
+            "\u{feff}{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"ok\":true}}}}",
+            request.id
+        ),
+        "application/json",
+    )
+    .await;
+
+    let transport = HttpTransport::new(&server.uri()).unwrap();
+    let response = transport
+        .send(request)
+        .await
+        .expect("a BOM must not hide the response");
+    assert_eq!(response.result.unwrap()["ok"], true);
+}
+
+/// A declared non-UTF-8 charset must fail loudly. Reading the body as bytes
+/// gives up the transcoding `Response::text()` did, and decoding such a body as
+/// UTF-8 anyway would return silently mangled tool output as a success.
+#[tokio::test]
+async fn non_utf8_charset_is_refused_rather_than_mangled() {
+    let server = MockServer::start().await;
+    let request = JsonRpcRequest::new("ping", None);
+    mount_body(
+        &server,
+        format!(r#"{{"jsonrpc":"2.0","id":{},"result":{{}}}}"#, request.id),
+        "application/json; charset=iso-8859-1",
+    )
+    .await;
+
+    let transport = HttpTransport::new(&server.uri()).unwrap();
+    let err = transport
+        .send(request)
+        .await
+        .expect_err("a non-UTF-8 charset must not be silently decoded as UTF-8");
+    assert!(err.to_string().contains("charset"), "got: {err}");
+}
+
+/// The one shape only the `method` check rejects: a malformed frame carrying
+/// both a `method` and a `result`. Without this, that check is unkillable by
+/// the suite and a maintainer doing dead-code cleanup would delete it green.
+#[tokio::test]
+async fn frame_with_both_method_and_result_is_not_the_response() {
+    let server = MockServer::start().await;
+    let request = JsonRpcRequest::new("tools/list", None);
+    let body = format!(
+        concat!(
+            "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"notifications/progress\",\"result\":{{\"bogus\":true}}}}\n\n",
+            "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"real\":true}}}}\n\n"
+        ),
+        id = request.id
+    );
+    mount_body(&server, body, "text/event-stream").await;
+
+    let transport = HttpTransport::new(&server.uri()).unwrap();
+    let response = transport.send(request).await.expect("send");
+
+    assert_eq!(
+        response.result.expect("the well-formed response must win")["real"],
+        true
+    );
+}
+
 /// Frames that aren't JSON-RPC at all — comments, `event:`/`id:` lines, foreign
 /// payloads — must be skipped.
 #[tokio::test]

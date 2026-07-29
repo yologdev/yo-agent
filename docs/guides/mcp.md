@@ -60,7 +60,7 @@ let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Claude
 
 `HttpTransport` handles both the plain JSON-RPC-over-POST shape and the
 **request/response subset of Streamable HTTP** — servers that answer a POST with
-an SSE-framed response and then close the stream:
+an SSE-framed response, whether or not they then close the stream:
 
 - Responses framed as `text/event-stream` are parsed out of their SSE frames,
   joining each event's `data:` lines as the SSE spec requires.
@@ -79,19 +79,25 @@ an SSE-framed response and then close the stream:
   acknowledged — is a success, not a parse failure. Any *other* empty 2xx is
   reported as an error, since it usually means a proxy answered instead of the
   MCP server.
-
-- The body is parsed incrementally, so a call returns at the frame carrying its
-  response rather than at end-of-stream. A server that holds the POST stream
-  open after answering — which Streamable HTTP permits — does not block it.
+- The body is parsed incrementally, so a call returns at the blank-line-terminated
+  frame carrying its response rather than at end-of-stream. A server that holds
+  the POST stream open after answering does not block it. Two trade-offs come
+  with that: returning mid-body forgoes connection reuse (a fresh connection,
+  and TLS handshake, on the next call to such a server), and a plain JSON-RPC
+  body has no frames to return early at, so it is read to the end as before.
+- A stalled server — one that accepts the POST then sends nothing — is bounded
+  by an idle read timeout (120s) rather than hanging. The timer resets on every
+  read, so a long `tools/call` streaming progress frames is never cut off.
 
 **Not supported:** the `GET` server→client stream and `Last-Event-ID`
 resumability. `McpTransport` is `send`/`close` only, with nowhere to deliver a
 server-initiated message — supporting them would mean growing the trait an
 inbound channel. Notifications arriving on the POST stream *before* the response
 are read and skipped; any that trail it are not, since the call has already
-returned. Note also that the handshake still negotiates
-`protocolVersion: 2024-11-05` (the revision predating Streamable HTTP), which
-servers generally accept.
+returned — so a server that blocks awaiting a reply to a `sampling/createMessage`
+it sent on this stream will time out rather than be answered. Note also that the
+handshake still negotiates `protocolVersion: 2024-11-05` (the revision predating
+Streamable HTTP), which servers generally accept.
 
 `McpClient::close()` is what sends the `DELETE`. `Agent::with_mcp_server_http`
 does not call it, so sessions opened that way are released by the server's own
