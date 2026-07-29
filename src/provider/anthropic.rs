@@ -12,6 +12,69 @@ use tracing::{debug, warn};
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
 
+/// Trim a model-supplied string for inclusion in an error or log line.
+///
+/// The accumulator can be a whole `max_tokens` worth of JSON — a truncated file
+/// write or a base64 blob. That string reaches `on_error`, the assistant
+/// message, session JSONL, and (via `SubAgentTool`) the parent model's context,
+/// so quoting it whole floods every one of them.
+fn truncate_for_error(s: &str) -> String {
+    const MAX: usize = 200;
+    if s.chars().count() <= MAX {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(MAX).collect();
+    format!("{head}\u{2026} ({} bytes total)", s.len())
+}
+
+/// Map an Anthropic `stop_reason` onto [`StopReason`], recording a diagnosis for
+/// the terminal ones that carry one.
+///
+/// Every documented value is listed explicitly. A catch-all that silently means
+/// "finished normally" is how `end_turn` — the ordinary completion — would land
+/// in the unknown arm and warn on every healthy turn, and how a resumable state
+/// would be handed back as a finished answer.
+fn map_stop_reason(reason: &str, error_message: &mut Option<String>) -> StopReason {
+    match reason {
+        "end_turn" | "stop_sequence" => StopReason::Stop,
+        "tool_use" => StopReason::ToolUse,
+        "max_tokens" => StopReason::Length,
+        "model_context_window_exceeded" => {
+            // In-stream overflow (HTTP 200). Map to the same Error +
+            // overflow-phrase shape as an HTTP 400 overflow so
+            // `Message::is_context_overflow()` and compaction-retry hooks keep
+            // working.
+            warn!("Anthropic context window exceeded mid-stream");
+            *error_message = Some("model_context_window_exceeded".into());
+            StopReason::Error
+        }
+        "refusal" => {
+            warn!("Anthropic declined the request (stop_reason=refusal)");
+            *error_message =
+                Some("Request declined by the model's safety system (stop_reason: refusal)".into());
+            StopReason::Refusal
+        }
+        "pause_turn" => {
+            // The model paused mid-turn and expects the conversation to be
+            // re-sent to continue — emitted when a server-side tool loop hits
+            // its iteration limit. There is no resume path here, so reporting
+            // it as a normal stop would hand back a truncated answer as though
+            // it were complete.
+            warn!("Anthropic paused the turn (stop_reason=pause_turn); response is incomplete");
+            *error_message = Some(
+                "Anthropic paused the turn (stop_reason: pause_turn); the response is \
+                 incomplete and must be resumed by re-sending the conversation"
+                    .into(),
+            );
+            StopReason::Error
+        }
+        other => {
+            warn!("unrecognized Anthropic stop_reason '{other}'; treating it as a normal stop");
+            StopReason::Stop
+        }
+    }
+}
+
 /// Resolve the request URL: `{base_url}/messages` when a `ModelConfig` is set
 /// (e.g. a gateway like OpenCode Zen), the official endpoint otherwise.
 fn request_url(config: &StreamConfig) -> String {
@@ -215,27 +278,54 @@ impl StreamProvider for AnthropicProvider {
                                         }
                                     }
                                 }
-                                "content_block_stop" => {
-                                    if let Ok(data) = serde_json::from_str::<serde_json::Value>(&msg.data) {
-                                        let idx = data["index"].as_u64().unwrap_or(0) as usize;
-                                        // Parse accumulated JSON for tool calls
-                                        if let Some(Content::ToolCall { ref mut arguments, .. }) = content.get_mut(idx) {
-                                            if let Some(partial) = arguments.as_object()
-                                                .and_then(|o| o.get("__partial_json"))
-                                                .and_then(|v| v.as_str())
-                                                .map(|s| s.to_string())
-                                            {
-                                                if let Ok(parsed) = serde_json::from_str(&partial) {
-                                                    *arguments = parsed;
-                                                } else {
-                                                    warn!("Failed to parse tool call JSON: {}", partial);
-                                                    *arguments = serde_json::Value::Object(Default::default());
+                                "content_block_stop" => match serde_json::from_str::<serde_json::Value>(&msg.data) {
+                                    // Skipping this silently would leave a tool
+                                    // call's accumulator unparsed *and* never emit
+                                    // ToolCallEnd, so a UI tracking the call's
+                                    // lifecycle hangs it open forever.
+                                    Err(e) => warn!(
+                                        "content_block_stop body is not JSON ({e}); \
+                                         any tool call it closes is left unfinalized: {}",
+                                        msg.data
+                                    ),
+                                    Ok(data) => match data["index"].as_u64() {
+                                        // Defaulting to 0 would close the wrong
+                                        // block: block 0 gets block N's arguments
+                                        // and block N keeps its raw accumulator.
+                                        None => warn!(
+                                            "content_block_stop without a numeric index; \
+                                             refusing to guess which block it closes: {}",
+                                            msg.data
+                                        ),
+                                        Some(idx) => {
+                                            let idx = idx as usize;
+                                            // A block whose accumulator does not
+                                            // parse is left carrying it. The sweep
+                                            // after the loop is what fails the
+                                            // turn — doing it here would miss the
+                                            // blocks this arm never reaches (a
+                                            // non-JSON stop event, or one with no
+                                            // index), which leak the same way.
+                                            if let Some(Content::ToolCall { name, arguments, .. }) = content.get_mut(idx) {
+                                                if let Some(partial) = arguments.as_object()
+                                                    .and_then(|o| o.get("__partial_json"))
+                                                    .and_then(|v| v.as_str())
+                                                    .map(|s| s.to_string())
+                                                {
+                                                    match serde_json::from_str(&partial) {
+                                                        Ok(parsed) => *arguments = parsed,
+                                                        Err(e) => warn!(
+                                                            "tool call `{}` has malformed JSON arguments ({e}): {}",
+                                                            name,
+                                                            truncate_for_error(&partial)
+                                                        ),
+                                                    }
                                                 }
                                             }
+                                            let _ = tx.send(StreamEvent::ToolCallEnd { content_index: idx });
                                         }
-                                        let _ = tx.send(StreamEvent::ToolCallEnd { content_index: idx });
-                                    }
-                                }
+                                    },
+                                },
                                 "message_delta" => {
                                     if let Ok(data) = serde_json::from_str::<AnthropicMessageDelta>(&msg.data) {
                                         // Only a delta that actually carried a
@@ -243,34 +333,25 @@ impl StreamProvider for AnthropicProvider {
                                         // is finished. An intermediate delta (usage
                                         // update, empty `delta`) parses fine and
                                         // must NOT arm the clean-EOF guard.
-                                        saw_stop_reason |= data.delta.stop_reason.is_some();
-                                        stop_reason = match data.delta.stop_reason.as_deref() {
-                                            Some("tool_use") => StopReason::ToolUse,
-                                            Some("max_tokens") => StopReason::Length,
-                                            Some("model_context_window_exceeded") => {
-                                                // In-stream overflow (HTTP 200). Map to the same
-                                                // Error + overflow-phrase shape as an HTTP 400
-                                                // overflow so Message::is_context_overflow() and
-                                                // compaction-retry hooks keep working.
-                                                warn!("Anthropic context window exceeded mid-stream");
-                                                error_message =
-                                                    Some("model_context_window_exceeded".into());
-                                                StopReason::Error
-                                            }
-                                            Some("refusal") => {
-                                                warn!(
-                                                    "Anthropic declined the request (stop_reason=refusal)"
-                                                );
-                                                error_message = Some(
-                                                    "Request declined by the model's safety system \
-                                                     (stop_reason: refusal)"
-                                                        .into(),
-                                                );
-                                                StopReason::Refusal
-                                            }
-                                            _ => StopReason::Stop,
-                                        };
-                                        usage.output = data.usage.output_tokens;
+                                        // A delta with no stop_reason leaves the
+                                        // current one alone — overwriting it would
+                                        // clobber a terminal reason an earlier
+                                        // delta already set. Only a delta that
+                                        // actually carried one proves the response
+                                        // is finished, so only that arms the
+                                        // clean-EOF guard.
+                                        if let Some(reason) = data.delta.stop_reason.as_deref() {
+                                            saw_stop_reason = true;
+                                            stop_reason =
+                                                map_stop_reason(reason, &mut error_message);
+                                        }
+                                        // A usage-less delta must not zero a real
+                                        // count: `AnthropicUsage` defaults every
+                                        // field, so an absent block would otherwise
+                                        // overwrite the output tokens with 0.
+                                        if let Some(delta_usage) = data.usage {
+                                            usage.output = delta_usage.output_tokens;
+                                        }
                                     }
                                 }
                                 "message_stop" => break,
@@ -327,6 +408,63 @@ impl StreamProvider for AnthropicProvider {
         let has_tool_calls = content
             .iter()
             .any(|c| matches!(c, Content::ToolCall { .. }));
+        // Invariant: no tool call leaves this provider still carrying the
+        // streaming accumulator. `content_block_stop` is what turns
+        // `__partial_json` into real arguments; if it never arrived, or arrived
+        // unusable (not JSON, no index, or holding JSON that does not parse),
+        // the sentinel is still there — and a tool handed
+        // `{"__partial_json": ...}` runs on its defaults instead of what the
+        // model asked for. One sweep covers every route to that state.
+        let unusable: Vec<(String, String)> = content
+            .iter()
+            .filter_map(|c| match c {
+                Content::ToolCall {
+                    name, arguments, ..
+                } => arguments
+                    .get("__partial_json")
+                    .and_then(|v| v.as_str())
+                    .map(|partial| (name.clone(), partial.to_string())),
+                _ => None,
+            })
+            .collect();
+
+        if !unusable.is_empty() {
+            let detail = unusable
+                .iter()
+                .map(|(name, partial)| format!("`{name}` ({})", truncate_for_error(partial)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let note = format!("tool call(s) with unusable arguments, not executed: {detail}");
+            // Append rather than replace: a refusal or an overflow reported by
+            // `message_delta` carries its own diagnosis, and the overflow phrase
+            // is what `Message::is_context_overflow()` matches on.
+            error_message = Some(match error_message.take() {
+                Some(existing) => format!("{existing}; {note}"),
+                None => note,
+            });
+            // A refusal is the more specific verdict and nothing can execute
+            // once the calls are gone, so leave it standing.
+            if stop_reason != StopReason::Refusal {
+                stop_reason = StopReason::Error;
+            }
+            // Every tool call goes, not just the unusable one. The turn executes
+            // none of them, so any that survived would return to the API as a
+            // `tool_use` with no `tool_result` and be rejected on the *next*
+            // request — breaking the conversation rather than just this turn.
+            // Replacing in place keeps `content.len()` aligned with the
+            // provider's block indices.
+            for block in content.iter_mut() {
+                if let Content::ToolCall { name, .. } = block {
+                    let name = name.clone();
+                    *block = Content::Text {
+                        text: format!(
+                            "[tool call `{name}` not executed: the turn failed on unusable tool arguments]"
+                        ),
+                    };
+                }
+            }
+        }
+
         // Never let the tool-call fallback mask a refusal or an error signal.
         if has_tool_calls && !matches!(stop_reason, StopReason::Refusal | StopReason::Error) {
             stop_reason = StopReason::ToolUse;
@@ -711,8 +849,11 @@ struct AnthropicMessageDelta {
     // Gateways relaying this protocol sometimes omit `usage` on message_delta.
     // Without the default the whole event fails to parse, silently dropping the
     // stop_reason it carried (downgrading tool_use/max_tokens/refusal to Stop).
+    // `Option` rather than a defaulted struct so an absent block is
+    // distinguishable from a reported zero — otherwise a trailing usage-less
+    // delta overwrites a real output count with 0.
     #[serde(default)]
-    usage: AnthropicUsage,
+    usage: Option<AnthropicUsage>,
 }
 
 #[derive(Deserialize)]

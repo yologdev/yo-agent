@@ -4,6 +4,58 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- **Tool calls with unusable arguments are surfaced instead of executed**
+  (#89, Anthropic provider). `content_block_stop` is what turns a tool call's
+  streamed `input_json_delta` accumulator into real arguments. When it did not
+  — the accumulated text was not valid JSON — the provider substituted an empty
+  object and carried on, so the tool executed with default arguments while
+  neither the caller nor the model learned the model's actual input had been
+  dropped. `list_files` asked for `/etc` would list the process's working
+  directory instead.
+
+  A single check after the stream now fails the turn if *any* tool call still
+  carries the accumulator, whichever route left it there: unparseable JSON, a
+  `content_block_stop` whose body is not JSON, or one with no `index` (which no
+  longer silently closes block 0 — a block the event was never about). The error
+  names each tool and quotes its input, truncated, since the accumulator can be
+  a whole `max_tokens` worth of JSON and it reaches logs, session files, and —
+  through `SubAgentTool` — the parent model's context.
+
+  `agent_loop` returns on `StopReason::Error` before extracting tool calls, so
+  nothing runs. *Every* tool call in the message is replaced with text, not just
+  the unusable one: the turn executes none of them, so any left behind would
+  return to the API as a `tool_use` with no `tool_result` and be rejected on the
+  next request — breaking the conversation rather than just the turn. Replacing
+  in place keeps `content.len()` aligned with the provider's block indices.
+
+  A refusal reported in the same response keeps its `Refusal` stop reason and
+  its explanation; the tool-argument note is appended rather than substituted,
+  so an in-stream context overflow still matches `Message::is_context_overflow()`
+  and its compaction-retry hook.
+
+### Fixed
+
+- **`end_turn` and `stop_sequence` are recognized stop reasons** (Anthropic).
+  They previously fell through to the catch-all. Harmless until the catch-all
+  gained a warning — at which point every healthy turn logged one.
+- **`pause_turn` is reported as incomplete rather than finished** (Anthropic).
+  It means the model stopped mid-turn and expects the conversation to be re-sent
+  to continue; mapping it to a normal stop handed back a truncated answer as
+  though it were complete. This transport cannot resume, so it now says so.
+- **A trailing `message_delta` no longer zeroes the output token count**
+  (Anthropic). `usage` is optional on the wire, and a defaulted struct made an
+  absent block indistinguishable from a reported zero, wiping cost accounting
+  and `ContextTracker` calibration for the turn. Such a delta already no longer
+  overwrites a stop reason an earlier one established.
+- **Structured-output responses keep their error message** (`agent_loop`). The
+  rebuild that unwraps a forced tool call preserved the stop reason but dropped
+  the explanation, so a failed structured call surfaced as
+  `"provider error (no detail)"`.
+
 ## 0.14.0
 
 ### Added
