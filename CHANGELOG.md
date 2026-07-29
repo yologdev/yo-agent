@@ -4,7 +4,7 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 0.14.1
 
 ### Fixed
 
@@ -36,8 +36,6 @@ adheres to [Semantic Versioning](https://semver.org/).
   its explanation; the tool-argument note is appended rather than substituted,
   so an in-stream context overflow still matches `Message::is_context_overflow()`
   and its compaction-retry hook.
-
-### Fixed
 
 - **`end_turn` and `stop_sequence` are recognized stop reasons** (Anthropic).
   They previously fell through to the catch-all. Harmless until the catch-all
