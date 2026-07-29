@@ -149,6 +149,24 @@ What that focus bought:
 
 ---
 
+## Built with yoagent
+
+**[yoyo-evolve](https://github.com/yologdev/yoyo-evolve)** [![][yoyo-stars]][yoyo-link] — a coding
+agent that evolves its own source in public. It began as 200 lines of Rust; every commit since has
+been agent-written and gated on tests. It runs on this loop with the `openapi` feature enabled.
+
+Also built on yoagent:
+
+| Project | What it is |
+|---|---|
+| [`rab`](https://github.com/markokocic/rab) | A lightweight, extensible Rust coding agent |
+| [`greatsage`](https://github.com/rick68/greatsage) | "Rimuru's Unique Skill, you know the one" |
+| [`yoclaw`](https://github.com/yologdev/yoclaw) | OpenClaw reborn in Rust — a single-binary agent that remembers you |
+
+Built something on yoagent? [Open a PR](CONTRIBUTING.md) and add it here — we'd like to see it.
+
+---
+
 ## What's in the box
 
 <details open>
@@ -369,3 +387,5 @@ Inspired by [pi-agent-core](https://github.com/badlogic/pi-mono/tree/main/packag
 [msrv-link]: https://github.com/yologdev/yoagent/blob/main/Cargo.toml
 [license-shield]: https://img.shields.io/badge/license-MIT-white?labelColor=black&style=flat-square
 [license-link]: https://github.com/yologdev/yoagent/blob/main/LICENSE
+[yoyo-stars]: https://img.shields.io/github/stars/yologdev/yoyo-evolve?labelColor=black&style=flat-square&color=c4f042
+[yoyo-link]: https://github.com/yologdev/yoyo-evolve

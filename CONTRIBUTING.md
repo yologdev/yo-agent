@@ -69,6 +69,13 @@ alongside the existing ones in `tests/*_stream_test.rs`.
 If a provider reports context overflow with a new error string, add it to `OVERFLOW_PHRASES` in
 `src/provider/traits.rs` — that list is the single place overflow is detected.
 
+## Adding your project to the README
+
+If you've built something on yoagent, open a PR adding a row to the **Built with yoagent** table in
+[README.md](README.md) — project link and one line on what it is. It doesn't need to be big or
+finished. Seeing what people build with the loop is genuinely useful for deciding what to work on
+next.
+
 ## Reporting bugs
 
 Provider-specific issues are the most common kind, so please include the protocol and provider

@@ -46,6 +46,9 @@ adheres to [Semantic Versioning](https://semver.org/).
   and a pull request template — the repository previously had none.
 - Loop and sub-agent/shared-state diagrams in `docs/images/`, with light and
   dark variants.
+- A **Built with yoagent** section listing the projects that depend on the
+  crate, headed by [yoyo-evolve](https://github.com/yologdev/yoyo-evolve), plus
+  an invitation to add your own.
 
 ## 0.14.1
 
