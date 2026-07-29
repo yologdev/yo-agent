@@ -13,7 +13,7 @@ runtime). The bridge is a consumer of the [`AgentEvent`] stream — **zero
 agent-loop changes**:
 
 ```toml
-yoagent = { version = "0.12", features = ["gasp"] }
+yoagent = { version = "0.14", features = ["gasp"] }
 ```
 
 

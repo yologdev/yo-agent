@@ -51,12 +51,44 @@ needed.
 
 Thinking content is streamed as `Content::Thinking` with a cryptographic `signature` for verification.
 
-### Refusals
+### Stop Reasons
 
-Models with safety classifiers (e.g. Claude Fable 5) can decline a request
-with `stop_reason: "refusal"`. The provider maps this to `StopReason::Refusal`;
-the agent loop stops the turn like a normal `Stop`, and callers can match on
-the variant to retry on a fallback model.
+Every documented Anthropic `stop_reason` maps explicitly:
+
+| Wire value | `StopReason` | Notes |
+|---|---|---|
+| `end_turn`, `stop_sequence` | `Stop` | |
+| `tool_use` | `ToolUse` | |
+| `max_tokens` | `Length` | |
+| `refusal` | `Refusal` | Sets `error_message`; see below |
+| `model_context_window_exceeded` | `Error` | In-stream overflow; keeps the phrase `Message::is_context_overflow()` matches, so compaction-retry hooks still fire |
+| `pause_turn` | `Error` | The model stopped mid-turn expecting the conversation to be re-sent. This transport cannot resume, so reporting it as a normal stop would return a truncated answer as though it were complete |
+
+Anything unrecognized maps to `Stop` and is logged at `warn`, so a stop reason
+added by Anthropic later is visible rather than silently treated as a finish.
+
+**Refusals.** Models with safety classifiers (e.g. Claude Fable 5) can decline a
+request with `stop_reason: "refusal"`. The agent loop stops the turn like a
+normal `Stop`, and callers can match on the variant to retry on a fallback model.
+
+### Tool Calls With Unusable Arguments
+
+A tool call's arguments arrive as `input_json_delta` fragments and are assembled
+at `content_block_stop`. When that assembly cannot happen — the accumulated text
+is not valid JSON, or the `content_block_stop` event itself is unusable — the
+turn fails with `StopReason::Error` and an `error_message` naming each affected
+tool and quoting its input.
+
+This matters because the alternative is silent: a tool executed with empty
+arguments falls back to its defaults, so `list_files` asked for `/etc` would
+list the working directory instead, with nothing in the response indicating the
+model's actual input was dropped.
+
+`agent_loop` returns on `StopReason::Error` before extracting tool calls, so
+nothing executes. Every tool call in the message is replaced with a text block —
+not just the unusable one — because the turn runs none of them, and a `tool_use`
+block with no matching `tool_result` is rejected by the API on the *next*
+request.
 
 ### Cache Control
 
