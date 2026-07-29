@@ -4,6 +4,38 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- **Malformed tool-call JSON is surfaced instead of silently discarded**
+  (#89, Anthropic provider). When a tool call's streamed `input_json_delta`
+  did not assemble into valid JSON, the provider replaced the arguments with an
+  empty object and carried on — so the tool executed with default arguments,
+  and neither the caller nor the model learned that the model's actual input had
+  been dropped. This is on the happy path for yoagent's own configuration, which
+  sends the `fine-grained-tool-streaming` beta that Anthropic documents as able
+  to emit incomplete tool JSON when a response hits `max_tokens`.
+
+  The turn now fails with an `error_message` naming the tool and quoting the
+  unparseable input. The agent loop returns on `StopReason::Error` before it
+  extracts tool calls, so nothing executes. The unusable `tool_use` block is
+  replaced with text rather than left in place: a `tool_use` with no matching
+  `tool_result` is rejected by the API on the *next* request, so leaving it would
+  break the conversation rather than just the turn.
+
+  Two adjacent silent paths in the same event went with it. A
+  `content_block_stop` whose body is not JSON is now logged instead of skipped
+  in silence (it leaves a tool call unfinalized *and* emits no `ToolCallEnd`, so
+  a UI tracking the call's lifecycle hangs it open). And one with a missing or
+  non-numeric `index` no longer defaults to block 0 — closing a block the event
+  was never about, which could parse a half-written accumulator and fail an
+  otherwise healthy turn.
+- **An unrecognized Anthropic `stop_reason` is logged** rather than quietly
+  treated as a normal finish, so a stop reason added later surfaces as a visible
+  change. It still maps to `Stop`. A `message_delta` carrying no `stop_reason`
+  also no longer overwrites one an earlier delta had set.
+
 ## 0.14.0
 
 ### Added

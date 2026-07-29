@@ -113,6 +113,10 @@ impl StreamProvider for AnthropicProvider {
         // delta without a stop_reason: that proves nothing about completeness.
         let mut saw_stop_reason = false;
         let mut error_message: Option<String> = None;
+        // A tool call whose arguments could not be parsed. Tracked separately
+        // because `message_delta` arrives *after* `content_block_stop` and would
+        // otherwise overwrite the error with its own `tool_use` stop reason.
+        let mut dropped_malformed_tool_call = false;
 
         let _ = tx.send(StreamEvent::Start);
 
@@ -215,27 +219,81 @@ impl StreamProvider for AnthropicProvider {
                                         }
                                     }
                                 }
-                                "content_block_stop" => {
-                                    if let Ok(data) = serde_json::from_str::<serde_json::Value>(&msg.data) {
-                                        let idx = data["index"].as_u64().unwrap_or(0) as usize;
-                                        // Parse accumulated JSON for tool calls
-                                        if let Some(Content::ToolCall { ref mut arguments, .. }) = content.get_mut(idx) {
-                                            if let Some(partial) = arguments.as_object()
-                                                .and_then(|o| o.get("__partial_json"))
-                                                .and_then(|v| v.as_str())
-                                                .map(|s| s.to_string())
-                                            {
-                                                if let Ok(parsed) = serde_json::from_str(&partial) {
-                                                    *arguments = parsed;
-                                                } else {
-                                                    warn!("Failed to parse tool call JSON: {}", partial);
-                                                    *arguments = serde_json::Value::Object(Default::default());
+                                "content_block_stop" => match serde_json::from_str::<serde_json::Value>(&msg.data) {
+                                    // Skipping this silently would leave a tool
+                                    // call's accumulator unparsed *and* never emit
+                                    // ToolCallEnd, so a UI tracking the call's
+                                    // lifecycle hangs it open forever.
+                                    Err(e) => warn!(
+                                        "content_block_stop body is not JSON ({e}); \
+                                         any tool call it closes is left unfinalized: {}",
+                                        msg.data
+                                    ),
+                                    Ok(data) => match data["index"].as_u64() {
+                                        // Defaulting to 0 would close the wrong
+                                        // block: block 0 gets block N's arguments
+                                        // and block N keeps its raw accumulator.
+                                        None => warn!(
+                                            "content_block_stop without a numeric index; \
+                                             refusing to guess which block it closes: {}",
+                                            msg.data
+                                        ),
+                                        Some(idx) => {
+                                            let idx = idx as usize;
+                                            // Deferred so the mutable borrow of
+                                            // `content` ends before we replace the
+                                            // block below.
+                                            let mut malformed: Option<(String, String)> = None;
+                                            if let Some(Content::ToolCall { name, arguments, .. }) = content.get_mut(idx) {
+                                                if let Some(partial) = arguments.as_object()
+                                                    .and_then(|o| o.get("__partial_json"))
+                                                    .and_then(|v| v.as_str())
+                                                    .map(|s| s.to_string())
+                                                {
+                                                    match serde_json::from_str(&partial) {
+                                                        Ok(parsed) => *arguments = parsed,
+                                                        Err(e) => {
+                                                            warn!(
+                                                                "tool call `{}` has malformed JSON arguments ({e}): {partial}",
+                                                                name
+                                                            );
+                                                            malformed = Some((name.clone(), partial));
+                                                        }
+                                                    }
                                                 }
                                             }
+                                            if let Some((tool, partial)) = malformed {
+                                                // Substituting `{}` here (the old
+                                                // behavior) let the tool run with
+                                                // default arguments while neither
+                                                // the caller nor the model learned
+                                                // the model's actual input was
+                                                // dropped — silently wrong action.
+                                                // Failing the turn stops the loop
+                                                // before it executes anything.
+                                                error_message = Some(format!(
+                                                    "Tool call `{tool}` (block {idx}) had malformed JSON \
+                                                     arguments and was not executed: {partial}"
+                                                ));
+                                                stop_reason = StopReason::Error;
+                                                dropped_malformed_tool_call = true;
+                                                // And replace the block: a tool_use
+                                                // with no matching tool_result is
+                                                // rejected by the API on the next
+                                                // request, so leaving it would break
+                                                // the conversation rather than just
+                                                // this turn. Text keeps the index
+                                                // stable for later blocks.
+                                                content[idx] = Content::Text {
+                                                    text: format!(
+                                                        "[tool call `{tool}` dropped: malformed JSON arguments]"
+                                                    ),
+                                                };
+                                            }
+                                            let _ = tx.send(StreamEvent::ToolCallEnd { content_index: idx });
                                         }
-                                        let _ = tx.send(StreamEvent::ToolCallEnd { content_index: idx });
-                                    }
-                                }
+                                    },
+                                },
                                 "message_delta" => {
                                     if let Ok(data) = serde_json::from_str::<AnthropicMessageDelta>(&msg.data) {
                                         // Only a delta that actually carried a
@@ -243,11 +301,16 @@ impl StreamProvider for AnthropicProvider {
                                         // is finished. An intermediate delta (usage
                                         // update, empty `delta`) parses fine and
                                         // must NOT arm the clean-EOF guard.
-                                        saw_stop_reason |= data.delta.stop_reason.is_some();
-                                        stop_reason = match data.delta.stop_reason.as_deref() {
-                                            Some("tool_use") => StopReason::ToolUse,
-                                            Some("max_tokens") => StopReason::Length,
-                                            Some("model_context_window_exceeded") => {
+                                        // A delta with no stop_reason leaves the
+                                        // current one alone — overwriting it would
+                                        // clobber a terminal reason an earlier
+                                        // delta already set.
+                                        if let Some(reason) = data.delta.stop_reason.as_deref() {
+                                        saw_stop_reason = true;
+                                        stop_reason = match reason {
+                                            "tool_use" => StopReason::ToolUse,
+                                            "max_tokens" => StopReason::Length,
+                                            "model_context_window_exceeded" => {
                                                 // In-stream overflow (HTTP 200). Map to the same
                                                 // Error + overflow-phrase shape as an HTTP 400
                                                 // overflow so Message::is_context_overflow() and
@@ -257,7 +320,7 @@ impl StreamProvider for AnthropicProvider {
                                                     Some("model_context_window_exceeded".into());
                                                 StopReason::Error
                                             }
-                                            Some("refusal") => {
+                                            "refusal" => {
                                                 warn!(
                                                     "Anthropic declined the request (stop_reason=refusal)"
                                                 );
@@ -268,8 +331,21 @@ impl StreamProvider for AnthropicProvider {
                                                 );
                                                 StopReason::Refusal
                                             }
-                                            _ => StopReason::Stop,
+                                            // A stop reason we do not know yet is
+                                            // reported rather than quietly treated
+                                            // as a normal finish, so a new one
+                                            // (a future `pause_turn`, say) surfaces
+                                            // as a visible change instead of a
+                                            // silent behavior shift.
+                                            other => {
+                                                warn!(
+                                                    "unknown Anthropic stop_reason '{other}'; \
+                                                     treating it as a normal stop"
+                                                );
+                                                StopReason::Stop
+                                            }
                                         };
+                                        }
                                         usage.output = data.usage.output_tokens;
                                     }
                                 }
@@ -327,6 +403,13 @@ impl StreamProvider for AnthropicProvider {
         let has_tool_calls = content
             .iter()
             .any(|c| matches!(c, Content::ToolCall { .. }));
+        // A content-level failure outranks whatever terminal reason the stream
+        // reported: the `message_delta` carrying `tool_use` arrives after the
+        // `content_block_stop` that found the malformed arguments.
+        if dropped_malformed_tool_call {
+            stop_reason = StopReason::Error;
+        }
+
         // Never let the tool-call fallback mask a refusal or an error signal.
         if has_tool_calls && !matches!(stop_reason, StopReason::Refusal | StopReason::Error) {
             stop_reason = StopReason::ToolUse;
