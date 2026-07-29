@@ -4,6 +4,52 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- **docs.rs was rendering an incomplete crate.** Without
+  `[package.metadata.docs.rs]`, docs.rs built with default features, so the
+  `openapi` and `gasp` modules — both advertised in the README — were missing
+  from the published API reference. The build now enables all features and
+  passes `--cfg docsrs`, and both feature-gated modules carry `doc(cfg(..))`
+  availability badges.
+
+### Changed
+
+- **README rewritten for first-time readers.** It now leads with the one
+  command that runs a real coding agent against a local model with no API key,
+  a Quick Start that actually calls a tool (every snippet compile-checked), a
+  diagram of the loop, and a section stating plainly what yoagent does *not* do
+  and which crates to use instead. Capabilities moved from a ~40-bullet wall
+  into six collapsible groups.
+- Surfaced what the README previously omitted: `SharedState`, `InputFilter`,
+  `MockProvider`, cost tracking, `set_model`, the OpenCode gateways, all ten
+  examples (nine were unreferenced), and the testing story — 456 of 463 tests
+  run with no network and no API keys.
+- Corrected stale claims: the CLI example is 370 lines, not ~250; the
+  OpenAI-compatible implementation covers 12 compat profiles, not "15+"; and
+  the module map now covers all of `src/`, including `mcp/`, `openapi/`,
+  `session`, `skills`, `shared_state`, `retry`, and `gasp` — roughly 4,000
+  lines the old architecture tree left out.
+- `docs/introduction.md`, the landing page the `homepage` field points at, was
+  a 27-line subset that never mentioned sub-agents, tool middleware, structured
+  outputs, skills, session trees, GASP, MCP, or OpenAPI. Rewritten to match the
+  README and link the pages that cover each area.
+- Crate metadata: filled the three unused crates.io category slots and swapped
+  two low-traffic keywords for `anthropic` and `openai`.
+
+### Added
+
+- `CONTRIBUTING.md`, `SECURITY.md`, issue templates (the bug report asks for
+  the protocol and model id up front, since most reports are provider-specific)
+  and a pull request template — the repository previously had none.
+- Loop and sub-agent/shared-state diagrams in `docs/images/`, with light and
+  dark variants.
+- A **Built with yoagent** section listing the projects that depend on the
+  crate, headed by [yoyo-evolve](https://github.com/yologdev/yoyo-evolve), plus
+  an invitation to add your own.
+
 ## 0.14.1
 
 ### Fixed

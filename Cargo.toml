@@ -8,11 +8,23 @@ repository = "https://github.com/yologdev/yoagent"
 homepage = "https://yologdev.github.io/yoagent/"
 documentation = "https://docs.rs/yoagent"
 readme = "README.md"
-keywords = ["agent", "llm", "ai", "tools", "streaming"]
-categories = ["api-bindings", "asynchronous"]
+keywords = ["agent", "llm", "ai", "anthropic", "openai"]
+categories = [
+    "api-bindings",
+    "asynchronous",
+    "development-tools",
+    "web-programming::http-client",
+    "network-programming",
+]
 authors = ["Yuanhao <yuanhao@yolog.dev>"]
 rust-version = "1.86"
 exclude = ["docs/images/*", "docs/theme/*", ".github/*", "scripts/*"]
+
+# docs.rs builds with default features unless told otherwise, which would hide
+# the `openapi` and `gasp` modules that the README advertises.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "sync", "fs", "macros", "process", "time", "io-util"] }
