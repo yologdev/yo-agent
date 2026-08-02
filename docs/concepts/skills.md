@@ -53,6 +53,21 @@ let skills = SkillSet::load(&["./skills", "~/.yoagent/skills"])?;
 let workspace_skills = SkillSet::load_dir("./skills", "workspace")?;
 ```
 
+If skills may be updated independently at runtime, use resilient loading so one
+malformed `SKILL.md` does not discard the rest of the set:
+
+```rust
+let (skills, errors) = SkillSet::load_resilient(&["./skills", "~/.yoagent/skills"]);
+
+for error in errors {
+    tracing::warn!(%error, "skipping malformed skill");
+}
+```
+
+`load_dir_resilient` provides the same behavior for a single directory with a
+custom source label. The original `load` and `load_dir` methods remain strict
+and return the first error they encounter.
+
 ## Using with Agent
 
 ```rust

@@ -84,10 +84,47 @@ impl SkillSet {
         Ok(Self { skills })
     }
 
+    /// Load skills from multiple directories while isolating individual failures.
+    ///
+    /// Successfully loaded skills are returned alongside every error encountered.
+    /// Later directories take precedence when a skill with the same name loads
+    /// successfully. A malformed override does not remove an earlier valid skill.
+    /// Nonexistent directories are skipped, matching [`Self::load`].
+    pub fn load_resilient(dirs: &[impl AsRef<Path>]) -> (Self, Vec<SkillError>) {
+        let mut by_name: HashMap<String, Skill> = HashMap::new();
+        let mut errors = Vec::new();
+
+        for (i, dir) in dirs.iter().enumerate() {
+            let dir = dir.as_ref();
+            if !dir.exists() {
+                continue;
+            }
+            let source = format!("dir:{}", i);
+            let (skills, dir_errors) = load_skills_from_dir_resilient(dir, &source);
+            for skill in skills {
+                by_name.insert(skill.name.clone(), skill);
+            }
+            errors.extend(dir_errors);
+        }
+
+        let mut skills: Vec<Skill> = by_name.into_values().collect();
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+        (Self { skills }, errors)
+    }
+
     /// Load skills from a single directory with a custom source label.
     pub fn load_dir(dir: impl AsRef<Path>, source: &str) -> Result<Self, SkillError> {
         let skills = load_skills_from_dir(dir.as_ref(), source)?;
         Ok(Self { skills })
+    }
+
+    /// Load skills from a single directory while isolating individual failures.
+    ///
+    /// Successfully loaded skills are returned alongside every directory-entry,
+    /// file-reading, or frontmatter error encountered during the scan.
+    pub fn load_dir_resilient(dir: impl AsRef<Path>, source: &str) -> (Self, Vec<SkillError>) {
+        let (skills, errors) = load_skills_from_dir_resilient(dir.as_ref(), source);
+        (Self { skills }, errors)
     }
 
     /// Create an empty skill set.
@@ -162,59 +199,103 @@ impl SkillSet {
 /// Scan a directory for skills. Looks for:
 /// - `<dir>/<name>/SKILL.md` (standard layout)
 fn load_skills_from_dir(dir: &Path, source: &str) -> Result<Vec<Skill>, SkillError> {
-    let mut skills = Vec::new();
-
-    let entries = fs::read_dir(dir).map_err(|e| SkillError::Io {
-        path: dir.to_path_buf(),
-        source: e,
-    })?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| SkillError::Io {
-            path: dir.to_path_buf(),
-            source: e,
-        })?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        let skill_md = path.join("SKILL.md");
-        if !skill_md.exists() {
-            continue;
-        }
-
-        let content = fs::read_to_string(&skill_md).map_err(|e| SkillError::Io {
-            path: skill_md.clone(),
-            source: e,
-        })?;
-
-        let (name, description) = parse_frontmatter(&content, &skill_md)?;
-
-        // Validate name matches directory
-        let dir_name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-
-        // Use directory name if frontmatter name doesn't match (be lenient)
-        let name = if name == dir_name { name } else { dir_name };
-
-        let base_dir = fs::canonicalize(&path).unwrap_or(path);
-        let file_path = base_dir.join("SKILL.md");
-
-        skills.push(Skill {
-            name,
-            description,
-            file_path,
-            base_dir,
-            source: source.to_string(),
-        });
+    let paths = skill_paths(dir)?;
+    let mut skills = Vec::with_capacity(paths.len());
+    for path in paths {
+        skills.push(load_skill(&path, source)?);
     }
 
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(skills)
+}
+
+fn load_skills_from_dir_resilient(dir: &Path, source: &str) -> (Vec<Skill>, Vec<SkillError>) {
+    let (paths, mut errors) = skill_paths_resilient(dir);
+    let mut skills = Vec::with_capacity(paths.len());
+    for path in paths {
+        match load_skill(&path, source) {
+            Ok(skill) => skills.push(skill),
+            Err(error) => errors.push(error),
+        }
+    }
+
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    (skills, errors)
+}
+
+fn skill_paths(dir: &Path) -> Result<Vec<PathBuf>, SkillError> {
+    let (paths, errors) = skill_paths_resilient(dir);
+    match errors.into_iter().next() {
+        Some(error) => Err(error),
+        None => Ok(paths),
+    }
+}
+
+fn skill_paths_resilient(dir: &Path) -> (Vec<PathBuf>, Vec<SkillError>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(source) => {
+            return (
+                Vec::new(),
+                vec![SkillError::Io {
+                    path: dir.to_path_buf(),
+                    source,
+                }],
+            );
+        }
+    };
+
+    let mut paths = Vec::new();
+    let mut errors = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(source) => {
+                errors.push(SkillError::Io {
+                    path: dir.to_path_buf(),
+                    source,
+                });
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.is_dir() && path.join("SKILL.md").exists() {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    (paths, errors)
+}
+
+fn load_skill(path: &Path, source: &str) -> Result<Skill, SkillError> {
+    let skill_md = path.join("SKILL.md");
+    let content = fs::read_to_string(&skill_md).map_err(|e| SkillError::Io {
+        path: skill_md.clone(),
+        source: e,
+    })?;
+
+    let (name, description) = parse_frontmatter(&content, &skill_md)?;
+
+    // Validate name matches directory
+    let dir_name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    // Use directory name if frontmatter name doesn't match (be lenient)
+    let name = if name == dir_name { name } else { dir_name };
+
+    let base_dir = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let file_path = base_dir.join("SKILL.md");
+
+    Ok(Skill {
+        name,
+        description,
+        file_path,
+        base_dir,
+        source: source.to_string(),
+    })
 }
 
 /// Parse YAML frontmatter from SKILL.md content.
@@ -410,6 +491,100 @@ mod tests {
 
         let result = SkillSet::load(&[tmp.path()]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn resilient_load_keeps_valid_skills_and_collects_errors() {
+        let tmp = TempDir::new().unwrap();
+        create_skill(tmp.path(), "weather", "Get current weather.");
+
+        let bad_dir = tmp.path().join("bad-skill");
+        fs::create_dir_all(&bad_dir).unwrap();
+        fs::write(bad_dir.join("SKILL.md"), "# No frontmatter\n").unwrap();
+
+        let (skills, errors) = SkillSet::load_resilient(&[tmp.path()]);
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills.skills()[0].name, "weather");
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(errors[0], SkillError::InvalidFrontmatter { .. }));
+    }
+
+    #[test]
+    fn resilient_load_collects_all_skill_errors_in_path_order() {
+        let tmp = TempDir::new().unwrap();
+        for name in ["z-bad", "a-bad"] {
+            let skill_dir = tmp.path().join(name);
+            fs::create_dir_all(&skill_dir).unwrap();
+            fs::write(skill_dir.join("SKILL.md"), "# No frontmatter\n").unwrap();
+        }
+
+        let (_, errors) = SkillSet::load_dir_resilient(tmp.path(), "workspace");
+
+        assert_eq!(errors.len(), 2);
+        assert!(errors[0].to_string().contains("a-bad/SKILL.md"));
+        assert!(errors[1].to_string().contains("z-bad/SKILL.md"));
+    }
+
+    #[test]
+    fn resilient_load_isolates_invalid_utf8() {
+        let tmp = TempDir::new().unwrap();
+        create_skill(tmp.path(), "weather", "Get current weather.");
+
+        let bad_dir = tmp.path().join("binary-skill");
+        fs::create_dir_all(&bad_dir).unwrap();
+        fs::write(bad_dir.join("SKILL.md"), [0xff, 0xfe, 0xfd]).unwrap();
+
+        let (skills, errors) = SkillSet::load_dir_resilient(tmp.path(), "workspace");
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills.skills()[0].name, "weather");
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(errors[0], SkillError::Io { .. }));
+    }
+
+    #[test]
+    fn resilient_load_reports_unreadable_root_path() {
+        let tmp = TempDir::new().unwrap();
+        let not_a_directory = tmp.path().join("SKILL.md");
+        fs::write(&not_a_directory, "not a directory").unwrap();
+
+        let (skills, errors) = SkillSet::load_dir_resilient(&not_a_directory, "workspace");
+
+        assert!(skills.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(errors[0], SkillError::Io { .. }));
+    }
+
+    #[test]
+    fn malformed_override_does_not_remove_valid_skill() {
+        let dir1 = TempDir::new().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        create_skill(dir1.path(), "weather", "Valid description.");
+
+        let override_dir = dir2.path().join("weather");
+        fs::create_dir_all(&override_dir).unwrap();
+        fs::write(override_dir.join("SKILL.md"), "# No frontmatter\n").unwrap();
+
+        let (skills, errors) = SkillSet::load_resilient(&[dir1.path(), dir2.path()]);
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills.skills()[0].description, "Valid description.");
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn valid_override_still_wins_in_resilient_load() {
+        let dir1 = TempDir::new().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        create_skill(dir1.path(), "weather", "Old description.");
+        create_skill(dir2.path(), "weather", "New description.");
+
+        let (skills, errors) = SkillSet::load_resilient(&[dir1.path(), dir2.path()]);
+
+        assert!(errors.is_empty());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills.skills()[0].description, "New description.");
     }
 
     #[test]

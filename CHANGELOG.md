@@ -4,6 +4,16 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- `SkillSet::load_resilient` / `SkillSet::load_dir_resilient` — keep valid
+  skills available while reporting malformed or unreadable `SKILL.md` files
+  individually, instead of one bad skill discarding the whole set (#74).
+  `load` / `load_dir` stay strict; their first reported error is now
+  deterministic (sorted path order) rather than filesystem order.
+
 ## 0.16.0
 
 GASP recorder v2 ([#104](https://github.com/yologdev/yoagent/issues/104)): the
