@@ -1952,6 +1952,7 @@ async fn test_default_compaction_matches_compact_messages() {
         keep_recent: 5,
         keep_first: 2,
         tool_output_max_lines: 20,
+        ..Default::default()
     };
 
     let result_direct = compact_messages(messages.clone(), &config);
@@ -2015,6 +2016,7 @@ async fn test_custom_compaction_strategy_is_called() {
             keep_recent: 1,
             keep_first: 1,
             tool_output_max_lines: 10,
+            ..Default::default()
         }),
         compaction_strategy: Some(std::sync::Arc::new(MarkerCompaction)),
         execution_limits: None,
@@ -2093,6 +2095,7 @@ async fn test_none_compaction_strategy_uses_default() {
             keep_recent: 1,
             keep_first: 1,
             tool_output_max_lines: 10,
+            ..Default::default()
         }),
         compaction_strategy: None, // Should fall back to DefaultCompaction
         execution_limits: None,
@@ -2271,6 +2274,7 @@ fn calibration_config(
             keep_recent: 1,
             keep_first: 1,
             tool_output_max_lines: 10,
+            ..Default::default()
         }),
         compaction_strategy: Some(strategy),
         execution_limits: Some(ExecutionLimits {
@@ -2357,4 +2361,139 @@ async fn test_calibration_floor_prevents_budget_collapse() {
     assert!(calls.len() >= 2, "expected 2 turns, got {:?}", calls);
     assert_eq!(calls[0], (4000, 500));
     assert_eq!(calls[1], (400, 0));
+}
+
+// ---------------------------------------------------------------------------
+// Tool output capped on append (prefix-cache stability)
+// ---------------------------------------------------------------------------
+
+struct BigOutputTool;
+
+#[async_trait::async_trait]
+impl AgentTool for BigOutputTool {
+    fn name(&self) -> &str {
+        "big_output"
+    }
+    fn label(&self) -> &str {
+        "Big output"
+    }
+    fn description(&self) -> &str {
+        "Returns a long output"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    async fn execute(
+        &self,
+        _params: serde_json::Value,
+        _ctx: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let text = (0..500)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(ToolResult {
+            content: vec![Content::Text { text }],
+            details: serde_json::Value::Null,
+        })
+    }
+}
+
+fn tool_then_text() -> MockProvider {
+    MockProvider::new(vec![
+        MockResponse::ToolCalls(vec![MockToolCall {
+            provider_metadata: None,
+            name: "big_output".into(),
+            arguments: serde_json::json!({}),
+        }]),
+        MockResponse::Text("done".into()),
+    ])
+}
+
+async fn run_with_context_config(
+    config: Option<yoagent::context::ContextConfig>,
+) -> (Vec<AgentMessage>, Vec<AgentEvent>) {
+    let mut loop_config = make_config(tool_then_text());
+    loop_config.context_config = config;
+
+    let mut context = AgentContext {
+        system_prompt: String::new(),
+        messages: Vec::new(),
+        tools: vec![Box::new(BigOutputTool)],
+    };
+    let (tx, rx) = mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user("go"))],
+        &mut context,
+        &loop_config,
+        tx,
+        cancel,
+    )
+    .await;
+
+    (context.messages, collect_events(rx))
+}
+
+fn tool_result_lines(messages: &[AgentMessage]) -> usize {
+    messages
+        .iter()
+        .find_map(|m| match m {
+            AgentMessage::Llm(Message::ToolResult { content, .. }) => match content.first() {
+                Some(Content::Text { text }) => Some(text.lines().count()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("expected a tool result in context")
+}
+
+#[tokio::test]
+async fn tool_output_is_capped_on_append_when_enabled() {
+    let (messages, events) = run_with_context_config(Some(yoagent::context::ContextConfig {
+        // Budget far above the output: without on-append capping nothing is
+        // truncated, which is exactly the history compaction later rewrites.
+        max_context_tokens: 1_000_000,
+        system_prompt_tokens: 0,
+        tool_output_max_lines: 25,
+        truncate_tool_output_on_append: true,
+        ..Default::default()
+    }))
+    .await;
+
+    assert_eq!(tool_result_lines(&messages), 25);
+
+    // The event stream still carries the untruncated output — the cap is a
+    // context concern, not a tool-result one.
+    let full = events.iter().any(|e| match e {
+        AgentEvent::ToolExecutionEnd { result, .. } => match result.content.first() {
+            Some(Content::Text { text }) => text.lines().count() == 500,
+            _ => false,
+        },
+        _ => false,
+    });
+    assert!(full, "ToolExecutionEnd should carry the untruncated output");
+}
+
+#[tokio::test]
+async fn tool_output_is_untouched_on_append_by_default() {
+    let (messages, _) = run_with_context_config(Some(yoagent::context::ContextConfig {
+        max_context_tokens: 1_000_000,
+        system_prompt_tokens: 0,
+        tool_output_max_lines: 25,
+        ..Default::default()
+    }))
+    .await;
+
+    assert_eq!(
+        tool_result_lines(&messages),
+        500,
+        "on-append truncation must stay opt-in"
+    );
+}
+
+#[tokio::test]
+async fn tool_output_is_untouched_without_a_context_config() {
+    let (messages, _) = run_with_context_config(None).await;
+    assert_eq!(tool_result_lines(&messages), 500);
 }

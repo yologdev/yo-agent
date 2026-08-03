@@ -68,7 +68,7 @@ cargo run --example cli -- --api-url http://localhost:1234/v1 --model my-model  
 
 ```toml
 [dependencies]
-yoagent = "0.14"
+yoagent = "0.15"
 tokio = { version = "1", features = ["full"] }
 ```
 

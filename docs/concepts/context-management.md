@@ -90,11 +90,13 @@ For LLM-based summarization (asking the model to summarize old messages), implem
 
 ```rust
 pub struct ContextConfig {
-    pub max_context_tokens: usize,      // Default: 100,000
-    pub system_prompt_tokens: usize,    // Default: 4,000
-    pub keep_recent: usize,             // Default: 10
-    pub keep_first: usize,              // Default: 2
-    pub tool_output_max_lines: usize,   // Default: 50
+    pub max_context_tokens: usize,               // Default: 100,000
+    pub system_prompt_tokens: usize,             // Default: 4,000
+    pub keep_recent: usize,                      // Default: 10
+    pub keep_first: usize,                       // Default: 2
+    pub tool_output_max_lines: usize,            // Default: 50
+    pub compact_target_ratio: f32,               // Default: 0.7
+    pub truncate_tool_output_on_append: bool,    // Default: false
 }
 ```
 
@@ -128,15 +130,49 @@ let config = ContextConfig::from_context_window(1_000_000);
 
 ### Level 1: Truncate Tool Outputs
 
-Replaces long tool outputs with head + tail (keeping first N/2 and last N/2 lines). This is the cheapest — preserves conversation structure, typically saves 50-70% in coding sessions.
+Replaces long tool outputs with head + tail, fitting the result into exactly `tool_output_max_lines` lines (the `[... N lines truncated ...]` marker is charged against that budget). This is the cheapest level — it preserves conversation structure and typically saves 50-70% in coding sessions.
+
+Truncation is idempotent: re-running it on an already-truncated output returns it byte for byte, so a session that sits above the budget does not re-truncate the same outputs turn after turn.
 
 ### Level 2: Summarize Old Turns
 
-Keeps the last `keep_recent` messages in full detail. Older assistant messages are replaced with one-line summaries like `"[Summary] [Assistant used 3 tool(s)]"`, and their tool results are dropped.
+Keeps the last `keep_recent` messages in full detail. Older assistant messages are replaced with one-line summaries like `"[Summary] [Assistant used 3 tool(s)]"`, and their tool results are dropped. The boundary is pulled back to a turn start so an assistant message and its tool results are never split across it.
 
 ### Level 3: Drop Middle Messages
 
-Keeps `keep_first` messages from the start and `keep_recent` from the end, dropping everything in between. A marker message notes how many were removed.
+Drops the smallest span of middle messages that reaches the target, keeping at least `keep_first` from the start and `keep_recent` from the end. A constant marker message stands in for what was removed; the count goes to the debug log rather than into the marker, so the text does not change from pass to pass.
+
+## Prefix Cache Stability
+
+Providers cache request prefixes — automatically on DeepSeek, explicitly via `cache_control` on Anthropic. A cache hit needs the new request to share a byte-identical prefix with the last one, so **every rewrite of already-sent history costs full price for every token from the rewrite point onward**.
+
+Compaction is built around that:
+
+- Levels are idempotent where they can be, so re-running on settled history changes nothing.
+- `compact_target_ratio` gives compaction headroom. It still *triggers* at the full budget, but the lossy levels reduce to `budget × ratio` (default 70%) rather than to whatever just barely fits — otherwise the next turn crosses the budget again and history is rewritten every single turn.
+- Markers and generated summaries carry no wall-clock timestamps or drifting counts, so the same history always compacts to the same bytes.
+
+### truncate_tool_output_on_append
+
+The largest remaining source of cache loss is *retroactive* truncation: a tool output is sent in full, cached, and then rewritten by Level 1 once the session goes over budget. Setting `truncate_tool_output_on_append` applies `tool_output_max_lines` when the tool result is appended instead, so the bytes the provider cached are the bytes that stay:
+
+```rust
+let agent = Agent::from_config(ModelConfig::deepseek("deepseek-chat", "DeepSeek Chat"))
+    .with_context_config(ContextConfig {
+        truncate_tool_output_on_append: true,
+        ..ContextConfig::from_context_window(128_000)
+    });
+```
+
+The trade-off is that a long tool output is trimmed even when the budget had room for it, which is why it is off by default. The untruncated output is always available in the `AgentEvent` stream either way.
+
+Measured over a 300-turn synthetic tool-heavy session on a 128K window (`tests/context_cache_test.rs`):
+
+| | prefix-cache hit rate | history rewrites |
+|---|---|---|
+| 0.14.2 | 95.80% | 16 |
+| 0.15.0 defaults | 96.85% | 15 |
+| 0.15.0 + `truncate_tool_output_on_append` | 98.51% | 2 |
 
 ## ExecutionLimits
 
