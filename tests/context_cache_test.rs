@@ -503,6 +503,8 @@ fn read_page_size_is_the_dominant_lever_on_cache() {
 // ---------------------------------------------------------------------------
 
 thread_local! {
+    static MISSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SHORTFALL: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
     static MAX_BREAK_EVEN: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
     static MAX_IH: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
 }
@@ -690,6 +692,152 @@ fn issue_101_gate_experiment() {
              that many calls)",
                 MAX_IH.with(|m| m.get()),
                 MAX_BREAK_EVEN.with(|m| m.get()),
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic compaction target: "buy N turns of headroom" vs a fixed ratio.
+//
+// A fixed ratio has no idea how fast the session is growing, so the headroom it
+// leaves is arbitrary. Growth per turn is trivially observable, and what we
+// actually want is an interval between compactions — so derive the target from
+// that instead: target = budget - N * growth_per_turn.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum Policy {
+    FixedRatio(f32),
+    /// Compact hard enough to buy `N` more turns at the observed growth rate.
+    HeadroomTurns(usize),
+}
+
+struct PolicyRun {
+    cost_usd: f64,
+    compactions: usize,
+    hit_rate: f64,
+    mean_interval: f64,
+    retained_tokens_mean: f64,
+}
+
+fn replay_policy(
+    turns: usize,
+    base: &ContextConfig,
+    pricing: Pricing,
+    policy: Policy,
+) -> PolicyRun {
+    let budget = base
+        .max_context_tokens
+        .saturating_sub(base.system_prompt_tokens);
+
+    let mut history: Vec<AgentMessage> = vec![AgentMessage::Llm(
+        Message::user("Refactor the provider layer.").with_timestamp(1_700_000_000_000),
+    )];
+    let mut previous = String::new();
+    let (mut cached_b, mut total_b) = (0usize, 0usize);
+    let mut cost = 0.0;
+    let mut compactions = 0usize;
+    let mut intervals: Vec<usize> = Vec::new();
+    let mut last_compaction_turn = 0usize;
+    let mut growth_total = 0usize;
+    let mut retained_sum = 0.0f64;
+
+    for turn in 1..=turns {
+        let before_append = yoagent::context::total_tokens(&history);
+        if turn % 5 == 0 {
+            history.push(AgentMessage::Llm(
+                Message::user(format!("Also check item {turn} while you are there."))
+                    .with_timestamp(1_700_000_000_000 + turn as u64),
+            ));
+        }
+        history.push(assistant_with_tool_call(turn));
+        let mut result = tool_result(turn);
+        if base.truncate_tool_output_on_append {
+            result = yoagent::context::truncate_tool_output(result, base);
+        }
+        history.push(result);
+        growth_total += yoagent::context::total_tokens(&history).saturating_sub(before_append);
+
+        let live = yoagent::context::total_tokens(&history);
+        if live > budget {
+            let ratio = match policy {
+                Policy::FixedRatio(r) => r,
+                Policy::HeadroomTurns(n) => {
+                    // Observed growth per turn so far.
+                    let growth = (growth_total as f64 / turn as f64).max(1.0);
+                    let target = (budget as f64 - n as f64 * growth).max(budget as f64 * 0.05);
+                    (target / budget as f64) as f32
+                }
+            };
+            let cfg = ContextConfig {
+                compact_target_ratio: ratio,
+                ..base.clone()
+            };
+            let candidate = compact_messages(history.clone(), &cfg);
+            if render(&candidate) != render(&history) {
+                compactions += 1;
+                intervals.push(turn - last_compaction_turn);
+                last_compaction_turn = turn;
+                let requested = (ratio as f64) * budget as f64;
+                let achieved = yoagent::context::total_tokens(&candidate) as f64;
+                if achieved > requested * 1.05 {
+                    MISSED.with(|m| m.set(m.get() + 1));
+                }
+                SHORTFALL.with(|m| m.set(m.get() + (achieved - requested).max(0.0)));
+            }
+            history = candidate;
+        }
+
+        retained_sum += yoagent::context::total_tokens(&history) as f64;
+        let current = render(&history);
+        let shared = common_prefix_len(&previous, &current);
+        cached_b += shared;
+        total_b += current.len();
+        cost += (shared as f64 / 4.0) * pricing.p_cache / 1e6
+            + ((current.len() - shared) as f64 / 4.0) * pricing.p_input / 1e6;
+        previous = current;
+    }
+
+    PolicyRun {
+        cost_usd: cost,
+        compactions,
+        hit_rate: cached_b as f64 / total_b as f64,
+        mean_interval: if intervals.is_empty() {
+            0.0
+        } else {
+            intervals.iter().sum::<usize>() as f64 / intervals.len() as f64
+        },
+        retained_tokens_mean: retained_sum / turns as f64,
+    }
+}
+
+#[test]
+fn dynamic_compaction_target_experiment() {
+    let base = session_config();
+    let pricing = Pricing::deepseek();
+
+    for turns in [300usize, 1200, 2400] {
+        println!("\n== {turns} turns ==");
+        for (label, policy) in [
+            ("fixed  0.7 (default)", Policy::FixedRatio(0.7)),
+            ("fixed  0.3         ", Policy::FixedRatio(0.3)),
+            ("headroom  10 turns ", Policy::HeadroomTurns(10)),
+            ("headroom  20 turns ", Policy::HeadroomTurns(20)),
+            ("headroom  30 turns ", Policy::HeadroomTurns(30)),
+            ("headroom  40 turns ", Policy::HeadroomTurns(40)),
+        ] {
+            MISSED.with(|m| m.set(0));
+            SHORTFALL.with(|m| m.set(0.0));
+            let r = replay_policy(turns, &base, pricing, policy);
+            println!(
+                "  {label}  ${:>8.4}  compactions {:>3}  mean interval {:>5.1}  \
+                 hit {:.2}%  mean ctx {:>6.0} tok",
+                r.cost_usd,
+                r.compactions,
+                r.mean_interval,
+                r.hit_rate * 100.0,
+                r.retained_tokens_mean
             );
         }
     }
