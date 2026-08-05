@@ -40,6 +40,22 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `ContextConfig::compact_headroom_turns` (**default `Some(30)`**) — compact
+  hard enough to buy that many more turns at the session's observed growth
+  rate, instead of to a fixed fraction of the budget:
+
+  ```text
+  target = budget − turns × growth_per_turn
+  ```
+
+  A fixed ratio cannot know how fast a session is growing, so the room it
+  leaves collapses as history accumulates: at the old default the gap between
+  compactions fell from 36 turns to 22 over a 2400-turn session, and the
+  rewrites piled up. The adaptive target holds it flat (36 → 35). The effective
+  ratio is `min(derived, compact_target_ratio)` floored at
+  `MIN_HEADROOM_RATIO`, so the policy can only compact harder than the ratio
+  alone, never softer; `None` restores pure ratio behaviour. Growth is measured
+  by the agent loop, so a direct `compact_messages` call is unaffected.
 - `ContextConfig::truncate_tool_output_on_append` (**default `true`**) applies
   the line cap when a tool result is appended rather than retroactively during
   compaction. Retroactive truncation was the single largest remaining source of
@@ -70,11 +86,20 @@ adheres to [Semantic Versioning](https://semver.org/).
   distribution are taken from 808 archived runs of a production agent built on
   yoagent. Over 300 turns on a 128K window:
 
-  | | prefix-cache hit rate | history rewrites |
+  | session | 0.14.2 hit | 0.15.0 hit | 0.14.2 rewrites | 0.15.0 rewrites |
+  |---|---|---|---|---|
+  | 300 turns | 90.96% | **95.69%** | 29 | **8** |
+  | 1200 turns | 91.54% | **95.39%** | 124 | **35** |
+  | 2400 turns | 91.51% | **95.27%** | 265 | **70** |
+
+  Priced as input-token spend over the whole session — the metric that matters,
+  since hit rate alone rewards carrying a larger context:
+
+  | session | DeepSeek 0.14.2 → 0.15.0 | Anthropic 0.14.2 → 0.15.0 |
   |---|---|---|
-  | 0.14.2 | 93.58% | 23 |
-  | 0.15.0, 0.14.2-equivalent settings | 94.38% | 22 |
-  | 0.15.0 defaults | **96.04%** | **8** |
+  | 300 turns | $1.5894 → $1.4985 (**−5.7%**) | $9.8189 → $7.9347 (**−19.2%**) |
+  | 1200 turns | $7.0242 → $5.7563 (**−18.0%**) | $42.6989 → $30.8415 (**−27.8%**) |
+  | 2400 turns | $14.2278 → $11.2566 (**−20.9%**) | $86.5669 → $60.5804 (**−30.0%**) |
 
 ### Changed
 
@@ -84,9 +109,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 - `ContextConfig::tool_output_max_lines` default raised from 50 to 200. It now
   applies on append rather than only under budget pressure, and 50 lines
   (≈23 head + 24 tail) cuts the error list out of most build output.
-- **Breaking:** `ContextConfig` gained three public fields
-  (`compact_target_ratio`, `truncate_tool_output_on_append`,
-  `tool_output_max_lines_overrides`) and `ReadFileTool` gained `max_lines`.
+- **Breaking:** `ContextConfig` gained four public fields
+  (`compact_target_ratio`, `compact_headroom_turns`,
+  `truncate_tool_output_on_append`, `tool_output_max_lines_overrides`) and
+  `ReadFileTool` gained `max_lines`.
   Code that constructs either with an exhaustive struct literal needs
   `..Default::default()`; code using `default()`, `new()`,
   `from_context_window()`, or functional update syntax is unaffected.

@@ -273,6 +273,10 @@ async fn run_loop(
 ) {
     let mut first_turn = true;
     let mut turn_number: usize = 0;
+    // Rolling growth measurement feeding `compact_headroom_turns`.
+    let mut last_context_tokens: Option<usize> = None;
+    let mut growth_total: usize = 0;
+    let mut growth_samples: usize = 0;
     // Blends real provider usage with estimation for compaction sizing.
     let mut context_tracker = ContextTracker::new();
     let mut tracker = config
@@ -381,6 +385,22 @@ async fn run_loop(
                 let estimated = context::total_tokens(&context.messages);
                 let hybrid = context_tracker.estimate_context_tokens(&context.messages);
                 let overhead = hybrid.saturating_sub(estimated);
+
+                // Growth since the last turn's compaction step, averaged. This
+                // is what lets the headroom policy target an interval between
+                // compactions instead of a fixed fraction of the budget: a
+                // ratio cannot know how fast the session is growing, so the
+                // room it leaves shrinks as history accumulates.
+                if let Some(previous) = last_context_tokens {
+                    growth_samples += 1;
+                    growth_total += estimated.saturating_sub(previous);
+                }
+                let growth_per_turn = if growth_samples > 0 {
+                    growth_total as f64 / growth_samples as f64
+                } else {
+                    0.0
+                };
+
                 let calibrated;
                 let effective_config = if overhead > 0 {
                     let floor = ctx_config.max_context_tokens / 10;
@@ -402,6 +422,30 @@ async fn run_loop(
                 } else {
                     ctx_config
                 };
+
+                // Resolve the headroom policy against the calibrated budget.
+                let with_headroom;
+                let effective_config = {
+                    let ratio = effective_config.effective_target_ratio(growth_per_turn);
+                    if ratio != effective_config.compact_target_ratio {
+                        tracing::debug!(
+                            "compaction target adapted: ratio {} -> {:.3} \
+                             ({} tokens/turn growth, {:?} turns of headroom)",
+                            effective_config.compact_target_ratio,
+                            ratio,
+                            growth_per_turn as usize,
+                            effective_config.compact_headroom_turns,
+                        );
+                        with_headroom = ContextConfig {
+                            compact_target_ratio: ratio,
+                            ..effective_config.clone()
+                        };
+                        &with_headroom
+                    } else {
+                        effective_config
+                    }
+                };
+
                 let strategy: &dyn CompactionStrategy = config
                     .compaction_strategy
                     .as_deref()
@@ -413,6 +457,7 @@ async fn run_loop(
                     // Messages shifted; re-baseline from the next real usage.
                     context_tracker.reset();
                 }
+                last_context_tokens = Some(context::total_tokens(&context.messages));
             }
 
             // Stream assistant response, under an llm_stream span that

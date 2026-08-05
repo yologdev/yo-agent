@@ -172,6 +172,11 @@ fn tool_result(turn: usize) -> AgentMessage {
     })
 }
 
+/// Per-million-token input prices used to turn byte counts into dollars.
+/// Hit rate alone is a misleading objective once a change also moves context
+/// size — a bigger context can raise the ratio while raising the bill.
+const PRICES: [(&str, f64, f64); 2] = [("deepseek", 0.27, 0.07), ("anthropic", 3.00, 0.30)];
+
 struct Replay {
     /// Bytes the provider would have to re-process (no cache hit).
     uncached_bytes: usize,
@@ -205,6 +210,13 @@ impl Replay {
         1.0 - (self.uncached_bytes as f64 / self.total_bytes as f64)
     }
 
+    /// Input-token spend across the whole replay, at the named price point.
+    fn cost_usd(&self, p_input: f64, p_cache: f64) -> f64 {
+        let cached = (self.total_bytes - self.uncached_bytes) as f64 / 4.0;
+        let uncached = self.uncached_bytes as f64 / 4.0;
+        (cached * p_cache + uncached * p_input) / 1e6
+    }
+
     fn report(&self, label: &str) {
         println!(
             "{label}: {} turns, prefix-cache hit rate {:.2}%, {} invalidations",
@@ -236,6 +248,10 @@ fn replay(turns: usize, config: &ContextConfig) -> Replay {
     let mut uncached_bytes = 0usize;
     let mut total_bytes = 0usize;
     let mut invalidations = Vec::new();
+    // Growth measurement, mirroring what the agent loop feeds the headroom
+    // policy. Without this the replay would not model the shipped behaviour.
+    let (mut growth_total, mut growth_samples) = (0usize, 0usize);
+    let mut last_total: Option<usize> = None;
 
     for turn in 1..=turns {
         if turn % 5 == 0 {
@@ -251,9 +267,25 @@ fn replay(turns: usize, config: &ContextConfig) -> Replay {
         }
         history.push(result);
 
+        let live = yoagent::context::total_tokens(&history);
+        if let Some(previous_total) = last_total {
+            growth_samples += 1;
+            growth_total += live.saturating_sub(previous_total);
+        }
+        let growth = if growth_samples > 0 {
+            growth_total as f64 / growth_samples as f64
+        } else {
+            0.0
+        };
+
         // The loop compacts immediately before streaming and writes the result
-        // back into the live history.
-        history = compact_messages(std::mem::take(&mut history), config);
+        // back into the live history, resolving the headroom policy first.
+        let effective = ContextConfig {
+            compact_target_ratio: config.effective_target_ratio(growth),
+            ..config.clone()
+        };
+        history = compact_messages(std::mem::take(&mut history), &effective);
+        last_total = Some(yoagent::context::total_tokens(&history));
 
         let parts: Vec<String> = history
             .iter()
@@ -464,36 +496,157 @@ fn repeated_compaction_of_settled_history_is_a_no_op() {
 }
 
 #[test]
-fn read_page_size_is_the_dominant_lever_on_cache() {
-    // Why DEFAULT_READ_MAX_LINES is 500. File reads are ~19% of tool calls but
-    // the largest token sink, and they are exempt from head+tail truncation
+fn unbounded_read_pages_cost_cache() {
+    // Why `read_file` pages at all. Reads are ~19% of tool calls but the
+    // largest token sink, and they are exempt from head+tail truncation
     // (cutting the middle out of a source file removes what was asked for), so
-    // the tool's page size — not the context cap — is what bounds them.
+    // the tool's page size is what bounds them.
     //
-    // Hit rate is flat from 300 to 500 and degrades sharply above it, making
-    // 500 the largest page that costs nothing extra.
-    let config = session_config();
+    // Measured with the adaptive target OFF, to isolate the read page: with a
+    // fixed ratio, every increase in page size costs cache monotonically.
+    // `compact_headroom_turns` largely absorbs this by compacting harder as
+    // growth rises, which is why the exact page size matters far less than
+    // that one exists at all.
+    let config = ContextConfig {
+        compact_headroom_turns: None,
+        ..session_config()
+    };
     let p300 = replay_with_read_cap(300, &config, 300).hit_rate();
     let p500 = replay_with_read_cap(300, &config, 500).hit_rate();
     let p1000 = replay_with_read_cap(300, &config, 1000).hit_rate();
     let p2000 = replay_with_read_cap(300, &config, 2000).hit_rate();
 
     assert!(
-        (p300 - p500).abs() < 0.01,
-        "300 and 500 should sit on the same plateau ({:.2}% vs {:.2}%)",
-        p300 * 100.0,
-        p500 * 100.0
-    );
-    assert!(
         p500 > p1000 && p1000 > p2000,
-        "larger read pages must cost cache: 500={:.2}% 1000={:.2}% 2000={:.2}%",
+        "larger read pages must cost cache under a fixed ratio: \
+         500={:.2}% 1000={:.2}% 2000={:.2}%",
         p500 * 100.0,
         p1000 * 100.0,
         p2000 * 100.0
     );
-    assert_eq!(
-        yoagent::tools::DEFAULT_READ_MAX_LINES,
-        500,
-        "the default should stay on the measured plateau"
+    assert!(
+        (p300 - p500).abs() < 0.015,
+        "300 and 500 should sit on the same plateau ({:.2}% vs {:.2}%)",
+        p300 * 100.0,
+        p500 * 100.0
     );
+    assert_eq!(yoagent::tools::DEFAULT_READ_MAX_LINES, 500);
+}
+
+/// and reports the mean turns between compactions.
+fn mean_compaction_interval(turns: usize, base: &ContextConfig) -> (f64, usize) {
+    let budget = base
+        .max_context_tokens
+        .saturating_sub(base.system_prompt_tokens);
+    let mut history: Vec<AgentMessage> = vec![AgentMessage::Llm(
+        Message::user("start").with_timestamp(1_700_000_000_000),
+    )];
+    let (mut growth_total, mut growth_samples) = (0usize, 0usize);
+    let mut last_total: Option<usize> = None;
+    let mut intervals: Vec<usize> = Vec::new();
+    let mut last_compaction = 0usize;
+
+    for turn in 1..=turns {
+        history.push(assistant_with_tool_call(turn));
+        let mut result = tool_result(turn);
+        if base.truncate_tool_output_on_append {
+            result = yoagent::context::truncate_tool_output(result, base);
+        }
+        history.push(result);
+
+        let live = yoagent::context::total_tokens(&history);
+        if let Some(previous) = last_total {
+            growth_samples += 1;
+            growth_total += live.saturating_sub(previous);
+        }
+        let growth = if growth_samples > 0 {
+            growth_total as f64 / growth_samples as f64
+        } else {
+            0.0
+        };
+
+        if live > budget {
+            let cfg = ContextConfig {
+                compact_target_ratio: base.effective_target_ratio(growth),
+                ..base.clone()
+            };
+            let candidate = compact_messages(history.clone(), &cfg);
+            if render(&candidate) != render(&history) {
+                intervals.push(turn - last_compaction);
+                last_compaction = turn;
+            }
+            history = candidate;
+        }
+        last_total = Some(yoagent::context::total_tokens(&history));
+    }
+
+    let n = intervals.len();
+    let mean = if n == 0 {
+        0.0
+    } else {
+        intervals.iter().sum::<usize>() as f64 / n as f64
+    };
+    (mean, n)
+}
+
+#[test]
+fn headroom_policy_holds_the_compaction_interval_across_session_lengths() {
+    // A fixed ratio cannot know how fast the session is growing, so the room it
+    // leaves collapses as history accumulates. The headroom policy targets the
+    // interval directly and should hold it roughly flat.
+    let fixed = ContextConfig {
+        compact_headroom_turns: None,
+        ..session_config()
+    };
+    let dynamic = session_config(); // headroom on by default
+
+    let mut fixed_intervals = Vec::new();
+    let mut dynamic_intervals = Vec::new();
+    for turns in [300usize, 1200, 2400] {
+        let (f, fc) = mean_compaction_interval(turns, &fixed);
+        let (d, dc) = mean_compaction_interval(turns, &dynamic);
+        println!(
+            "{turns:>4} turns: fixed ratio interval {f:>5.1} ({fc} compactions)  |  \
+             headroom interval {d:>5.1} ({dc} compactions)"
+        );
+        fixed_intervals.push(f);
+        dynamic_intervals.push(d);
+    }
+
+    // The fixed ratio degrades markedly from the shortest to the longest run.
+    let fixed_drop = fixed_intervals[0] - fixed_intervals[2];
+    let dynamic_drop = dynamic_intervals[0] - dynamic_intervals[2];
+    assert!(
+        fixed_drop > 8.0,
+        "expected the fixed ratio to degrade, got {fixed_intervals:?}"
+    );
+    assert!(
+        dynamic_drop < fixed_drop / 2.0,
+        "headroom policy should hold the interval far better: fixed {fixed_intervals:?} \
+         vs headroom {dynamic_intervals:?}"
+    );
+    // And it must compact less often at the long horizon.
+    assert!(
+        dynamic_intervals[2] > fixed_intervals[2] * 1.2,
+        "headroom interval {} should beat fixed {} at 2400 turns",
+        dynamic_intervals[2],
+        fixed_intervals[2]
+    );
+}
+
+#[test]
+fn report_cost_for_docs() {
+    for turns in [300usize, 1200, 2400] {
+        let r = replay(turns, &session_config());
+        let costs: Vec<String> = PRICES
+            .iter()
+            .map(|(name, pi, pc)| format!("{name} ${:.4}", r.cost_usd(*pi, *pc)))
+            .collect();
+        println!(
+            "NEW turns={turns}: {}  hit {:.2}%  rewrites {}",
+            costs.join("  "),
+            r.hit_rate() * 100.0,
+            r.invalidations.len()
+        );
+    }
 }

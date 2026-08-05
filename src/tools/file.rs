@@ -46,10 +46,15 @@ fn get_image_mime_type(path: &Path) -> Option<&'static str> {
 /// lossless and directed — the header states the true total, and the agent asks
 /// for the range it actually wants.
 ///
-/// 500 was chosen by measurement. Replaying a session modelled on that agent's
-/// tool mix, prefix-cache hit rate is flat between a 300- and 500-line page
-/// (96.2% / 96.0%) and falls off sharply above it (94.2% at 1000, 92.9% at
-/// 2000), so 500 is the largest page that costs nothing extra.
+/// 500 comes from measurement against a fixed compaction target, where hit rate
+/// is flat between a 300- and 500-line page and degrades monotonically above
+/// it — making 500 the largest page that cost nothing extra.
+///
+/// With [`compact_headroom_turns`] on (the default) the choice matters much
+/// less: the adaptive target compacts harder as growth rises, absorbing most of
+/// the difference. What matters is that a bound exists at all.
+///
+/// [`compact_headroom_turns`]: crate::context::ContextConfig::compact_headroom_turns
 pub const DEFAULT_READ_MAX_LINES: usize = 500;
 
 /// Read a file's contents. Supports line range for large files.

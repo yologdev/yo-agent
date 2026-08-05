@@ -63,11 +63,12 @@ pub struct ContextConfig {
     pub tool_output_max_lines: usize,                         // Default: 200
     pub tool_output_max_lines_overrides: HashMap<String, usize>, // Default: {"read_file": MAX}
     pub compact_target_ratio: f32,                            // Default: 0.7
+    pub compact_headroom_turns: Option<usize>,                // Default: Some(30)
     pub truncate_tool_output_on_append: bool,                 // Default: true
 }
 ```
 
-`compact_target_ratio` is the headroom compaction leaves behind: it triggers at the full budget but reduces to `budget × ratio`, so history is not rewritten every turn once the budget is crossed. `truncate_tool_output_on_append` caps tool output as it enters the context rather than retroactively, and `tool_output_max_lines_overrides` gives per-tool budgets so a tool that head+tail would damage (a paging reader) can opt out. All three exist to keep the provider's prefix cache intact — see [Context Management](../concepts/context-management.md#prefix-cache-stability).
+`compact_headroom_turns` sets the compaction target from observed growth (`target = budget − turns × growth_per_turn`), keeping the interval between compactions constant as a session lengthens; `compact_target_ratio` is the fallback and a ceiling on retention. `truncate_tool_output_on_append` caps tool output as it enters the context rather than retroactively, and `tool_output_max_lines_overrides` gives per-tool budgets so a tool that head+tail would damage (a paging reader) can opt out. All three exist to keep the provider's prefix cache intact — see [Context Management](../concepts/context-management.md#prefix-cache-stability).
 
 When `context_config` is not explicitly set, it is automatically derived from `ModelConfig.context_window` (80% for context, 20% reserved for output). If neither is set, `ContextConfig::default()` (100K) is used.
 
