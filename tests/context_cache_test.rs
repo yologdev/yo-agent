@@ -497,3 +497,189 @@ fn read_page_size_is_the_dominant_lever_on_cache() {
         "the default should stay on the measured plateau"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #101 experiment: does a cache-aware gate beat budget-driven compaction?
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static MAX_BREAK_EVEN: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    static MAX_IH: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+#[derive(Clone, Copy)]
+struct Pricing {
+    p_input: f64,
+    p_cache: f64,
+}
+
+impl Pricing {
+    /// DeepSeek-like: cache hits are ~4x cheaper than uncached input.
+    fn deepseek() -> Self {
+        Self {
+            p_input: 0.27,
+            p_cache: 0.07,
+        }
+    }
+
+    /// Anthropic-like: cache reads are 0.1x base input — the harshest common
+    /// ratio, so the gate has the most reason to fire.
+    fn anthropic() -> Self {
+        Self {
+            p_input: 3.00,
+            p_cache: 0.30,
+        }
+    }
+}
+
+struct CostReplay {
+    hit_rate: f64,
+    cost_usd: f64,
+    compactions: usize,
+    deferred: usize,
+    input_tokens: usize,
+}
+
+/// Replay pricing every turn. With `gate`, a prospective compaction is only
+/// accepted when the tokens it stops resending, over the remaining calls,
+/// outweigh the prefix it invalidates now — the two-term model from #101.
+fn replay_costed(
+    turns: usize,
+    config: &ContextConfig,
+    pricing: Pricing,
+    gate: bool,
+    hard_ceiling: usize,
+) -> CostReplay {
+    let soft_budget = config
+        .max_context_tokens
+        .saturating_sub(config.system_prompt_tokens);
+
+    let mut history: Vec<AgentMessage> = vec![AgentMessage::Llm(
+        Message::user("Refactor the provider layer.").with_timestamp(1_700_000_000_000),
+    )];
+    let mut previous = String::new();
+    let (mut cached_b, mut total_b) = (0usize, 0usize);
+    let (mut compactions, mut deferred) = (0usize, 0usize);
+    let mut cost = 0.0f64;
+
+    for turn in 1..=turns {
+        if turn % 5 == 0 {
+            history.push(AgentMessage::Llm(
+                Message::user(format!("Also check item {turn} while you are there."))
+                    .with_timestamp(1_700_000_000_000 + turn as u64),
+            ));
+        }
+        history.push(assistant_with_tool_call(turn));
+        let mut result = tool_result(turn);
+        if config.truncate_tool_output_on_append {
+            result = yoagent::context::truncate_tool_output(result, config);
+        }
+        history.push(result);
+
+        let live = yoagent::context::total_tokens(&history);
+        if live > soft_budget {
+            let candidate = compact_messages(history.clone(), config);
+            let after = yoagent::context::total_tokens(&candidate);
+            let accept = if !gate || live > hard_ceiling {
+                true
+            } else {
+                // H: tokens we stop resending on every future call.
+                let h = live.saturating_sub(after) as f64;
+                // I: prefix actually invalidated — measured, not bounded by
+                // (S+K), because compaction is byte-stable up to the cut.
+                let rendered = render(&candidate);
+                let shared = common_prefix_len(&previous, &rendered);
+                let invalidated = (rendered.len().saturating_sub(shared)) as f64 / 4.0;
+                let r = (turns - turn) as f64;
+                let benefit =
+                    r * h * pricing.p_cache - invalidated * (pricing.p_input - pricing.p_cache);
+                // Break-even: R > (I/H) * (P_input - P_cache) / P_cache
+                let break_even =
+                    (invalidated / h) * (pricing.p_input - pricing.p_cache) / pricing.p_cache;
+                MAX_BREAK_EVEN.with(|m| m.set(m.get().max(break_even)));
+                MAX_IH.with(|m| m.set(m.get().max(invalidated / h)));
+                benefit > 0.0
+            };
+            if accept {
+                if candidate.len() != history.len() || render(&candidate) != render(&history) {
+                    compactions += 1;
+                }
+                history = candidate;
+            } else {
+                deferred += 1;
+            }
+        }
+
+        let current = render(&history);
+        let shared = common_prefix_len(&previous, &current);
+        cached_b += shared;
+        total_b += current.len();
+        cost += (shared as f64 / 4.0) * pricing.p_cache / 1e6
+            + ((current.len() - shared) as f64 / 4.0) * pricing.p_input / 1e6;
+        previous = current;
+    }
+
+    CostReplay {
+        hit_rate: cached_b as f64 / total_b as f64,
+        cost_usd: cost,
+        compactions,
+        deferred,
+        input_tokens: total_b / 4,
+    }
+}
+
+#[test]
+fn issue_101_gate_experiment() {
+    let hard = 128_000;
+
+    for (label, config, pricing) in [
+        (
+            "post-#100 / deepseek ",
+            session_config(),
+            Pricing::deepseek(),
+        ),
+        (
+            "post-#100 / anthropic",
+            session_config(),
+            Pricing::anthropic(),
+        ),
+        (
+            "legacy    / deepseek ",
+            legacy_config(),
+            Pricing::deepseek(),
+        ),
+        (
+            "legacy    / anthropic",
+            legacy_config(),
+            Pricing::anthropic(),
+        ),
+    ] {
+        let config = &config;
+        println!("\n== {label} ==");
+        for turns in [150usize, 300, 600] {
+            MAX_BREAK_EVEN.with(|m| m.set(0.0));
+            MAX_IH.with(|m| m.set(0.0));
+            let base = replay_costed(turns, config, pricing, false, hard);
+            let gated = replay_costed(turns, config, pricing, true, hard);
+            println!(
+                "turns={turns:>3}  ungated: hit {:.2}%  ${:.4}  compactions {:>2}      | \
+             gated: hit {:.2}%  ${:.4}  compactions {:>2}  deferred {:>2}  | \
+             cost {:+.2}%",
+                base.hit_rate * 100.0,
+                base.cost_usd,
+                base.compactions,
+                gated.hit_rate * 100.0,
+                gated.cost_usd,
+                gated.compactions,
+                gated.deferred,
+                (gated.cost_usd - base.cost_usd) / base.cost_usd * 100.0,
+            );
+            println!(
+                "         worst I/H {:.2} -> break-even R {:.1} (gate fires only inside the last \
+             that many calls)",
+                MAX_IH.with(|m| m.get()),
+                MAX_BREAK_EVEN.with(|m| m.get()),
+            );
+        }
+    }
+}
