@@ -160,17 +160,19 @@ Set `compact_headroom_turns: None` to restore pure ratio behaviour.
 
 | session | 0.14.2 hit rate | 0.15.0 hit rate | 0.14.2 rewrites | 0.15.0 rewrites |
 |---|---|---|---|---|
-| 300 turns | 90.96% | **95.69%** | 29 | **8** |
-| 1200 turns | 91.54% | **95.39%** | 124 | **35** |
-| 2400 turns | 91.51% | **95.27%** | 265 | **70** |
+| 300 turns | 93.83% | **95.69%** | 34 | **8** |
+| 1200 turns | 94.24% | **95.39%** | 169 | **35** |
+| 2400 turns | 94.77% | **95.27%** | 415 | **70** |
+
+The rewrite count is the sharper signal: 0.14.2 kept its hit rate up by compacting constantly to a small context — 415 rewrites over 2400 turns — which is precisely the churn that costs money.
 
 Priced as input-token spend across the whole session:
 
 | session | DeepSeek | Anthropic |
 |---|---|---|
-| 300 turns | $1.5894 → **$1.4985** (−5.7%) | $9.8189 → **$7.9347** (−19.2%) |
-| 1200 turns | $7.0242 → **$5.7563** (−18.0%) | $42.6989 → **$30.8415** (−27.8%) |
-| 2400 turns | $14.2278 → **$11.2566** (−20.9%) | $86.5669 → **$60.5804** (−30.0%) |
+| 300 turns | $1.6511 → **$1.4985** (−9.2%) | $9.3567 → **$7.9347** (−15.2%) |
+| 1200 turns | $6.9307 → **$5.7563** (−16.9%) | $38.7284 → **$30.8415** (−20.4%) |
+| 2400 turns | $14.3065 → **$11.2566** (−21.3%) | $78.4390 → **$60.5804** (−22.8%) |
 
 The gap widens with session length, which is the point: the old behaviour degraded as history accumulated, and the new behaviour does not.
 

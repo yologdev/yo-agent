@@ -5,6 +5,23 @@
 //! byte-identical prefix with the previous one, so any in-place rewrite of
 //! history costs every token from the rewrite point onward.
 //!
+//! # Reproducing the published baseline
+//!
+//! The old-vs-new figures in `CHANGELOG.md` and `docs/concepts/prompt-caching.md`
+//! compare against a real 0.14.2 checkout, not against 0.15 with the new
+//! settings turned off — those are different things and give different answers.
+//! To re-measure:
+//!
+//! ```text
+//! git checkout <0.14.2 commit> -- src/      # NOT `git stash`: a clean tree
+//! grep -c compact_headroom_turns src/context.rs   # must print 0
+//! # strip the post-0.14.2 APIs from a copy of this file, run it, then:
+//! git checkout HEAD -- src/
+//! ```
+//!
+//! `git stash push src/` is *not* a substitute — with a clean working tree it
+//! stashes nothing and silently measures the current code.
+//!
 //! These tests replay a synthetic tool-heavy session through `compact_messages`
 //! turn by turn, render each turn's message list the way a provider body would
 //! see it (timestamps excluded — no provider serializes them), and measure the

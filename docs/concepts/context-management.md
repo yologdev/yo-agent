@@ -178,11 +178,11 @@ To restore pre-0.15 behaviour, set `truncate_tool_output_on_append: false` and c
 
 | session | 0.14.2 hit rate | 0.15.0 hit rate | 0.14.2 rewrites | 0.15.0 rewrites |
 |---|---|---|---|---|
-| 300 turns | 90.96% | **95.69%** | 29 | **8** |
-| 1200 turns | 91.54% | **95.39%** | 124 | **35** |
-| 2400 turns | 91.51% | **95.27%** | 265 | **70** |
+| 300 turns | 93.83% | **95.69%** | 34 | **8** |
+| 1200 turns | 94.24% | **95.39%** | 169 | **35** |
+| 2400 turns | 94.77% | **95.27%** | 415 | **70** |
 
-In input-token spend that is −5.7% to −20.9% on DeepSeek and −19.2% to −30.0% on Anthropic, widening with session length. Full breakdown and the reasoning behind each default: [Prompt Caching](prompt-caching.md#cache-stable-compaction).
+In input-token spend that is −9.2% to −21.3% on DeepSeek and −15.2% to −22.8% on Anthropic, widening with session length. Full breakdown and the reasoning behind each default: [Prompt Caching](prompt-caching.md#cache-stable-compaction).
 
 ## ExecutionLimits
 
