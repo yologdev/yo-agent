@@ -2476,7 +2476,7 @@ async fn tool_output_is_capped_on_append_when_enabled() {
 }
 
 #[tokio::test]
-async fn tool_output_is_untouched_on_append_by_default() {
+async fn tool_output_is_capped_on_append_by_default() {
     let (messages, _) = run_with_context_config(Some(yoagent::context::ContextConfig {
         max_context_tokens: 1_000_000,
         system_prompt_tokens: 0,
@@ -2487,9 +2487,42 @@ async fn tool_output_is_untouched_on_append_by_default() {
 
     assert_eq!(
         tool_result_lines(&messages),
-        500,
-        "on-append truncation must stay opt-in"
+        25,
+        "on-append capping is the default"
     );
+}
+
+#[tokio::test]
+async fn on_append_capping_can_be_turned_off() {
+    let (messages, _) = run_with_context_config(Some(yoagent::context::ContextConfig {
+        max_context_tokens: 1_000_000,
+        system_prompt_tokens: 0,
+        tool_output_max_lines: 25,
+        truncate_tool_output_on_append: false,
+        ..Default::default()
+    }))
+    .await;
+
+    assert_eq!(tool_result_lines(&messages), 500);
+}
+
+#[tokio::test]
+async fn per_tool_override_exempts_a_tool_from_capping() {
+    // A tool that head+tail would damage opts out by name rather than by
+    // disabling capping for everything.
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert("big_output".to_string(), usize::MAX);
+
+    let (messages, _) = run_with_context_config(Some(yoagent::context::ContextConfig {
+        max_context_tokens: 1_000_000,
+        system_prompt_tokens: 0,
+        tool_output_max_lines: 25,
+        tool_output_max_lines_overrides: overrides,
+        ..Default::default()
+    }))
+    .await;
+
+    assert_eq!(tool_result_lines(&messages), 500);
 }
 
 #[tokio::test]

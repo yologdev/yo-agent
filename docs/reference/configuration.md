@@ -56,17 +56,18 @@ Controls context window compaction:
 
 ```rust
 pub struct ContextConfig {
-    pub max_context_tokens: usize,               // Default: 100,000
-    pub system_prompt_tokens: usize,             // Default: 4,000
-    pub keep_recent: usize,                      // Default: 10
-    pub keep_first: usize,                       // Default: 2
-    pub tool_output_max_lines: usize,            // Default: 50
-    pub compact_target_ratio: f32,               // Default: 0.7
-    pub truncate_tool_output_on_append: bool,    // Default: false
+    pub max_context_tokens: usize,                            // Default: 100,000
+    pub system_prompt_tokens: usize,                          // Default: 4,000
+    pub keep_recent: usize,                                   // Default: 10
+    pub keep_first: usize,                                    // Default: 2
+    pub tool_output_max_lines: usize,                         // Default: 200
+    pub tool_output_max_lines_overrides: HashMap<String, usize>, // Default: {"read_file": MAX}
+    pub compact_target_ratio: f32,                            // Default: 0.7
+    pub truncate_tool_output_on_append: bool,                 // Default: true
 }
 ```
 
-`compact_target_ratio` is the headroom compaction leaves behind: it triggers at the full budget but reduces to `budget × ratio`, so history is not rewritten every turn once the budget is crossed. `truncate_tool_output_on_append` caps oversized tool output as it enters the context rather than retroactively. Both exist to keep the provider's prefix cache intact — see [Context Management](../concepts/context-management.md#prefix-cache-stability).
+`compact_target_ratio` is the headroom compaction leaves behind: it triggers at the full budget but reduces to `budget × ratio`, so history is not rewritten every turn once the budget is crossed. `truncate_tool_output_on_append` caps tool output as it enters the context rather than retroactively, and `tool_output_max_lines_overrides` gives per-tool budgets so a tool that head+tail would damage (a paging reader) can opt out. All three exist to keep the provider's prefix cache intact — see [Context Management](../concepts/context-management.md#prefix-cache-stability).
 
 When `context_config` is not explicitly set, it is automatically derived from `ModelConfig.context_window` (80% for context, 20% reserved for output). If neither is set, `ContextConfig::default()` (100K) is used.
 

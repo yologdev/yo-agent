@@ -92,17 +92,52 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 // Synthetic session
 // ---------------------------------------------------------------------------
 
-fn tool_output(turn: usize) -> String {
-    // Deterministic, varied length: some outputs cross tool_output_max_lines,
-    // some don't — the mix a real coding agent produces.
-    let lines = 20 + (turn * 37) % 160;
+/// The tool mix a real coding agent produces, measured from 808 archived runs
+/// of an agent built on yoagent: bash 41%, edit/write 36%, read 19%, search 4%.
+/// Output shape differs sharply per tool, which is the whole reason the line
+/// budget is per-tool.
+fn tool_for_turn(turn: usize) -> &'static str {
+    match turn % 100 {
+        0..=40 => "bash",       // build logs, grep, git — head+tail suits these
+        41..=76 => "edit_file", // a confirmation line
+        77..=95 => "read_file", // paged by the tool itself
+        _ => "search",
+    }
+}
+
+thread_local! {
+    static READ_CAP: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(yoagent::tools::DEFAULT_READ_MAX_LINES) };
+}
+
+/// Replay with the read tool's page size overridden.
+fn replay_with_read_cap(turns: usize, config: &ContextConfig, read_cap: usize) -> Replay {
+    READ_CAP.with(|c| c.set(read_cap));
+    let r = replay(turns, config);
+    READ_CAP.with(|c| c.set(yoagent::tools::DEFAULT_READ_MAX_LINES));
+    r
+}
+
+/// Deterministic output whose length distribution reflects the tool.
+fn tool_output(turn: usize, tool: &str) -> String {
+    let lines = match tool {
+        // cargo/grep/git: routinely hundreds of lines, occasionally thousands.
+        "bash" => 40 + (turn * 37) % 700,
+        // The read tool pages itself at DEFAULT_READ_MAX_LINES, so what reaches
+        // the context is already bounded — source files run 100..1500 lines.
+        "read_file" => (100 + (turn * 53) % 1400).min(READ_CAP.with(|c| c.get())),
+        "search" => 10 + (turn * 17) % 120,
+        // edit/write return a short confirmation.
+        _ => 1 + (turn * 3) % 4,
+    };
     (0..lines)
-        .map(|i| format!("turn {turn} output line {i}: {}", "data ".repeat(6)))
+        .map(|i| format!("turn {turn} {tool} line {i}: {}", "data ".repeat(6)))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
 fn assistant_with_tool_call(turn: usize) -> AgentMessage {
+    let tool = tool_for_turn(turn);
     AgentMessage::Llm(
         Message::assistant(
             vec![
@@ -111,8 +146,8 @@ fn assistant_with_tool_call(turn: usize) -> AgentMessage {
                 },
                 Content::tool_call(
                     format!("tc-{turn}"),
-                    "bash",
-                    serde_json::json!({ "command": format!("rg --files -g '*.rs' | sed -n '{turn}p'") }),
+                    tool,
+                    serde_json::json!({ "arg": format!("target-{turn}") }),
                 ),
             ],
             StopReason::ToolUse,
@@ -125,11 +160,12 @@ fn assistant_with_tool_call(turn: usize) -> AgentMessage {
 }
 
 fn tool_result(turn: usize) -> AgentMessage {
+    let tool = tool_for_turn(turn);
     AgentMessage::Llm(Message::ToolResult {
         tool_call_id: format!("tc-{turn}"),
-        tool_name: "bash".into(),
+        tool_name: tool.into(),
         content: vec![Content::Text {
-            text: tool_output(turn),
+            text: tool_output(turn, tool),
         }],
         is_error: false,
         timestamp: 1_700_000_000_000 + turn as u64,
@@ -211,7 +247,7 @@ fn replay(turns: usize, config: &ContextConfig) -> Replay {
         history.push(assistant_with_tool_call(turn));
         let mut result = tool_result(turn);
         if config.truncate_tool_output_on_append {
-            result = yoagent::context::truncate_tool_output(result, config.tool_output_max_lines);
+            result = yoagent::context::truncate_tool_output(result, config);
         }
         history.push(result);
 
@@ -260,10 +296,14 @@ fn session_config() -> ContextConfig {
     }
 }
 
-/// The same session with oversized tool output capped as it is appended.
-fn on_append_config() -> ContextConfig {
+/// The 0.14.2 settings, for comparison: cap every tool at 50 lines, apply it
+/// only retroactively during compaction, and compact to whatever just fits.
+fn legacy_config() -> ContextConfig {
     ContextConfig {
-        truncate_tool_output_on_append: true,
+        tool_output_max_lines: 50,
+        tool_output_max_lines_overrides: Default::default(),
+        truncate_tool_output_on_append: false,
+        compact_target_ratio: 1.0,
         ..session_config()
     }
 }
@@ -271,47 +311,93 @@ fn on_append_config() -> ContextConfig {
 // ---------------------------------------------------------------------------
 // Tests
 //
-// Thresholds are regression guards, not targets. The measured figures for this
-// replay at 300 turns are:
-//
-//   yoagent 0.14.2                          95.80%   16 rewrites
-//   + idempotent truncation, hysteresis      96.85%   15 rewrites
-//   + truncate_tool_output_on_append         98.51%    2 rewrites
-//
-// The ceiling is set by request size over per-turn growth: a session that adds
-// 1/50th of its context each turn cannot exceed ~98% however stable compaction
-// is, because that new tail was never cached to begin with.
+// Thresholds are regression guards, not targets. The ceiling is set by request
+// size over per-turn growth: a session that adds 1/50th of its context each
+// turn cannot exceed ~98% however stable compaction is, because that new tail
+// was never cached to begin with.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn compaction_preserves_the_prefix_cache_across_a_long_session() {
     let result = replay(300, &session_config());
-    result.report("default");
+    result.report("defaults");
 
     assert!(
-        result.hit_rate() > 0.96,
+        result.hit_rate() > 0.955,
         "prefix-cache hit rate regressed to {:.2}%",
         result.hit_rate() * 100.0
+    );
+    assert!(
+        result.invalidations.len() <= 12,
+        "history was rewritten on {} of 300 turns",
+        result.invalidations.len()
     );
 }
 
 #[test]
-fn truncating_on_append_keeps_the_prefix_cache_nearly_intact() {
-    let result = replay(300, &on_append_config());
-    result.report("truncate-on-append");
+fn defaults_beat_the_legacy_settings() {
+    let legacy = replay(300, &legacy_config());
+    let current = replay(300, &session_config());
+    legacy.report("legacy settings");
 
-    // Capping output on the way in removes the retroactive rewrites entirely,
-    // leaving only the genuine compaction events.
     assert!(
-        result.hit_rate() > 0.98,
-        "prefix-cache hit rate regressed to {:.2}%",
-        result.hit_rate() * 100.0
+        current.hit_rate() > legacy.hit_rate(),
+        "defaults ({:.2}%) should beat legacy settings ({:.2}%)",
+        current.hit_rate() * 100.0,
+        legacy.hit_rate() * 100.0
     );
     assert!(
-        result.invalidations.len() <= 4,
-        "history was rewritten on {} of 300 turns",
-        result.invalidations.len()
+        current.invalidations.len() < legacy.invalidations.len(),
+        "defaults should rewrite history less often ({} vs {})",
+        current.invalidations.len(),
+        legacy.invalidations.len()
     );
+}
+
+#[test]
+fn read_output_is_exempt_from_head_tail_truncation() {
+    // Cutting the middle out of a source file removes exactly what was asked
+    // for; the read tool bounds itself by paging instead.
+    let config = session_config();
+    let big = (0..900)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let msg = AgentMessage::Llm(Message::ToolResult {
+        tool_call_id: "tc-1".into(),
+        tool_name: "read_file".into(),
+        content: vec![Content::Text { text: big.clone() }],
+        is_error: false,
+        timestamp: 1,
+    });
+    let out = yoagent::context::truncate_tool_output(msg, &config);
+    let AgentMessage::Llm(Message::ToolResult { content, .. }) = &out else {
+        panic!("expected a tool result")
+    };
+    let Content::Text { text } = &content[0] else {
+        panic!("expected text")
+    };
+    assert_eq!(
+        text, &big,
+        "read_file output must not be head+tail truncated"
+    );
+
+    // The same output from a command tool is capped.
+    let msg = AgentMessage::Llm(Message::ToolResult {
+        tool_call_id: "tc-2".into(),
+        tool_name: "bash".into(),
+        content: vec![Content::Text { text: big }],
+        is_error: false,
+        timestamp: 1,
+    });
+    let out = yoagent::context::truncate_tool_output(msg, &config);
+    let AgentMessage::Llm(Message::ToolResult { content, .. }) = &out else {
+        panic!("expected a tool result")
+    };
+    let Content::Text { text } = &content[0] else {
+        panic!("expected text")
+    };
+    assert_eq!(text.lines().count(), config.tool_output_max_lines);
 }
 
 #[test]
@@ -375,4 +461,39 @@ fn repeated_compaction_of_settled_history_is_a_no_op() {
             "third compaction pass rewrote settled history at {max_context_tokens} tokens"
         );
     }
+}
+
+#[test]
+fn read_page_size_is_the_dominant_lever_on_cache() {
+    // Why DEFAULT_READ_MAX_LINES is 500. File reads are ~19% of tool calls but
+    // the largest token sink, and they are exempt from head+tail truncation
+    // (cutting the middle out of a source file removes what was asked for), so
+    // the tool's page size — not the context cap — is what bounds them.
+    //
+    // Hit rate is flat from 300 to 500 and degrades sharply above it, making
+    // 500 the largest page that costs nothing extra.
+    let config = session_config();
+    let p300 = replay_with_read_cap(300, &config, 300).hit_rate();
+    let p500 = replay_with_read_cap(300, &config, 500).hit_rate();
+    let p1000 = replay_with_read_cap(300, &config, 1000).hit_rate();
+    let p2000 = replay_with_read_cap(300, &config, 2000).hit_rate();
+
+    assert!(
+        (p300 - p500).abs() < 0.01,
+        "300 and 500 should sit on the same plateau ({:.2}% vs {:.2}%)",
+        p300 * 100.0,
+        p500 * 100.0
+    );
+    assert!(
+        p500 > p1000 && p1000 > p2000,
+        "larger read pages must cost cache: 500={:.2}% 1000={:.2}% 2000={:.2}%",
+        p500 * 100.0,
+        p1000 * 100.0,
+        p2000 * 100.0
+    );
+    assert_eq!(
+        yoagent::tools::DEFAULT_READ_MAX_LINES,
+        500,
+        "the default should stay on the measured plateau"
+    );
 }

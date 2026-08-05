@@ -524,18 +524,19 @@ async fn run_loop(
 
                 // Cap oversized output on the way in when configured, so
                 // compaction never has to rewrite a tool result the provider
-                // has already cached. The events emitted above still carry the
-                // untruncated output — this is a context concern only.
+                // has already cached. Per-tool budgets apply, so a tool that
+                // tolerates head+tail badly can opt out. The events emitted
+                // above still carry the untruncated output — this is a context
+                // concern only.
                 let append_cap = config
                     .context_config
                     .as_ref()
-                    .filter(|c| c.truncate_tool_output_on_append)
-                    .map(|c| c.tool_output_max_lines);
+                    .filter(|c| c.truncate_tool_output_on_append);
 
                 for result in &tool_results {
                     let mut am: AgentMessage = result.clone().into();
-                    if let Some(max_lines) = append_cap {
-                        am = context::truncate_tool_output(am, max_lines);
+                    if let Some(ctx_config) = append_cap {
+                        am = context::truncate_tool_output(am, ctx_config);
                     }
                     context.messages.push(am.clone());
                     new_messages.push(am);

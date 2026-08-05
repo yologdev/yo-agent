@@ -10,6 +10,7 @@
 
 use crate::types::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Token estimation
@@ -150,8 +151,25 @@ pub struct ContextConfig {
     pub keep_recent: usize,
     /// Minimum first messages to always keep
     pub keep_first: usize,
-    /// Max lines to keep per tool output in Level 1 compaction
+    /// Max lines to keep per tool output, for tools with no override below.
+    ///
+    /// Tuned for command output — build logs, test runs, `grep` — where
+    /// head+tail is a good cut: the first error is at the top, the summary at
+    /// the bottom, and the middle is repetition.
     pub tool_output_max_lines: usize,
+    /// Per-tool overrides for `tool_output_max_lines`, keyed by tool name.
+    ///
+    /// One global number cannot serve every tool. Head+tail truncation suits
+    /// command output but is the *wrong* cut for a file read, where the middle
+    /// is usually the part that matters — a paging read tool bounds itself far
+    /// better than a blind truncation can. The default therefore exempts the
+    /// built-in `read_file` (see [`DEFAULT_READ_MAX_LINES`]).
+    ///
+    /// `usize::MAX` disables truncation for a tool.
+    ///
+    /// [`DEFAULT_READ_MAX_LINES`]: crate::tools::DEFAULT_READ_MAX_LINES
+    #[serde(default)]
+    pub tool_output_max_lines_overrides: HashMap<String, usize>,
     /// Fraction of the budget that lossy compaction (Level 2/3) aims for.
     ///
     /// Compaction still *triggers* at the full budget, but once it has to
@@ -173,10 +191,13 @@ pub struct ContextConfig {
     /// It also slows context growth, so compaction runs less often.
     ///
     /// The cost is that a long tool output is trimmed even when the budget
-    /// had room for it. Off by default; the full output is always visible in
-    /// the [`AgentEvent`](crate::types::AgentEvent) stream either way.
+    /// had room for it — which is why tools that tolerate it badly are exempted
+    /// via `tool_output_max_lines_overrides` rather than by turning this off.
+    /// The full output is always visible in the
+    /// [`AgentEvent`](crate::types::AgentEvent) stream either way.
     ///
-    /// Only honoured by the agent loop when a `ContextConfig` is set.
+    /// On by default. Only honoured by the agent loop when a `ContextConfig`
+    /// is set.
     pub truncate_tool_output_on_append: bool,
 }
 
@@ -187,11 +208,21 @@ impl Default for ContextConfig {
             system_prompt_tokens: 4_000,
             keep_recent: 10,
             keep_first: 2,
-            tool_output_max_lines: 50,
+            tool_output_max_lines: 200,
+            tool_output_max_lines_overrides: default_tool_output_overrides(),
             compact_target_ratio: 0.7,
-            truncate_tool_output_on_append: false,
+            truncate_tool_output_on_append: true,
         }
     }
+}
+
+/// Tools whose output the default head+tail cap would damage.
+///
+/// `read_file` bounds itself by paging (`DEFAULT_READ_MAX_LINES`), which is
+/// both lossless and directed; cutting the middle out of a source file on top
+/// of that would remove exactly the part the agent asked for.
+fn default_tool_output_overrides() -> HashMap<String, usize> {
+    HashMap::from([("read_file".to_string(), usize::MAX)])
 }
 
 impl ContextConfig {
@@ -205,6 +236,14 @@ impl ContextConfig {
             max_context_tokens,
             ..Default::default()
         }
+    }
+
+    /// The line cap that applies to a given tool's output.
+    pub fn max_lines_for(&self, tool_name: &str) -> usize {
+        self.tool_output_max_lines_overrides
+            .get(tool_name)
+            .copied()
+            .unwrap_or(self.tool_output_max_lines)
     }
 
     /// The token count lossy compaction reduces to, given the trigger budget.
@@ -292,7 +331,7 @@ pub fn compact_messages(messages: Vec<AgentMessage>, config: &ContextConfig) -> 
     // Level 1: Truncate tool outputs. Checked against the full budget, not the
     // target: this level is idempotent and cheap to repeat, so there is nothing
     // to gain by escalating to the lossy levels before we have to.
-    let compacted = level1_truncate_tool_outputs(&messages, config.tool_output_max_lines);
+    let compacted = level1_truncate_tool_outputs(&messages, config);
     if total_tokens(&compacted) <= budget {
         return compacted;
     }
@@ -312,21 +351,26 @@ pub fn compact_messages(messages: Vec<AgentMessage>, config: &ContextConfig) -> 
 /// This is the cheapest compaction — preserves conversation structure,
 /// just removes verbose tool output middles. In practice this saves
 /// 50-70% of context in coding sessions.
-fn level1_truncate_tool_outputs(messages: &[AgentMessage], max_lines: usize) -> Vec<AgentMessage> {
+fn level1_truncate_tool_outputs(
+    messages: &[AgentMessage],
+    config: &ContextConfig,
+) -> Vec<AgentMessage> {
     messages
         .iter()
-        .map(|msg| truncate_tool_output(msg.clone(), max_lines))
+        .map(|msg| truncate_tool_output(msg.clone(), config))
         .collect()
 }
 
-/// Cap a single tool result's text at `max_lines`, keeping head and tail.
+/// Cap a single tool result's text at the tool's line budget, keeping head and
+/// tail.
 ///
-/// Non-tool-result messages pass through untouched, and the operation is
-/// idempotent, so applying it when the message is first appended means
-/// compaction never has to rewrite it later — which is what keeps the
-/// provider's prefix cache intact. See
+/// The budget comes from [`ContextConfig::max_lines_for`], so a tool that
+/// tolerates head+tail badly can be exempted. Non-tool-result messages pass
+/// through untouched, and the operation is idempotent, so applying it when the
+/// message is first appended means compaction never has to rewrite it later —
+/// which is what keeps the provider's prefix cache intact. See
 /// [`ContextConfig::truncate_tool_output_on_append`].
-pub fn truncate_tool_output(msg: AgentMessage, max_lines: usize) -> AgentMessage {
+pub fn truncate_tool_output(msg: AgentMessage, config: &ContextConfig) -> AgentMessage {
     match msg {
         AgentMessage::Llm(Message::ToolResult {
             tool_call_id,
@@ -335,6 +379,7 @@ pub fn truncate_tool_output(msg: AgentMessage, max_lines: usize) -> AgentMessage
             is_error,
             timestamp,
         }) => {
+            let max_lines = config.max_lines_for(&tool_name);
             let truncated_content: Vec<Content> = content
                 .into_iter()
                 .map(|c| match c {
@@ -1026,8 +1071,12 @@ mod tests {
             timestamp: 7,
         });
 
-        let once = truncate_tool_output(msg, 50);
-        let twice = truncate_tool_output(once.clone(), 50);
+        let config = ContextConfig {
+            tool_output_max_lines: 50,
+            ..Default::default()
+        };
+        let once = truncate_tool_output(msg, &config);
+        let twice = truncate_tool_output(once.clone(), &config);
         assert_eq!(once, twice, "on-append truncation must be idempotent");
 
         match &once {
@@ -1045,7 +1094,7 @@ mod tests {
 
         // Non-tool-result messages pass through untouched.
         let user = AgentMessage::Llm(Message::user("hello"));
-        assert_eq!(truncate_tool_output(user.clone(), 1), user);
+        assert_eq!(truncate_tool_output(user.clone(), &config), user);
     }
 
     #[test]
@@ -1065,7 +1114,13 @@ mod tests {
             }),
         ];
 
-        let compacted = level1_truncate_tool_outputs(&messages, 20);
+        let compacted = level1_truncate_tool_outputs(
+            &messages,
+            &ContextConfig {
+                tool_output_max_lines: 20,
+                ..Default::default()
+            },
+        );
         let tool_msg = &compacted[1];
         if let AgentMessage::Llm(Message::ToolResult { content, .. }) = tool_msg {
             if let Content::Text { text } = &content[0] {

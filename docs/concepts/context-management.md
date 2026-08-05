@@ -90,13 +90,14 @@ For LLM-based summarization (asking the model to summarize old messages), implem
 
 ```rust
 pub struct ContextConfig {
-    pub max_context_tokens: usize,               // Default: 100,000
-    pub system_prompt_tokens: usize,             // Default: 4,000
-    pub keep_recent: usize,                      // Default: 10
-    pub keep_first: usize,                       // Default: 2
-    pub tool_output_max_lines: usize,            // Default: 50
-    pub compact_target_ratio: f32,               // Default: 0.7
-    pub truncate_tool_output_on_append: bool,    // Default: false
+    pub max_context_tokens: usize,                            // Default: 100,000
+    pub system_prompt_tokens: usize,                          // Default: 4,000
+    pub keep_recent: usize,                                   // Default: 10
+    pub keep_first: usize,                                    // Default: 2
+    pub tool_output_max_lines: usize,                         // Default: 200
+    pub tool_output_max_lines_overrides: HashMap<String, usize>, // Default: {"read_file": MAX}
+    pub compact_target_ratio: f32,                            // Default: 0.7
+    pub truncate_tool_output_on_append: bool,                 // Default: true
 }
 ```
 
@@ -152,27 +153,35 @@ Compaction is built around that:
 - `compact_target_ratio` gives compaction headroom. It still *triggers* at the full budget, but the lossy levels reduce to `budget × ratio` (default 70%) rather than to whatever just barely fits — otherwise the next turn crosses the budget again and history is rewritten every single turn.
 - Markers and generated summaries carry no wall-clock timestamps or drifting counts, so the same history always compacts to the same bytes.
 
-### truncate_tool_output_on_append
+### Bounding tool output: two layers
 
-The largest remaining source of cache loss is *retroactive* truncation: a tool output is sent in full, cached, and then rewritten by Level 1 once the session goes over budget. Setting `truncate_tool_output_on_append` applies `tool_output_max_lines` when the tool result is appended instead, so the bytes the provider cached are the bytes that stay:
+The largest source of cache loss is *retroactive* truncation — output is sent in full, cached, then rewritten by Level 1 in one sweep once the session goes over budget. Bounding it as it arrives fixes that, but a single global cap is the wrong instrument, because tools differ in how well they survive being cut:
+
+**Command output** (`bash`, `search`) takes a head+tail cut well: the first error is at the top, the summary at the bottom, and the middle is repetition. `tool_output_max_lines` (200) is applied on append, controlled by `truncate_tool_output_on_append` (on by default).
+
+**File reads** do not. The middle of a source file is usually the part that was asked for, so head+tail removes exactly the wrong lines. `read_file` bounds itself instead, by paging: it returns `DEFAULT_READ_MAX_LINES` (500) at a time with a header stating the true total, and the agent asks for the next range with `offset`/`limit`. That bound is lossless and directed. `read_file` is therefore exempt from head+tail truncation by default, via `tool_output_max_lines_overrides`.
+
+Custom tools pick their own budget the same way:
 
 ```rust
-let agent = Agent::from_config(ModelConfig::deepseek("deepseek-chat", "DeepSeek Chat"))
-    .with_context_config(ContextConfig {
-        truncate_tool_output_on_append: true,
-        ..ContextConfig::from_context_window(128_000)
-    });
+let mut config = ContextConfig::from_context_window(128_000);
+config.tool_output_max_lines_overrides.insert("my_paging_tool".into(), usize::MAX);
+config.tool_output_max_lines_overrides.insert("noisy_tool".into(), 40);
 ```
 
-The trade-off is that a long tool output is trimmed even when the budget had room for it, which is why it is off by default. The untruncated output is always available in the `AgentEvent` stream either way.
+To restore pre-0.15 behaviour, set `truncate_tool_output_on_append: false` and construct `ReadFileTool { max_lines: usize::MAX, ..Default::default() }`.
 
-Measured over a 300-turn synthetic tool-heavy session on a 128K window (`tests/context_cache_test.rs`):
+### Measured effect
+
+`tests/context_cache_test.rs` replays 300 turns on a 128K window. The tool mix (bash 41%, edit/write 36%, read 19%, search 4%) and file-size distribution come from 808 archived runs of a production agent built on yoagent.
 
 | | prefix-cache hit rate | history rewrites |
 |---|---|---|
-| 0.14.2 | 95.80% | 16 |
-| 0.15.0 defaults | 96.85% | 15 |
-| 0.15.0 + `truncate_tool_output_on_append` | 98.51% | 2 |
+| 0.14.2 | 93.58% | 23 |
+| 0.15.0, 0.14.2-equivalent settings | 94.38% | 22 |
+| 0.15.0 defaults | **96.04%** | **8** |
+
+Read page size is the dominant remaining lever — hit rate is flat between a 300- and 500-line page (96.2% / 96.0%) and falls to 94.2% at 1000 and 92.9% at 2000. 500 is the largest page that costs nothing extra. Lowering it to 200 buys about a further 1.2 points, at the cost of more read round-trips.
 
 ## ExecutionLimits
 

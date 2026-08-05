@@ -448,3 +448,91 @@ async fn test_read_text_file_unchanged() {
 
     let _ = std::fs::remove_file(tmp);
 }
+
+#[tokio::test]
+async fn test_read_file_pages_long_files_by_default() {
+    let tmp = std::env::temp_dir().join("yoagent-test-paging.txt");
+    let path = tmp.to_str().unwrap();
+
+    let total = yoagent::tools::DEFAULT_READ_MAX_LINES * 2;
+    let content = (1..=total)
+        .map(|i| format!("line {}", i))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&tmp, &content).unwrap();
+
+    let tool = ReadFileTool::new();
+    let result = tool
+        .execute(serde_json::json!({"path": path}), ctx("read_file"))
+        .await
+        .unwrap();
+    let Content::Text { text } = &result.content[0] else {
+        panic!("expected text")
+    };
+
+    // One page, and the header states the true total so the agent can page on.
+    assert!(text.contains(&format!("of {}", total)));
+    assert!(text.contains("offset/limit"));
+    assert!(text.contains("line 1\n") || text.contains("| line 1"));
+    assert!(!text.contains(&format!("| line {}", total)));
+    assert_eq!(
+        text.lines().count(),
+        yoagent::tools::DEFAULT_READ_MAX_LINES + 1, // + header
+    );
+
+    // Paging forward reaches the end.
+    let result = tool
+        .execute(
+            serde_json::json!({"path": path, "offset": yoagent::tools::DEFAULT_READ_MAX_LINES + 1}),
+            ctx("read_file"),
+        )
+        .await
+        .unwrap();
+    let Content::Text { text } = &result.content[0] else {
+        panic!("expected text")
+    };
+    assert!(text.contains(&format!("| line {}", total)));
+
+    // An explicit limit still wins, and short files are unaffected.
+    let result = tool
+        .execute(
+            serde_json::json!({"path": path, "limit": 3}),
+            ctx("read_file"),
+        )
+        .await
+        .unwrap();
+    let Content::Text { text } = &result.content[0] else {
+        panic!("expected text")
+    };
+    assert_eq!(text.lines().count(), 4); // header + 3
+
+    let _ = std::fs::remove_file(tmp);
+}
+
+#[tokio::test]
+async fn test_read_file_unbounded_when_max_lines_disabled() {
+    let tmp = std::env::temp_dir().join("yoagent-test-unbounded.txt");
+    let path = tmp.to_str().unwrap();
+    let total = yoagent::tools::DEFAULT_READ_MAX_LINES + 50;
+    let content = (1..=total)
+        .map(|i| format!("line {}", i))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&tmp, &content).unwrap();
+
+    let tool = ReadFileTool {
+        max_lines: usize::MAX,
+        ..Default::default()
+    };
+    let result = tool
+        .execute(serde_json::json!({"path": path}), ctx("read_file"))
+        .await
+        .unwrap();
+    let Content::Text { text } = &result.content[0] else {
+        panic!("expected text")
+    };
+    assert_eq!(text.lines().count(), total + 1);
+    assert!(text.contains(&format!("[{} lines]", total)));
+
+    let _ = std::fs::remove_file(tmp);
+}
