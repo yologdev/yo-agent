@@ -644,19 +644,30 @@ fn issue_101_gate_experiment() {
             Pricing::anthropic(),
         ),
         (
+            "ratio 0.5 / deepseek ",
+            ContextConfig {
+                compact_target_ratio: 0.5,
+                ..session_config()
+            },
+            Pricing::deepseek(),
+        ),
+        (
+            "ratio 0.3 / deepseek ",
+            ContextConfig {
+                compact_target_ratio: 0.3,
+                ..session_config()
+            },
+            Pricing::deepseek(),
+        ),
+        (
             "legacy    / deepseek ",
             legacy_config(),
             Pricing::deepseek(),
         ),
-        (
-            "legacy    / anthropic",
-            legacy_config(),
-            Pricing::anthropic(),
-        ),
     ] {
         let config = &config;
         println!("\n== {label} ==");
-        for turns in [150usize, 300, 600] {
+        for turns in [300usize, 1200, 2400] {
             MAX_BREAK_EVEN.with(|m| m.set(0.0));
             MAX_IH.with(|m| m.set(0.0));
             let base = replay_costed(turns, config, pricing, false, hard);
