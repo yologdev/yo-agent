@@ -180,7 +180,30 @@ pub struct ContextConfig {
     ///
     /// Clamped to `[0.05, 1.0]` (a non-finite value falls back to `1.0`).
     /// `1.0` restores the old compact-to-just-fit behaviour. Default: `0.7`.
+    ///
+    /// Acts as a ceiling on retention when `compact_headroom_turns` is also
+    /// set — the headroom policy may compact harder, never softer.
     pub compact_target_ratio: f32,
+    /// Compact hard enough to buy this many more turns before the next
+    /// compaction, at the session's observed growth rate.
+    ///
+    /// A fixed ratio has no idea how fast a session is growing, so the
+    /// headroom it leaves is arbitrary and the interval between compactions
+    /// collapses as history accumulates. This targets the interval directly:
+    ///
+    /// ```text
+    /// target = budget - turns × observed_growth_per_turn
+    /// ```
+    ///
+    /// The effective ratio is `min(target / budget, compact_target_ratio)`,
+    /// floored at [`MIN_HEADROOM_RATIO`], so this can only make compaction
+    /// more aggressive than the ratio alone — never less.
+    ///
+    /// Growth is measured by the agent loop, so this is only honoured there;
+    /// a direct [`compact_messages`] call uses `compact_target_ratio` as-is.
+    /// `None` disables the policy. Default: `Some(30)`.
+    #[serde(default = "default_headroom_turns")]
+    pub compact_headroom_turns: Option<usize>,
     /// Apply `tool_output_max_lines` when a tool result is appended, rather
     /// than only once the session is over budget.
     ///
@@ -211,9 +234,20 @@ impl Default for ContextConfig {
             tool_output_max_lines: 200,
             tool_output_max_lines_overrides: default_tool_output_overrides(),
             compact_target_ratio: 0.7,
+            compact_headroom_turns: default_headroom_turns(),
             truncate_tool_output_on_append: true,
         }
     }
+}
+
+/// Lower bound on the ratio the headroom policy may derive.
+///
+/// A session whose growth per turn approaches the whole budget would otherwise
+/// ask compaction to discard essentially everything.
+pub const MIN_HEADROOM_RATIO: f32 = 0.15;
+
+fn default_headroom_turns() -> Option<usize> {
+    Some(30)
 }
 
 /// Tools whose output the default head+tail cap would damage.
@@ -236,6 +270,35 @@ impl ContextConfig {
             max_context_tokens,
             ..Default::default()
         }
+    }
+
+    /// The compaction ratio to use given the session's observed growth rate.
+    ///
+    /// Returns `compact_target_ratio` unchanged when no headroom policy is
+    /// set, or when the growth rate is not yet known. Otherwise derives a
+    /// ratio that leaves room for `compact_headroom_turns` more turns, and
+    /// takes whichever of the two is more aggressive.
+    ///
+    /// See [`compact_headroom_turns`](Self::compact_headroom_turns).
+    pub fn effective_target_ratio(&self, growth_tokens_per_turn: f64) -> f32 {
+        let Some(turns) = self.compact_headroom_turns else {
+            return self.compact_target_ratio;
+        };
+        // NaN and non-positive growth both mean "no usable estimate yet".
+        if turns == 0 || !growth_tokens_per_turn.is_finite() || growth_tokens_per_turn <= 0.0 {
+            return self.compact_target_ratio;
+        }
+        let budget = self
+            .max_context_tokens
+            .saturating_sub(self.system_prompt_tokens) as f64;
+        if budget <= 0.0 {
+            return self.compact_target_ratio;
+        }
+        let target = budget - (turns as f64) * growth_tokens_per_turn;
+        let derived = (target / budget) as f32;
+        derived
+            .min(self.compact_target_ratio)
+            .max(MIN_HEADROOM_RATIO)
     }
 
     /// The line cap that applies to a given tool's output.
@@ -906,6 +969,64 @@ mod tests {
             total_tokens(&result) <= 4_000,
             "compacted to {} tokens, expected <= 4000 (50% of budget)",
             total_tokens(&result)
+        );
+    }
+
+    #[test]
+    fn test_headroom_policy_derives_the_ratio_from_growth() {
+        let config = ContextConfig {
+            max_context_tokens: 100_000,
+            system_prompt_tokens: 0,
+            compact_target_ratio: 0.7,
+            compact_headroom_turns: Some(30),
+            ..Default::default()
+        };
+
+        // 1000 tokens/turn * 30 turns = 30K headroom -> target 70K -> 0.70,
+        // which ties the ratio; nothing changes.
+        assert!((config.effective_target_ratio(1000.0) - 0.7).abs() < 1e-6);
+
+        // Faster growth needs a deeper cut than the ratio would give.
+        assert!((config.effective_target_ratio(2000.0) - 0.4).abs() < 1e-6);
+
+        // Slow growth would allow keeping more, but the ratio is a ceiling.
+        assert!((config.effective_target_ratio(100.0) - 0.7).abs() < 1e-6);
+
+        // Runaway growth is floored so compaction cannot wipe history.
+        assert_eq!(
+            config.effective_target_ratio(1_000_000.0),
+            MIN_HEADROOM_RATIO
+        );
+    }
+
+    #[test]
+    fn test_headroom_policy_is_inert_without_a_growth_estimate() {
+        let config = ContextConfig {
+            max_context_tokens: 100_000,
+            system_prompt_tokens: 0,
+            compact_target_ratio: 0.6,
+            compact_headroom_turns: Some(30),
+            ..Default::default()
+        };
+        // No growth measured yet, or a degenerate policy.
+        assert_eq!(config.effective_target_ratio(0.0), 0.6);
+        assert_eq!(config.effective_target_ratio(-5.0), 0.6);
+        assert_eq!(config.effective_target_ratio(f64::NAN), 0.6);
+        assert_eq!(
+            ContextConfig {
+                compact_headroom_turns: Some(0),
+                ..config.clone()
+            }
+            .effective_target_ratio(1000.0),
+            0.6
+        );
+        assert_eq!(
+            ContextConfig {
+                compact_headroom_turns: None,
+                ..config
+            }
+            .effective_target_ratio(9999.0),
+            0.6
         );
     }
 

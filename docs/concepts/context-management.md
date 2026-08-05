@@ -97,6 +97,7 @@ pub struct ContextConfig {
     pub tool_output_max_lines: usize,                         // Default: 200
     pub tool_output_max_lines_overrides: HashMap<String, usize>, // Default: {"read_file": MAX}
     pub compact_target_ratio: f32,                            // Default: 0.7
+    pub compact_headroom_turns: Option<usize>,                // Default: Some(30)
     pub truncate_tool_output_on_append: bool,                 // Default: true
 }
 ```
@@ -150,7 +151,7 @@ Providers cache request prefixes — automatically on DeepSeek, explicitly via `
 Compaction is built around that:
 
 - Levels are idempotent where they can be, so re-running on settled history changes nothing.
-- `compact_target_ratio` gives compaction headroom. It still *triggers* at the full budget, but the lossy levels reduce to `budget × ratio` (default 70%) rather than to whatever just barely fits — otherwise the next turn crosses the budget again and history is rewritten every single turn.
+- `compact_headroom_turns` sets the compaction target from the session's observed growth rate — `target = budget − turns × growth_per_turn` — so the gap between compactions stays constant instead of collapsing as history accumulates. `compact_target_ratio` is the fallback and acts as a ceiling on retention. See [Prompt Caching](prompt-caching.md#3-the-compaction-target-adapts) for the full formula and measurements.
 - Markers and generated summaries carry no wall-clock timestamps or drifting counts, so the same history always compacts to the same bytes.
 
 ### Bounding tool output: two layers
@@ -175,13 +176,13 @@ To restore pre-0.15 behaviour, set `truncate_tool_output_on_append: false` and c
 
 `tests/context_cache_test.rs` replays 300 turns on a 128K window. The tool mix (bash 41%, edit/write 36%, read 19%, search 4%) and file-size distribution come from 808 archived runs of a production agent built on yoagent.
 
-| | prefix-cache hit rate | history rewrites |
-|---|---|---|
-| 0.14.2 | 93.58% | 23 |
-| 0.15.0, 0.14.2-equivalent settings | 94.38% | 22 |
-| 0.15.0 defaults | **96.04%** | **8** |
+| session | 0.14.2 hit rate | 0.15.0 hit rate | 0.14.2 rewrites | 0.15.0 rewrites |
+|---|---|---|---|---|
+| 300 turns | 93.83% | **95.69%** | 34 | **8** |
+| 1200 turns | 94.24% | **95.39%** | 169 | **35** |
+| 2400 turns | 94.77% | **95.27%** | 415 | **70** |
 
-Read page size is the dominant remaining lever — hit rate is flat between a 300- and 500-line page (96.2% / 96.0%) and falls to 94.2% at 1000 and 92.9% at 2000. 500 is the largest page that costs nothing extra. Lowering it to 200 buys about a further 1.2 points, at the cost of more read round-trips.
+In input-token spend that is −9.2% to −21.3% on DeepSeek and −15.2% to −22.8% on Anthropic, widening with session length. Full breakdown and the reasoning behind each default: [Prompt Caching](prompt-caching.md#cache-stable-compaction).
 
 ## ExecutionLimits
 
