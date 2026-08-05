@@ -4,6 +4,97 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.15.0
+
+### Fixed
+
+- **Compaction rewrote history in place, discarding the provider's prefix
+  cache** ([#99](https://github.com/yologdev/yoagent/issues/99)). A cache hit
+  requires a byte-identical prefix, so every rewrite of already-sent history
+  costs full price for every token from the rewrite point on — automatically on
+  DeepSeek, and via `cache_control` on Anthropic. Four separate sources of
+  churn are gone:
+  - `truncate_text_head_tail` was not idempotent. The `[... N lines truncated
+    ...]` marker pushed the result past `tool_output_max_lines`, so the next
+    compaction pass re-truncated it and restated the count (`950 lines
+    truncated` became `3 lines truncated`) — a second full-prefix
+    invalidation, and a marker that lied about how much was dropped. The
+    marker is now charged against the line budget, so the result fits exactly
+    and re-truncating is a no-op.
+  - Compaction reduced to whatever just barely fit, so the next turn crossed
+    the budget again and rewrote history *every turn*. The new
+    `ContextConfig::compact_target_ratio` (default `0.7`) makes the lossy
+    levels reduce to a fraction of the budget while still triggering at the
+    full budget. Set it to `1.0` for the old behaviour.
+  - Level 3's marker embedded a message count and sat at a fixed position near
+    the front, so the cached prefix changed on every pass. The marker text is
+    now constant and the count goes to the debug log.
+  - Level 2's generated summaries and the Level 3 marker were stamped with
+    `now_ms()`, making compaction non-deterministic. They now inherit the
+    timestamp of the content they replace.
+- **Compaction could orphan tool calls.** Level 2's boundary
+  (`len - keep_recent`) could land mid-turn, summarizing away an assistant
+  message while its tool results stayed in the kept section; Level 3 and
+  `keep_within_budget` could cut the mirror image. Every provider rejects both.
+  Boundaries now snap to turn starts.
+
+### Added
+
+- `ContextConfig::truncate_tool_output_on_append` (**default `true`**) applies
+  the line cap when a tool result is appended rather than retroactively during
+  compaction. Retroactive truncation was the single largest remaining source of
+  cache loss: output is sent in full, cached, then rewritten in one sweep once
+  the session goes over budget. Capping on the way in also slows context
+  growth, so compaction runs less often. The untruncated output is still
+  carried by the `AgentEvent` stream.
+- `ContextConfig::tool_output_max_lines_overrides` — per-tool line budgets. One
+  global number cannot serve every tool: head+tail is a good cut for command
+  output (first error at the top, summary at the bottom, repetition in the
+  middle) and the *wrong* cut for a file read, where the middle is the part
+  that was asked for. The default exempts `read_file`, which bounds itself by
+  paging instead. `usize::MAX` disables truncation for a tool.
+- `ReadFileTool::max_lines` / `tools::DEFAULT_READ_MAX_LINES` (500) — an
+  unqualified read used to return the whole file. Measured against a real Rust
+  codebase, the median source file is 1364 lines and 96% exceed 200, so one
+  read could spend ~15K tokens; reads are ~19% of tool calls. Paging is the
+  right bound for a file — unlike head+tail it is lossless and directed, and
+  the header now states the true total and tells the agent to use
+  `offset`/`limit`. 500 was chosen by measurement: hit rate is flat between a
+  300- and 500-line page and falls off sharply above it.
+- `context::truncate_tool_output()` — the single-message helper behind Level 1,
+  now public for custom loops and compaction strategies.
+- `tests/context_cache_test.rs` replays a session through `compact_messages`
+  turn by turn and measures the shared prefix between consecutive requests —
+  the direct analogue of DeepSeek's `cache_hit_tokens / input_tokens`. The tool
+  mix (bash 41%, edit/write 36%, read 19%, search 4%) and the file-size
+  distribution are taken from 808 archived runs of a production agent built on
+  yoagent. Over 300 turns on a 128K window:
+
+  | | prefix-cache hit rate | history rewrites |
+  |---|---|---|
+  | 0.14.2 | 93.58% | 23 |
+  | 0.15.0, 0.14.2-equivalent settings | 94.38% | 22 |
+  | 0.15.0 defaults | **96.04%** | **8** |
+
+### Changed
+
+- Level 3 now drops the smallest span of middle messages that reaches the
+  target instead of always collapsing to `keep_first` + `keep_recent`, so
+  compaction destroys only as much history as the budget requires.
+- `ContextConfig::tool_output_max_lines` default raised from 50 to 200. It now
+  applies on append rather than only under budget pressure, and 50 lines
+  (≈23 head + 24 tail) cuts the error list out of most build output.
+- **Breaking:** `ContextConfig` gained three public fields
+  (`compact_target_ratio`, `truncate_tool_output_on_append`,
+  `tool_output_max_lines_overrides`) and `ReadFileTool` gained `max_lines`.
+  Code that constructs either with an exhaustive struct literal needs
+  `..Default::default()`; code using `default()`, `new()`,
+  `from_context_window()`, or functional update syntax is unaffected.
+- **Breaking (behaviour):** tool output is now capped as it enters the context,
+  and an unqualified `read_file` returns 500 lines instead of the whole file.
+  To restore the old behaviour set `truncate_tool_output_on_append: false` and
+  `ReadFileTool { max_lines: usize::MAX, ..Default::default() }`.
+
 ## 0.14.2
 
 ### Fixed

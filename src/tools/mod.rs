@@ -7,7 +7,7 @@ pub mod shared_state_tool;
 
 pub use bash::BashTool;
 pub use edit::EditFileTool;
-pub use file::{ReadFileTool, WriteFileTool};
+pub use file::{ReadFileTool, WriteFileTool, DEFAULT_READ_MAX_LINES};
 pub use list::ListFilesTool;
 pub use search::SearchTool;
 pub use shared_state_tool::SharedStateTool;
