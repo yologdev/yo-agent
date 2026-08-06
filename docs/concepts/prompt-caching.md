@@ -154,6 +154,28 @@ Mean turns between compactions:
 
 Set `compact_headroom_turns: None` to restore pure ratio behaviour.
 
+#### Choosing a value
+
+Replaying a 2400-turn session at a 1:10 cache-to-input price ratio:
+
+| setting | mean context | cost | compactions |
+|---|---|---|---|
+| policy off (fixed ratio) | 67,402 | $3.33 | 110 |
+| 20 | 61,740 | $3.02 | 86 |
+| **30 (default)** | **59,033** | **$2.83** | **70** |
+| 40 | 54,069 | $2.58 | 63 |
+| 60 and above | 55,283 | $2.61 | 62 |
+
+**The trade is proportional, so pick on memory rather than cost.** Cost per unit of retained context barely moves across the whole range — 4.94 down to 4.73, about 4%. There is no efficient point in this table for the data to single out: lowering the setting sells retained history for money at a nearly fixed exchange rate. Going from 30 to 40 costs 8.7% less and keeps 8.4% less. Choose it on how much history your agent needs to do its job; the cost follows mechanically.
+
+The 4% that is *not* proportional is the genuinely free part, and it comes from compacting less often rather than from retaining less.
+
+**Above roughly 60 the setting stops doing anything.** The derived ratio hits [`MIN_HEADROOM_RATIO`] (0.15) and clamps, so 60, 80, 100 and 140 produce byte-identical runs. To compact harder than that, lower `compact_target_ratio` — it is the ceiling the headroom policy is capped by, not an independent knob.
+
+**Cheaper cache argues for a smaller context, not a larger one.** The same step from a fixed ratio to headroom 60 saves 19.4% at a 1:4 cache-to-input ratio and 26.0% at 1:50. That reads backwards until you notice that once cached tokens are nearly free per token, they dominate the *count* — and you are re-sending them on every request. Vendor ratios in practice run from about 1:10 to 1:50, so the payoff for a smaller working context is larger than a 1:4 assumption would suggest.
+
+[`MIN_HEADROOM_RATIO`]: https://docs.rs/yoagent/latest/yoagent/context/constant.MIN_HEADROOM_RATIO.html
+
 ### Measured effect
 
 `tests/context_cache_test.rs` replays a session through compaction turn by turn, renders each turn as a provider body would see it, and measures the shared prefix between consecutive requests — the direct analogue of DeepSeek's `prompt_cache_hit_tokens / prompt_tokens`. The tool mix (bash 41%, edit/write 36%, read 19%, search 4%) and file-size distribution come from 808 archived runs of a production agent built on yoagent. Old and new are measured through the identical code path, on a 128K window.
