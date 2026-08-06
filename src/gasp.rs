@@ -53,6 +53,14 @@ use yoagent_state::{
     YoAgentToolCalled, YoAgentToolFinished,
 };
 pub use yoagent_state::{GoalId, RunId, StateError};
+// The extension-path types (see [`GaspRecorder::with_store`]): everything the
+// `YoAgentState::record_*` methods take, so applications recording the
+// goal/task/verdict tier need no direct `yoagent-state` dependency (a
+// version-skewed duplicate produces baffling type errors).
+pub use yoagent_state::{
+    Decision, DecisionStatus, EvalResult, EvalStatus, EventStore, Goal as GaspGoal, GoalStatus,
+    Hypothesis, Observation, StatePatch, Task, TaskId, TaskStatus,
+};
 
 /// Which GASP goal recorded runs belong to (stamped into each run-boundary
 /// commit's `Goal:` trailer).
@@ -110,7 +118,28 @@ impl GaspRecorder {
         Self::with_store(store, agent_id, goal).await
     }
 
-    async fn with_store(
+    /// Open a recorder on a store the caller owns.
+    ///
+    /// This is the extension path for applications that record more than the
+    /// run/model/tool tier — goals, tasks, verdicts, evals — into the *same*
+    /// ledger: open the [`GitEventStore`] yourself, build a
+    /// [`YoAgentState`](yoagent_state::YoAgentState) on a clone of it for your
+    /// own `record_*` calls, and hand the recorder this handle. One store, one
+    /// writer process, no cross-process coordination.
+    ///
+    /// # Writer model
+    ///
+    /// - **One store per agent**; concurrent writer *processes* on one clone
+    ///   are not supported (the open-run check below assumes it).
+    /// - `worker_id` (in [`GitEventStore::open`]) distinguishes writers in the
+    ///   log; use a distinct id per host/CI lane.
+    /// - The recorder commits at **run close** (stream end). Events appended
+    ///   between commits are durable in the working tree but unpushed —
+    ///   callers on ephemeral runners should push after each run, or crashed
+    ///   sessions vanish from the corpus.
+    /// - A run left open by a crashed process is closed as `"interrupted"` on
+    ///   the next open.
+    pub async fn with_store(
         store: GitEventStore,
         agent_id: &str,
         goal: GoalRef,
@@ -319,6 +348,7 @@ async fn record_event(
                     content,
                     model,
                     stop_reason,
+                    usage,
                     ..
                 }),
         } if tracking.started => {
@@ -340,10 +370,22 @@ async fn record_event(
                     _ => None,
                 })
                 .unwrap_or("(no text)");
+            // Token usage makes the log sufficient for offline cost analysis,
+            // and makes compactions inferable: a sharp drop in input tokens
+            // between consecutive model calls in one run is the compaction
+            // signature (no separate event kind needed).
             sink.on_model_finished(YoAgentModelFinished {
                 run_id: tracking.run_id.clone(),
                 model: model.clone(),
                 output_summary: summarize(text),
+                metadata: serde_json::json!({
+                    "usage": {
+                        "input": usage.input,
+                        "output": usage.output,
+                        "cache_read": usage.cache_read,
+                        "cache_write": usage.cache_write,
+                    }
+                }),
             })
             .await?;
             tracking.outcome = outcome_for(stop_reason).to_string();
@@ -355,6 +397,9 @@ async fn record_event(
                 run_id: tracking.run_id.clone(),
                 tool: tool_name.clone(),
                 input_summary: summarize(&args.to_string()),
+                metadata: serde_json::json!({
+                    "args_fingerprint": args_fingerprint(tool_name, args),
+                }),
             })
             .await?;
         }
@@ -439,6 +484,48 @@ fn commit_scaffolding(store: &GitEventStore) -> Result<(), StateError> {
 
 /// One-line, bounded summary for semantic events — full content belongs in
 /// the transcripts tier, not the event log.
+/// Stable identity for a tool call, so calls can be *matched* across a log —
+/// `input_summary` is a truncated human summary and cannot be.
+///
+/// Normalized per tool rather than hashing the raw argument bytes: the file
+/// tools page and re-slice (`offset`/`limit` on `read_file` since 0.15), so a
+/// re-read of the same file arrives with different argument bytes. Hashing the
+/// full JSON would then undercount re-fetches for exactly the tools where they
+/// are most diagnostic. Identity per tool:
+///
+/// - `read_file` / `edit_file` / `write_file` / `list_files`: the `path` /
+///   `directory` argument
+/// - `bash`: the `command`
+/// - anything else: the full arguments, serialized
+fn args_fingerprint(tool_name: &str, args: &serde_json::Value) -> String {
+    let identity = match tool_name {
+        "read_file" | "edit_file" | "write_file" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        "list_files" => args
+            .get("directory")
+            .or_else(|| args.get("path"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        "bash" => args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        _ => None,
+    }
+    .unwrap_or_else(|| args.to_string());
+
+    // FNV-1a: stable across runs and platforms (DefaultHasher is neither
+    // guaranteed stable across Rust releases nor documented as such).
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in identity.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{tool_name}:{hash:016x}")
+}
+
 fn summarize(text: &str) -> String {
     let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.chars().count() <= 200 {
@@ -461,7 +548,55 @@ fn outcome_for(stop_reason: &StopReason) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::summarize;
+    use super::{args_fingerprint, summarize};
+
+    #[test]
+    fn fingerprint_is_stable_and_tool_scoped() {
+        let args = serde_json::json!({"path": "src/main.rs"});
+        let a = args_fingerprint("read_file", &args);
+        let b = args_fingerprint("read_file", &args);
+        assert_eq!(a, b, "same call must fingerprint identically");
+        assert!(a.starts_with("read_file:"));
+        // Same args through a different tool is a different call.
+        assert_ne!(a, args_fingerprint("edit_file", &args));
+    }
+
+    #[test]
+    fn fingerprint_ignores_read_paging() {
+        // read_file pages since 0.15: a re-read of a lost file arrives with
+        // different offset/limit bytes. Identity is the path, or re-fetches
+        // of exactly the most diagnostic tool go uncounted.
+        let full = serde_json::json!({"path": "src/big.rs"});
+        let page = serde_json::json!({"path": "src/big.rs", "offset": 501, "limit": 500});
+        assert_eq!(
+            args_fingerprint("read_file", &full),
+            args_fingerprint("read_file", &page)
+        );
+        // Different files stay distinct.
+        let other = serde_json::json!({"path": "src/other.rs"});
+        assert_ne!(
+            args_fingerprint("read_file", &full),
+            args_fingerprint("read_file", &other)
+        );
+    }
+
+    #[test]
+    fn fingerprint_bash_keys_on_command_and_default_on_full_args() {
+        let a = serde_json::json!({"command": "cargo test"});
+        let b = serde_json::json!({"command": "cargo test", "timeout": 60});
+        // bash identity is the command; ancillary knobs don't split it.
+        assert_eq!(args_fingerprint("bash", &a), args_fingerprint("bash", &b));
+        // Unknown tools fall back to full-args identity.
+        let x = serde_json::json!({"q": "foo"});
+        let y = serde_json::json!({"q": "bar"});
+        assert_ne!(
+            args_fingerprint("web_search", &x),
+            args_fingerprint("web_search", &y)
+        );
+        // Malformed / non-object args must not panic.
+        let weird = serde_json::json!("just a string");
+        assert!(args_fingerprint("read_file", &weird).starts_with("read_file:"));
+    }
 
     #[test]
     fn summarize_collapses_and_truncates_on_char_boundaries() {

@@ -390,17 +390,35 @@ pub fn compact_messages(messages: Vec<AgentMessage>, config: &ContextConfig) -> 
     }
 
     let target = config.compaction_target(budget);
+    let before = total_tokens(&messages);
 
     // Level 1: Truncate tool outputs. Checked against the full budget, not the
     // target: this level is idempotent and cheap to repeat, so there is nothing
     // to gain by escalating to the lossy levels before we have to.
     let compacted = level1_truncate_tool_outputs(&messages, config);
-    if total_tokens(&compacted) <= budget {
+    let after_l1 = total_tokens(&compacted);
+    if after_l1 < before {
+        tracing::debug!(
+            "compaction level 1: tool outputs truncated, {} -> {} tokens",
+            before,
+            after_l1
+        );
+    }
+    if after_l1 <= budget {
         return compacted;
     }
 
     // Level 2: Summarize old turns (keep recent N full, summarize the rest)
+    let before_l2 = compacted.len();
     let compacted = level2_summarize_old_turns(&compacted, config.keep_recent);
+    if compacted.len() != before_l2 {
+        tracing::debug!(
+            "compaction level 2: old turns summarized, {} -> {} messages ({} tokens)",
+            before_l2,
+            compacted.len(),
+            total_tokens(&compacted)
+        );
+    }
     if total_tokens(&compacted) <= target {
         return compacted;
     }

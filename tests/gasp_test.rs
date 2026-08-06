@@ -622,3 +622,54 @@ async fn tee_delivers_the_complete_event_stream() {
 
     assert_eq!(direct, teed, "tee must deliver every event, in order");
 }
+
+#[tokio::test]
+async fn tool_fingerprint_and_usage_reach_the_log() {
+    ensure_git_identity();
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = GaspRecorder::init(
+        dir.path(),
+        "test-agent",
+        "w1",
+        GoalRef::New {
+            title: "measurement goal".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut agent = Agent::from_provider(tool_then_text_provider(), ModelConfig::mock())
+        .with_tools(vec![Box::new(NoopTool)]);
+    let (tx, handle) = recorder.recording_sender("measured run", None);
+    agent.prompt_with_sender("measured run", tx).await;
+    handle.await.unwrap().unwrap().expect("run recorded");
+
+    let raw = std::fs::read_to_string(dir.path().join("state/events.jsonl")).unwrap();
+    let events: Vec<serde_json::Value> = raw
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    // tool.called must carry a stable fingerprint so calls can be matched
+    // across the log — input_summary is truncated and cannot be.
+    let tool_called = events
+        .iter()
+        .find(|e| e["kind"] == "tool.called")
+        .expect("tool.called recorded");
+    let fp = tool_called["payload"]["metadata"]["args_fingerprint"]
+        .as_str()
+        .expect("args_fingerprint present");
+    assert!(fp.starts_with("noop:"), "got {fp}");
+
+    // model.finished must carry usage — this is what makes the log
+    // sufficient for cost analysis and compaction inference.
+    let model_finished = events
+        .iter()
+        .find(|e| e["kind"] == "model.finished")
+        .expect("model.finished recorded");
+    let usage = &model_finished["payload"]["metadata"]["usage"];
+    assert!(usage["input"].is_number(), "usage.input missing: {usage}");
+    assert!(usage["output"].is_number());
+    assert!(usage["cache_read"].is_number());
+    assert!(usage["cache_write"].is_number());
+}

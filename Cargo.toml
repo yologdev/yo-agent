@@ -1,6 +1,6 @@
 [package]
 name = "yoagent"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 description = "Simple, effective agent loop with tool execution and event streaming"
 license = "MIT"
@@ -45,7 +45,7 @@ base64 = "0.22"
 openapiv3 = { version = "2", optional = true }
 serde_yaml_ng = { version = "0.10", optional = true }
 # 0.4.2 floor: 0.4.1 declared MSRV 1.85 but required 1.88 (let-chain)
-yoagent-state = { version = "0.4.2", optional = true }
+yoagent-state = { version = "0.5", optional = true }
 
 [features]
 openapi = ["dep:openapiv3", "dep:serde_yaml_ng", "reqwest/query"]
