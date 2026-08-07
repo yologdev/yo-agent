@@ -2,6 +2,7 @@ pub mod bash;
 pub mod edit;
 pub mod file;
 pub mod list;
+pub mod sandbox;
 pub mod search;
 pub mod shared_state_tool;
 
@@ -9,6 +10,7 @@ pub use bash::BashTool;
 pub use edit::EditFileTool;
 pub use file::{ReadFileTool, WriteFileTool, DEFAULT_READ_MAX_LINES};
 pub use list::ListFilesTool;
+pub use sandbox::PathSandbox;
 pub use search::SearchTool;
 pub use shared_state_tool::SharedStateTool;
 

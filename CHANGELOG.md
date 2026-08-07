@@ -4,6 +4,45 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- **`allowed_paths` was declared but never enforced.** `ReadFileTool` accepted
+  an allowlist of directory roots, defaulted it, and then ignored it — callers
+  who set it believed reads were sandboxed and they were not. It is now
+  enforced, and the same allowlist was added to `WriteFileTool`,
+  `EditFileTool`, `ListFilesTool` and `SearchTool`, which previously had no
+  path restriction at all.
+
+  Checks run against the **resolved** path via the new
+  [`tools::PathSandbox`], so `..` and symlinks cannot escape, and a
+  not-yet-created file resolves through its real parent so writes are covered.
+  Rejections do not echo the allowed roots (tool results reach the model's
+  transcript). Default stays unrestricted — no behaviour change unless the
+  allowlist is set.
+
+- **Credentials could reach `Debug` output.** `StreamConfig` derived `Debug`
+  with a plaintext `api_key`, and `ModelConfig` derived it with a `headers`
+  map that conventionally carries `Authorization` / `x-api-key`. Any `{:?}` in
+  a log line or panic message printed them. Both now have manual `Debug` impls
+  that redact — `StreamConfig` still distinguishes a set key from an empty
+  one, and `ModelConfig` keeps header *names*. `ModelConfig`'s `Serialize` is
+  intentionally unchanged so saved configs still round-trip.
+
+### Added
+
+- `BashTool::with_env_allowlist` — pass only named environment variables (plus
+  `PATH`, `HOME`, `PWD`) to commands. Commands otherwise inherit the agent's
+  full environment, so a model-authored command can read any `*_API_KEY` the
+  process holds. Default behaviour unchanged.
+
+### Changed
+
+- Documented plainly that **`BashTool` is not a sandbox**: `deny_patterns` is
+  a substring check for typos, bypassed by whitespace, quoting or encoding.
+  Isolation belongs in a container/VM or `ToolMiddleware`.
+
 ## 0.16.1
 
 ### Added

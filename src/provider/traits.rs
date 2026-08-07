@@ -40,7 +40,7 @@ pub enum StreamEvent {
 /// let mut config = StreamConfig::new("claude-sonnet-5", "sk-key");
 /// config.system_prompt = "be brief".into();
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct StreamConfig {
     pub model: String,
@@ -61,6 +61,39 @@ pub struct StreamConfig {
     /// response format; Gemini: `responseSchema`). Providers without support
     /// log a warning and ignore it.
     pub output_schema: Option<OutputSchema>,
+}
+
+/// Redacts `api_key`. A `{:?}` of this struct reaches logs and panic
+/// messages; a derived `Debug` would print the credential verbatim.
+impl std::fmt::Debug for StreamConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamConfig")
+            .field("model", &self.model)
+            .field("system_prompt", &self.system_prompt)
+            .field("messages", &self.messages)
+            .field("tools", &self.tools)
+            .field("thinking_level", &self.thinking_level)
+            .field("api_key", &Redacted(&self.api_key))
+            .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
+            .field("model_config", &self.model_config)
+            .field("cache_config", &self.cache_config)
+            .field("output_schema", &self.output_schema)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Prints a placeholder instead of a secret, preserving only whether one is set.
+pub(crate) struct Redacted<'a>(pub(crate) &'a str);
+
+impl std::fmt::Debug for Redacted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            f.write_str("\"\"")
+        } else {
+            f.write_str("\"[redacted]\"")
+        }
+    }
 }
 
 impl StreamConfig {

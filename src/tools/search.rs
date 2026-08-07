@@ -13,6 +13,19 @@ pub struct SearchTool {
     pub max_results: usize,
     /// Timeout
     pub timeout: Duration,
+    /// Allowed directory roots (empty = no restriction).
+    ///
+    /// Enforced against the *resolved* path, so `..` and symlinks cannot
+    /// escape. See [`PathSandbox`](crate::tools::PathSandbox).
+    pub allowed_paths: Vec<String>,
+}
+
+impl SearchTool {
+    /// Restrict searching to these directory roots.
+    pub fn with_allowed_paths(mut self, paths: Vec<String>) -> Self {
+        self.allowed_paths = paths;
+        self
+    }
 }
 
 impl Default for SearchTool {
@@ -21,6 +34,7 @@ impl Default for SearchTool {
             root: None,
             max_results: 50,
             timeout: Duration::from_secs(30),
+            allowed_paths: Vec::new(),
         }
     }
 }
@@ -97,6 +111,8 @@ impl AgentTool for SearchTool {
         if cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
+
+        crate::tools::PathSandbox::new(self.allowed_paths.clone()).check(&search_path)?;
 
         // Try ripgrep first, fall back to grep
         let (cmd_name, args) = if which_exists("rg") {

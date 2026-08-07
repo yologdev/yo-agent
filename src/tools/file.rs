@@ -61,7 +61,10 @@ pub const DEFAULT_READ_MAX_LINES: usize = 500;
 pub struct ReadFileTool {
     /// Max file size to read (prevents OOM)
     pub max_bytes: usize,
-    /// Allowed directory roots (empty = no restriction)
+    /// Allowed directory roots (empty = no restriction).
+    ///
+    /// Enforced against the *resolved* path, so `..` and symlinks cannot
+    /// escape. See [`PathSandbox`](crate::tools::PathSandbox).
     pub allowed_paths: Vec<String>,
     /// Lines returned when the call specifies no `limit`.
     /// Set to `usize::MAX` to restore unbounded reads.
@@ -81,6 +84,12 @@ impl Default for ReadFileTool {
 impl ReadFileTool {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Restrict reads to these directory roots.
+    pub fn with_allowed_paths(mut self, paths: Vec<String>) -> Self {
+        self.allowed_paths = paths;
+        self
     }
 }
 
@@ -131,6 +140,8 @@ impl AgentTool for ReadFileTool {
         if ctx.cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
+
+        crate::tools::PathSandbox::new(self.allowed_paths.clone()).check(path)?;
 
         // Check file exists and size
         let metadata = tokio::fs::metadata(path)
@@ -222,7 +233,13 @@ impl AgentTool for ReadFileTool {
 // ---------------------------------------------------------------------------
 
 /// Write content to a file. Creates parent directories if needed.
-pub struct WriteFileTool;
+pub struct WriteFileTool {
+    /// Allowed directory roots (empty = no restriction).
+    ///
+    /// Enforced against the *resolved* path, so `..` and symlinks cannot
+    /// escape. See [`PathSandbox`](crate::tools::PathSandbox).
+    pub allowed_paths: Vec<String>,
+}
 
 impl Default for WriteFileTool {
     fn default() -> Self {
@@ -232,7 +249,15 @@ impl Default for WriteFileTool {
 
 impl WriteFileTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            allowed_paths: Vec::new(),
+        }
+    }
+
+    /// Restrict writes to these directory roots.
+    pub fn with_allowed_paths(mut self, paths: Vec<String>) -> Self {
+        self.allowed_paths = paths;
+        self
     }
 }
 
@@ -282,6 +307,8 @@ impl AgentTool for WriteFileTool {
         if ctx.cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
+
+        crate::tools::PathSandbox::new(self.allowed_paths.clone()).check(path)?;
 
         // Create parent directories
         if let Some(parent) = std::path::Path::new(path).parent() {

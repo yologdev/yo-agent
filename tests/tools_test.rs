@@ -536,3 +536,198 @@ async fn test_read_file_unbounded_when_max_lines_disabled() {
 
     let _ = std::fs::remove_file(tmp);
 }
+
+// ---------------------------------------------------------------------------
+// Path sandboxing — allowed_paths must actually be enforced, on every tool
+// that takes a path, against the resolved path (not the string).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn read_tool_rejects_paths_outside_allowed_roots() {
+    let tmp = std::env::temp_dir().join("yoagent-sandbox-read");
+    let ws = tmp.join("workspace");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("ok.txt"), "inside").unwrap();
+    std::fs::write(tmp.join("secret.txt"), "outside").unwrap();
+
+    let tool = ReadFileTool::new().with_allowed_paths(vec![ws.to_string_lossy().to_string()]);
+
+    // Inside the root: allowed.
+    assert!(tool
+        .execute(
+            serde_json::json!({"path": ws.join("ok.txt").to_str().unwrap()}),
+            ctx("read_file")
+        )
+        .await
+        .is_ok());
+
+    // Absolute path outside: rejected.
+    assert!(tool
+        .execute(
+            serde_json::json!({"path": tmp.join("secret.txt").to_str().unwrap()}),
+            ctx("read_file")
+        )
+        .await
+        .is_err());
+
+    // Traversal that is lexically "inside" the root: rejected.
+    let escape = ws.join("../secret.txt");
+    assert!(
+        tool.execute(
+            serde_json::json!({"path": escape.to_str().unwrap()}),
+            ctx("read_file")
+        )
+        .await
+        .is_err(),
+        "`..` must not escape the sandbox"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn write_and_edit_tools_reject_paths_outside_allowed_roots() {
+    let tmp = std::env::temp_dir().join("yoagent-sandbox-write");
+    let ws = tmp.join("workspace");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("edit.txt"), "hello").unwrap();
+    let outside = tmp.join("victim.txt");
+    std::fs::write(&outside, "original").unwrap();
+
+    let roots = vec![ws.to_string_lossy().to_string()];
+    let write = WriteFileTool::new().with_allowed_paths(roots.clone());
+    let edit = EditFileTool::new().with_allowed_paths(roots);
+
+    // A write outside the sandbox must fail *and* leave the file untouched.
+    assert!(write
+        .execute(
+            serde_json::json!({"path": outside.to_str().unwrap(), "content": "pwned"}),
+            ctx("write_file")
+        )
+        .await
+        .is_err());
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original");
+
+    // Writing a not-yet-existing file inside the sandbox still works.
+    assert!(write
+        .execute(
+            serde_json::json!({"path": ws.join("new/deep.txt").to_str().unwrap(), "content": "ok"}),
+            ctx("write_file")
+        )
+        .await
+        .is_ok());
+
+    assert!(edit
+        .execute(
+            serde_json::json!({
+                "path": outside.to_str().unwrap(),
+                "old_text": "original",
+                "new_text": "pwned"
+            }),
+            ctx("edit_file")
+        )
+        .await
+        .is_err());
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn list_and_search_tools_reject_paths_outside_allowed_roots() {
+    let tmp = std::env::temp_dir().join("yoagent-sandbox-scan");
+    let ws = tmp.join("workspace");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(tmp.join("secret.txt"), "needle").unwrap();
+
+    let roots = vec![ws.to_string_lossy().to_string()];
+    let list = ListFilesTool::default().with_allowed_paths(roots.clone());
+    let search = SearchTool::default().with_allowed_paths(roots);
+
+    assert!(list
+        .execute(
+            serde_json::json!({"path": tmp.to_str().unwrap()}),
+            ctx("list_files")
+        )
+        .await
+        .is_err());
+    assert!(search
+        .execute(
+            serde_json::json!({"pattern": "needle", "path": tmp.to_str().unwrap()}),
+            ctx("search")
+        )
+        .await
+        .is_err());
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn unrestricted_tools_are_unchanged_by_default() {
+    // The default is no sandbox; adding enforcement must not break it.
+    let tmp = std::env::temp_dir().join("yoagent-sandbox-default");
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("f.txt"), "content").unwrap();
+
+    let tool = ReadFileTool::new();
+    assert!(tool
+        .execute(
+            serde_json::json!({"path": tmp.join("f.txt").to_str().unwrap()}),
+            ctx("read_file")
+        )
+        .await
+        .is_ok());
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn bash_env_allowlist_hides_other_variables() {
+    // Model-authored commands inherit the agent's environment by default,
+    // including credentials. The allowlist is the mitigation.
+    unsafe {
+        std::env::set_var("YOAGENT_TEST_SECRET", "leaked-value");
+        std::env::set_var("YOAGENT_TEST_KEEP", "kept-value");
+    }
+
+    let guarded = BashTool::default().with_env_allowlist(vec!["YOAGENT_TEST_KEEP".to_string()]);
+    let result = guarded
+        .execute(
+            serde_json::json!({"command": "echo \"$YOAGENT_TEST_SECRET|$YOAGENT_TEST_KEEP\""}),
+            ctx("bash"),
+        )
+        .await
+        .unwrap();
+    let out = match &result.content[0] {
+        Content::Text { text } => text.clone(),
+        _ => panic!("expected text"),
+    };
+    assert!(
+        !out.contains("leaked-value"),
+        "secret reached the command: {out}"
+    );
+    assert!(out.contains("kept-value"), "allowlisted var missing: {out}");
+
+    // Default behaviour is unchanged: the full environment is inherited.
+    let plain = BashTool::default();
+    let result = plain
+        .execute(
+            serde_json::json!({"command": "echo \"$YOAGENT_TEST_SECRET\""}),
+            ctx("bash"),
+        )
+        .await
+        .unwrap();
+    let out = match &result.content[0] {
+        Content::Text { text } => text.clone(),
+        _ => panic!("expected text"),
+    };
+    assert!(
+        out.contains("leaked-value"),
+        "default should inherit env: {out}"
+    );
+
+    unsafe {
+        std::env::remove_var("YOAGENT_TEST_SECRET");
+        std::env::remove_var("YOAGENT_TEST_KEEP");
+    }
+}

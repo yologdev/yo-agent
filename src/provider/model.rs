@@ -322,7 +322,7 @@ impl OpenCodeGateway {
 /// (`ModelConfig { .. }`) no longer compile; field mutation is the supported
 /// pattern. New fields must carry `#[serde(default)]` so previously
 /// persisted configs keep deserializing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ModelConfig {
     /// Model identifier sent to the API (e.g. "gpt-4o", "claude-sonnet-4-20250514").
@@ -349,6 +349,11 @@ pub struct ModelConfig {
     #[serde(default)]
     pub cost: CostConfig,
     /// Additional headers to send with requests.
+    ///
+    /// May carry credentials (`Authorization`, `x-api-key`). `Debug` prints
+    /// header *names* with redacted values, but `Serialize` is intentionally
+    /// lossless so configs round-trip — do not serialize a `ModelConfig` into
+    /// logs or telemetry.
     #[serde(default)]
     pub headers: HashMap<String, String>,
     /// OpenAI-compat quirk flags (only for OpenAiCompletions protocol).
@@ -358,6 +363,25 @@ pub struct ModelConfig {
     /// `None` behaves like `AnthropicCompat::default()` (current generation).
     #[serde(default)]
     pub anthropic: Option<AnthropicCompat>,
+}
+
+/// Redacts header values. Headers routinely carry credentials, and a
+/// derived `Debug` would print them into any log line or panic message.
+impl std::fmt::Debug for ModelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headers: Vec<&str> = self.headers.keys().map(String::as_str).collect();
+        f.debug_struct("ModelConfig")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("api", &self.api)
+            .field("provider", &self.provider)
+            .field("base_url", &self.base_url)
+            .field("reasoning", &self.reasoning)
+            .field("context_window", &self.context_window)
+            .field("max_tokens", &self.max_tokens)
+            .field("header_names", &headers)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ModelConfig {

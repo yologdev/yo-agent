@@ -8,7 +8,13 @@ use crate::types::*;
 use async_trait::async_trait;
 
 /// Surgical file editing via exact text search/replace.
-pub struct EditFileTool;
+pub struct EditFileTool {
+    /// Allowed directory roots (empty = no restriction).
+    ///
+    /// Enforced against the *resolved* path, so `..` and symlinks cannot
+    /// escape. See [`PathSandbox`](crate::tools::PathSandbox).
+    pub allowed_paths: Vec<String>,
+}
 
 impl Default for EditFileTool {
     fn default() -> Self {
@@ -18,7 +24,15 @@ impl Default for EditFileTool {
 
 impl EditFileTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            allowed_paths: Vec::new(),
+        }
+    }
+
+    /// Restrict edits to these directory roots.
+    pub fn with_allowed_paths(mut self, paths: Vec<String>) -> Self {
+        self.allowed_paths = paths;
+        self
     }
 }
 
@@ -76,6 +90,8 @@ impl AgentTool for EditFileTool {
         if cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
+
+        crate::tools::PathSandbox::new(self.allowed_paths.clone()).check(path)?;
 
         // Read existing file
         let content = tokio::fs::read_to_string(path).await.map_err(|e| {
