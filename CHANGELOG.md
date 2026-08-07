@@ -4,6 +4,49 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.16.0
+
+GASP recorder v2 ([#104](https://github.com/yologdev/yoagent/issues/104)): the
+recorded log becomes sufficient for offline cost analysis, compaction
+inference, and call matching — the substrate for measuring whether compaction
+actually hurts an agent, rather than only what it costs.
+
+### Added
+
+- **`tool.called` carries a stable argument fingerprint**
+  (`metadata.args_fingerprint`). `input_summary` is a 200-char human summary,
+  so calls could not be matched across a log. The fingerprint is normalized
+  per tool — path for the file tools, command for `bash`, full args otherwise
+  — because `read_file` pages since 0.15 and a re-read of a lost file arrives
+  with different offset bytes; hashing raw args would undercount re-fetches
+  for exactly the most diagnostic tool. FNV-1a, stable across platforms.
+- **`model.finished` carries token usage** (`metadata.usage`: input, output,
+  cache_read, cache_write). This makes real cost computable from the log, and
+  makes compactions *inferable* — a sharp input-token drop between
+  consecutive model calls in one run is the compaction signature — which is
+  why no compaction event kind (and no `AgentEvent` break) is needed.
+- **`GaspRecorder::with_store` is public** — the extension path for
+  applications recording the goal/task/verdict tier into the same ledger:
+  open the `GitEventStore` yourself, record goals/tasks on your own
+  `YoAgentState`, hand the recorder the same handle. One store, one writer.
+  The writer model (one store per agent, `worker_id` per writer, commit at
+  run close, push-per-run advice for ephemeral runners) is now documented on
+  the method.
+- **`gasp` module re-exports the extension-path types** (`Task`,
+  `TaskStatus`, `StatePatch`, `EvalResult`, `Goal as GaspGoal`, …) so
+  applications need no direct `yoagent-state` dependency kept in version
+  lockstep.
+- Compaction levels 1 and 2 now emit `tracing::debug!` (tokens/messages
+  before → after); previously only level 3 and budget calibration reported.
+
+### Changed
+
+- **Breaking:** `yoagent-state` 0.4 → 0.5. Its types are re-exported from
+  `yoagent::gasp`, so this changes public type identity for code that also
+  depends on `yoagent-state` directly. Sidecar processes with their own
+  `yoagent-state` (separate binaries) are unaffected; 0.5 events are
+  wire-compatible both ways with 0.4 logs.
+
 ## 0.15.0
 
 ### Fixed
