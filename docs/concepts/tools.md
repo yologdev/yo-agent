@@ -133,6 +133,37 @@ tools.push(Box::new(WeatherTool));
 let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Claude Sonnet 5")).with_tools(tools);
 ```
 
+## Sandboxing the built-in file tools
+
+`ReadFileTool`, `WriteFileTool`, `EditFileTool`, `ListFilesTool` and `SearchTool` accept an allowlist of directory roots. Empty (the default) means unrestricted:
+
+```rust
+let roots = vec!["/srv/workspace".to_string()];
+
+let tools: Vec<Box<dyn AgentTool>> = vec![
+    Box::new(ReadFileTool::new().with_allowed_paths(roots.clone())),
+    Box::new(WriteFileTool::new().with_allowed_paths(roots.clone())),
+    Box::new(EditFileTool::new().with_allowed_paths(roots)),
+];
+```
+
+Enforcement is against the **resolved** path, not the string, so neither `..` nor a symlink pointing outside can escape — and a file that does not exist yet still resolves through its real parent, so writes are checked too. The rejection message deliberately does not echo the allowed roots, since tool results reach the model's transcript.
+
+## `BashTool` is not a sandbox
+
+`BashTool` runs whatever the model asks through `bash -c`, with the agent process's own environment and filesystem access.
+
+`deny_patterns` is a substring check that catches typos and obvious mistakes — `rm  -rf /` with two spaces, a base64-decoded pipe, or an equivalent `find -delete` all sail past it. Treat it as a guardrail, never as a security boundary.
+
+Real isolation belongs outside the tool: run the agent in a container or VM, or gate calls through [`ToolMiddleware`](#tool-middleware), which sees the arguments before execution and can deny them.
+
+For credentials specifically, commands inherit every environment variable the agent process holds — including any `*_API_KEY`. When the model composes the command, restrict what it can read:
+
+```rust
+let bash = BashTool::default()
+    .with_env_allowlist(vec!["RUST_LOG".to_string()]);  // plus PATH, HOME, PWD
+```
+
 ## Error Handling
 
 **Return `Err(ToolError)` on failure, not `Ok` with error text.** When a tool returns `Err`, the agent loop converts it to a `Message::ToolResult` with `is_error: true` and sends it to the LLM. The LLM sees the error and can self-correct — retry with different arguments, try a different approach, or explain the failure to the user.

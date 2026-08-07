@@ -630,3 +630,67 @@ fn test_agent_event_deserializes_from_raw_json() {
     assert_eq!(tool_name, "read");
     assert_eq!(args["path"], "a.rs");
 }
+
+// ---------------------------------------------------------------------------
+// Secrets must not reach Debug output — it lands in logs and panic messages.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stream_config_debug_redacts_the_api_key() {
+    let mut config = yoagent::provider::StreamConfig::new("m", "sk-super-secret-key");
+    config.system_prompt = "be brief".into();
+    let rendered = format!("{:?}", config);
+
+    assert!(
+        !rendered.contains("sk-super-secret-key"),
+        "api_key leaked into Debug: {rendered}"
+    );
+    assert!(
+        rendered.contains("[redacted]"),
+        "no redaction marker: {rendered}"
+    );
+    // Still useful for debugging.
+    assert!(rendered.contains("be brief"));
+}
+
+#[test]
+fn stream_config_debug_distinguishes_an_empty_key() {
+    let config = yoagent::provider::StreamConfig::new("m", "");
+    let rendered = format!("{:?}", config);
+    assert!(
+        !rendered.contains("[redacted]"),
+        "an unset key should not look like a set one: {rendered}"
+    );
+}
+
+#[test]
+fn model_config_debug_redacts_header_values_but_keeps_names() {
+    let mut config = yoagent::provider::ModelConfig::anthropic("claude-sonnet-5", "Sonnet");
+    config
+        .headers
+        .insert("Authorization".into(), "Bearer sk-leaked-token".into());
+    let rendered = format!("{:?}", config);
+
+    assert!(
+        !rendered.contains("sk-leaked-token"),
+        "header credential leaked into Debug: {rendered}"
+    );
+    assert!(
+        rendered.contains("Authorization"),
+        "header names should survive for debugging: {rendered}"
+    );
+}
+
+#[test]
+fn model_config_serialization_stays_lossless() {
+    // Debug redacts; Serialize must not, or saved configs lose their headers.
+    let mut config = yoagent::provider::ModelConfig::anthropic("claude-sonnet-5", "Sonnet");
+    config.headers.insert("x-api-key".into(), "keep-me".into());
+
+    let json = serde_json::to_string(&config).unwrap();
+    let back: yoagent::provider::ModelConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        back.headers.get("x-api-key").map(String::as_str),
+        Some("keep-me")
+    );
+}

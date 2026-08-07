@@ -9,6 +9,19 @@ use tokio::process::Command;
 pub struct ListFilesTool {
     pub max_results: usize,
     pub timeout: Duration,
+    /// Allowed directory roots (empty = no restriction).
+    ///
+    /// Enforced against the *resolved* path, so `..` and symlinks cannot
+    /// escape. See [`PathSandbox`](crate::tools::PathSandbox).
+    pub allowed_paths: Vec<String>,
+}
+
+impl ListFilesTool {
+    /// Restrict listing to these directory roots.
+    pub fn with_allowed_paths(mut self, paths: Vec<String>) -> Self {
+        self.allowed_paths = paths;
+        self
+    }
 }
 
 impl Default for ListFilesTool {
@@ -16,6 +29,7 @@ impl Default for ListFilesTool {
         Self {
             max_results: 200,
             timeout: Duration::from_secs(10),
+            allowed_paths: Vec::new(),
         }
     }
 }
@@ -73,6 +87,8 @@ impl AgentTool for ListFilesTool {
         if cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
+
+        crate::tools::PathSandbox::new(self.allowed_paths.clone()).check(path)?;
 
         // Check path exists
         if !std::path::Path::new(path).exists() {
