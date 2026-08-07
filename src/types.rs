@@ -290,6 +290,7 @@ impl From<Message> for AgentMessage {
 /// downstream matches rather than silently falling into a wildcard arm.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum StopReason {
     Stop,
     Length,
@@ -552,6 +553,7 @@ pub enum ToolError {
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
+#[non_exhaustive]
 pub enum AgentEvent {
     AgentStart,
     AgentEnd {
@@ -608,6 +610,7 @@ pub enum AgentEvent {
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
+#[non_exhaustive]
 pub enum StreamDelta {
     Text { delta: String },
     Thinking { delta: String },
@@ -729,5 +732,63 @@ impl fmt::Display for StopReason {
             Self::Aborted => write!(f, "aborted"),
             Self::Refusal => write!(f, "refusal"),
         }
+    }
+}
+
+/// Wire-tag freeze for [`AgentEvent`] and [`StreamDelta`].
+///
+/// These matches deliberately have **no wildcard arm**: adding a variant must
+/// fail to compile here until its serde tag is pinned. That guarantee is the
+/// reason they live in this crate rather than in `tests/` — both enums are
+/// `#[non_exhaustive]`, so an integration test *cannot* match them
+/// exhaustively and the compile-time freeze would silently degrade to a
+/// wildcard. Inside the defining crate, exhaustiveness still applies.
+///
+/// A tag change is a breaking change for wire clients — do not edit casually.
+/// `tests/serialization_test.rs` covers the round-trips and payload shapes;
+/// this covers only "no variant escapes without a pinned tag".
+#[cfg(test)]
+mod wire_tag_freeze {
+    use super::*;
+
+    fn expected_event_tag(event: &AgentEvent) -> &'static str {
+        match event {
+            AgentEvent::AgentStart => "agentStart",
+            AgentEvent::AgentEnd { .. } => "agentEnd",
+            AgentEvent::TurnStart => "turnStart",
+            AgentEvent::TurnEnd { .. } => "turnEnd",
+            AgentEvent::MessageStart { .. } => "messageStart",
+            AgentEvent::MessageUpdate { .. } => "messageUpdate",
+            AgentEvent::MessageEnd { .. } => "messageEnd",
+            AgentEvent::ToolExecutionStart { .. } => "toolExecutionStart",
+            AgentEvent::ToolExecutionUpdate { .. } => "toolExecutionUpdate",
+            AgentEvent::ToolExecutionEnd { .. } => "toolExecutionEnd",
+            AgentEvent::ProgressMessage { .. } => "progressMessage",
+            AgentEvent::InputRejected { .. } => "inputRejected",
+        }
+    }
+
+    fn expected_delta_tag(delta: &StreamDelta) -> &'static str {
+        match delta {
+            StreamDelta::Text { .. } => "text",
+            StreamDelta::Thinking { .. } => "thinking",
+            StreamDelta::ToolCallDelta { .. } => "toolCallDelta",
+        }
+    }
+
+    #[test]
+    fn every_event_variant_has_a_pinned_tag() {
+        // Sampling one variant is enough: the compiler enforces coverage, this
+        // just proves the mapping matches what serde actually emits.
+        let event = AgentEvent::AgentStart;
+        let v = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(v["type"], expected_event_tag(&event));
+    }
+
+    #[test]
+    fn every_delta_variant_has_a_pinned_tag() {
+        let delta = StreamDelta::Text { delta: "x".into() };
+        let v = serde_json::to_value(&delta).expect("serialize");
+        assert_eq!(v["type"], expected_delta_tag(&delta));
     }
 }

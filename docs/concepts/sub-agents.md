@@ -204,6 +204,28 @@ This works with all providers: OpenAI, Groq, DeepSeek, Gemini, Mistral, xAI, and
 - **Cancellation propagation**: The parent's cancellation token is forwarded. Aborting the parent aborts all sub-agents.
 - **Turn limiting**: The default 10-turn limit prevents runaway execution. The parent's execution limits also apply to total wall-clock time.
 
+## Isolating sub-agents from each other
+
+`SharedState` is a single flat namespace by design — a parent stores an artifact once and several sub-agents read it by reference, which is the whole point of the type. Every holder sees every key.
+
+When a sub-agent should *not* see its siblings' data, hand it a scoped view:
+
+```rust
+let state = SharedState::new();
+
+let researcher = SubAgentTool::from_config("researcher", config.clone())
+    .with_scoped_shared_state(state.clone(), "researcher");
+let writer = SubAgentTool::from_config("writer", config)
+    .with_scoped_shared_state(state.clone(), "writer");
+
+// The parent's unscoped handle still sees everything both wrote.
+for key in state.keys().await { /* … */ }
+```
+
+Keys are transparently prefixed, so a scoped sub-agent cannot read, overwrite, or **enumerate** anything outside its scope — including via a crafted key, since the prefix is applied on the way in. `summary()` is scoped too, which matters most: it is injected into the sub-agent's system prompt, so an unscoped summary would disclose every sibling's key names.
+
+Scoping nests (`state.scoped("a").scoped("b")`), so a sub-agent can narrow its own view but never widen it. Keep plain `with_shared_state` when sharing is the intent.
+
 ## Examples
 
 - [`examples/sub_agent.rs`](../../examples/sub_agent.rs) — Coordinator with researcher and coder sub-agents

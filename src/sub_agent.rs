@@ -256,6 +256,21 @@ impl SubAgentTool {
         self
     }
 
+    /// Attach a shared store restricted to this sub-agent's own namespace.
+    ///
+    /// Equivalent to [`with_shared_state(state.scoped(name))`](Self::with_shared_state),
+    /// spelled out because the isolating variant is easy to forget. The
+    /// sub-agent cannot read, overwrite, or even enumerate keys outside its
+    /// scope, while the parent's unscoped handle still sees everything it
+    /// writes.
+    ///
+    /// Use when sub-agents should not see each other's data; keep
+    /// `with_shared_state` when sharing is the point.
+    pub fn with_scoped_shared_state(mut self, state: SharedState, scope: impl AsRef<str>) -> Self {
+        self.shared_state = Some(state.scoped(scope));
+        self
+    }
+
     /// Add an inter-turn delay to throttle API requests.
     /// Useful when using OAuth tokens or providers with low rate limits.
     /// The delay is applied before each turn except the first.

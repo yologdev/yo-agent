@@ -81,6 +81,7 @@ async fn test_simple_text_response() {
             AgentEvent::ToolExecutionEnd { .. } => "ToolExecEnd",
             AgentEvent::ProgressMessage { .. } => "ProgressMessage",
             AgentEvent::InputRejected { .. } => "InputRejected",
+            _ => "Unknown",
         })
         .collect();
 
@@ -177,6 +178,7 @@ async fn test_tool_call_and_response() {
             AgentEvent::ToolExecutionEnd { .. } => "ToolExecEnd",
             AgentEvent::ProgressMessage { .. } => "ProgressMessage",
             AgentEvent::InputRejected { .. } => "InputRejected",
+            _ => "Unknown",
         })
         .collect();
 

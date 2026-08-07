@@ -586,6 +586,7 @@ async fn tee_delivers_the_complete_event_stream() {
             AgentEvent::ToolExecutionEnd { .. } => "ToolExecutionEnd",
             AgentEvent::ProgressMessage { .. } => "ProgressMessage",
             AgentEvent::InputRejected { .. } => "InputRejected",
+            _ => "Unknown",
         }
     }
 
