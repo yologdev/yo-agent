@@ -6,6 +6,7 @@ use super::model::ModelConfig;
 
 /// Events emitted during LLM streaming
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum StreamEvent {
     /// Stream started, partial assistant message
     Start,

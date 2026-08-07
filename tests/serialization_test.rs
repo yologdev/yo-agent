@@ -375,10 +375,13 @@ fn test_stream_delta_every_variant_roundtrips() {
 }
 
 /// The frozen `"type"` tag for every `AgentEvent` variant. Exhaustive match
-/// with NO wildcard arm on purpose: adding a variant fails to compile here
-/// until its wire tag is pinned. Keep [`EVENT_VARIANT_COUNT`] and the sample
-/// in `all_agent_events` in step — the count assertion below fails until the
-/// new variant is actually exercised, closing the other half of the freeze.
+/// The compile-time half of this freeze moved into `src/types.rs`
+/// (`wire_tag_freeze`) when `AgentEvent` and `StreamDelta` became
+/// `#[non_exhaustive]` — an integration test can no longer match them
+/// exhaustively, so the "adding a variant fails to compile" guarantee only
+/// holds inside the defining crate. What remains here is the round-trip and
+/// payload-shape coverage, plus [`EVENT_VARIANT_COUNT`], which still fails
+/// until a new variant gets a sample in `all_agent_events`.
 /// A tag change is a breaking change for wire clients — do not edit casually.
 fn expected_event_tag(event: &AgentEvent) -> &'static str {
     match event {
@@ -394,6 +397,7 @@ fn expected_event_tag(event: &AgentEvent) -> &'static str {
         AgentEvent::ToolExecutionEnd { .. } => "toolExecutionEnd",
         AgentEvent::ProgressMessage { .. } => "progressMessage",
         AgentEvent::InputRejected { .. } => "inputRejected",
+        _ => "unknown",
     }
 }
 
@@ -403,6 +407,7 @@ fn expected_delta_tag(delta: &StreamDelta) -> &'static str {
         StreamDelta::Text { .. } => "text",
         StreamDelta::Thinking { .. } => "thinking",
         StreamDelta::ToolCallDelta { .. } => "toolCallDelta",
+        _ => "unknown",
     }
 }
 

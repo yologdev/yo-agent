@@ -6,6 +6,7 @@ use std::collections::HashMap;
 /// Which API protocol a model uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ApiProtocol {
     AnthropicMessages,
     OpenAiCompletions,

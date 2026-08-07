@@ -248,3 +248,98 @@ async fn test_shared_state_summary_in_system_prompt() {
     };
     assert_eq!(text, "Listed state");
 }
+
+// ---------------------------------------------------------------------------
+// Scoped views — opt-in isolation between sub-agents.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn scoped_views_cannot_see_or_touch_each_other() {
+    let state = SharedState::new();
+    let a = state.scoped("researcher");
+    let b = state.scoped("writer");
+
+    a.set("notes", "secret research".into()).await.unwrap();
+    b.set("notes", "draft prose".into()).await.unwrap();
+
+    // Same key name, independent values.
+    assert_eq!(a.get("notes").await.as_deref(), Some("secret research"));
+    assert_eq!(b.get("notes").await.as_deref(), Some("draft prose"));
+
+    // Neither can enumerate the other.
+    assert_eq!(a.keys().await, vec!["notes".to_string()]);
+    assert_eq!(b.keys().await, vec!["notes".to_string()]);
+
+    // A sibling's remove does not reach across.
+    assert!(b.remove("notes").await);
+    assert_eq!(a.get("notes").await.as_deref(), Some("secret research"));
+}
+
+#[tokio::test]
+async fn scoped_summary_does_not_disclose_sibling_keys() {
+    // The summary goes into the sub-agent's system prompt — the leak that
+    // matters most.
+    let state = SharedState::new();
+    state
+        .scoped("writer")
+        .set("private_draft", "x".into())
+        .await
+        .unwrap();
+    let researcher = state.scoped("researcher");
+    researcher.set("sources", "y".into()).await.unwrap();
+
+    let summary = researcher.summary().await;
+    assert!(summary.contains("sources"), "own key missing: {summary}");
+    assert!(
+        !summary.contains("private_draft"),
+        "sibling key leaked into the prompt: {summary}"
+    );
+}
+
+#[tokio::test]
+async fn a_scoped_view_cannot_escape_its_scope() {
+    let state = SharedState::new();
+    state.set("root_secret", "topsecret".into()).await.unwrap();
+    let sub = state.scoped("sub");
+
+    // Neither a plain key nor one crafted with a separator reaches the root.
+    assert!(sub.get("root_secret").await.is_none());
+    assert!(sub.get("\u{1f}root_secret").await.is_none());
+    assert!(sub.get("../root_secret").await.is_none());
+
+    // Nesting narrows, never widens.
+    let deeper = sub.scoped("deeper");
+    deeper.set("k", "v".into()).await.unwrap();
+    assert!(sub.get("k").await.is_none());
+    assert_eq!(deeper.get("k").await.as_deref(), Some("v"));
+}
+
+#[tokio::test]
+async fn the_parent_still_sees_everything_scopes_write() {
+    // Collecting sub-agent results is the reason scoping is a view, not a
+    // separate store.
+    let state = SharedState::new();
+    state
+        .scoped("researcher")
+        .set("out", "findings".into())
+        .await
+        .unwrap();
+
+    let all = state.keys().await;
+    assert_eq!(all.len(), 1);
+    assert!(all[0].contains("researcher"), "got {all:?}");
+    assert_eq!(
+        state.scoped("researcher").get("out").await.as_deref(),
+        Some("findings")
+    );
+}
+
+#[tokio::test]
+async fn unscoped_behaviour_is_unchanged() {
+    let state = SharedState::new();
+    state.set("k", "v".into()).await.unwrap();
+    assert_eq!(state.get("k").await.as_deref(), Some("v"));
+    assert_eq!(state.keys().await, vec!["k".to_string()]);
+    assert!(state.scope().is_none());
+    assert!(state.summary().await.contains("k"));
+}

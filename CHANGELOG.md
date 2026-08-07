@@ -4,6 +4,44 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Changed
+
+- **Breaking: `AgentEvent`, `StreamEvent`, `StreamDelta`, `StopReason` and
+  `ApiProtocol` are now `#[non_exhaustive]`.** These five grow with provider
+  and protocol features, so every addition was previously a breaking change —
+  the reason yoagent#104 routed around adding a compaction event rather than
+  adding one. Downstream `match` arms need a `_ =>` wildcard; new variants are
+  additive from here.
+
+  Other enums were deliberately left exhaustive: `Message`, `AgentMessage`,
+  `FilterResult`, `ToolDecision` and the config enums are closed shapes, and
+  marking them would break a great deal of downstream code for no expected
+  growth.
+
+  The `AgentEvent` / `StreamDelta` **wire-tag freeze moved into the crate**
+  (`types::wire_tag_freeze`). It relies on exhaustive matching to fail
+  compilation until a new variant's serde tag is pinned — a guarantee that no
+  longer holds from an integration test once the enum is `#[non_exhaustive]`.
+  Verified by adding a probe variant: it still fails to compile.
+
+### Added
+
+- **`SharedState::scoped` — opt-in isolation between sub-agents.** The store
+  is a shared flat namespace by design, so this is a view rather than a
+  default: keys are transparently prefixed, and `keys()` / `summary()` report
+  only that scope. A scoped sub-agent cannot read, overwrite or enumerate
+  anything outside it (prefixing is applied on the way in, so a crafted key
+  cannot escape), while the parent's unscoped handle still sees everything —
+  which is what lets it collect results. Scoping nests, so a view can narrow
+  but never widen.
+
+  `summary()` matters most here: it is injected into the sub-agent's system
+  prompt, so an unscoped one disclosed every sibling's key names.
+- `SubAgentTool::with_scoped_shared_state` — the isolating counterpart to
+  `with_shared_state`.
+
 ## 0.16.2
 
 ### Fixed

@@ -329,13 +329,47 @@ impl SharedStateBackend for FileBackend {
 // SharedState (public API)
 // ---------------------------------------------------------------------------
 
+/// Separator between a scope name and a key. Non-printable, so it cannot
+/// collide with a key a caller would plausibly choose.
+const SCOPE_SEP: char = '\u{1f}';
+
 /// A shared string key-value store for sub-agent communication.
 ///
 /// Cheaply cloneable (wraps `Arc`). Delegates all operations to a
 /// pluggable [`SharedStateBackend`].
+///
+/// # Scoping
+///
+/// Sharing is the point of this type — a parent stores an artifact once and
+/// several sub-agents read it by reference. So the default is a single flat
+/// namespace where every holder sees every key.
+///
+/// When a sub-agent should *not* see its siblings' data, hand it a scoped
+/// view via [`scoped`](Self::scoped). Keys are transparently prefixed, and
+/// [`keys`](Self::keys) / [`summary`](Self::summary) report only that scope
+/// with the prefix stripped — so the sub-agent cannot enumerate, read, or
+/// overwrite anything outside it. Prefixing is applied on the way in, so a
+/// crafted key cannot escape the scope. The unscoped handle still sees
+/// everything, which is what lets the parent collect results.
+///
+/// ```rust
+/// # use yoagent::shared_state::SharedState;
+/// # async fn demo() {
+/// let state = SharedState::new();
+/// let researcher = state.scoped("researcher");
+/// researcher.set("notes", "…".into()).await.unwrap();
+///
+/// // A sibling sees nothing of it.
+/// assert!(state.scoped("writer").get("notes").await.is_none());
+/// // The parent does.
+/// assert!(researcher.get("notes").await.is_some());
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct SharedState {
     backend: Arc<dyn SharedStateBackend>,
+    /// `None` = the root view: full, unprefixed access.
+    scope: Option<Arc<str>>,
 }
 
 impl SharedState {
@@ -343,6 +377,7 @@ impl SharedState {
     pub fn new() -> Self {
         Self {
             backend: Arc::new(MemoryBackend::new()),
+            scope: None,
         }
     }
 
@@ -350,6 +385,7 @@ impl SharedState {
     pub fn with_max_bytes(max_bytes: usize) -> Self {
         Self {
             backend: Arc::new(MemoryBackend::with_max_bytes(max_bytes)),
+            scope: None,
         }
     }
 
@@ -357,12 +393,47 @@ impl SharedState {
     pub fn with_backend(backend: impl SharedStateBackend + 'static) -> Self {
         Self {
             backend: Arc::new(backend),
+            scope: None,
         }
+    }
+
+    /// A view of this store restricted to `scope`.
+    ///
+    /// The view shares the same backend, so the parent still sees everything
+    /// the scope writes. Scoping a scoped view nests (`a` then `b` behaves as
+    /// `a/b`), so a sub-agent cannot widen its own access.
+    pub fn scoped(&self, scope: impl AsRef<str>) -> Self {
+        let scope = match &self.scope {
+            Some(existing) => format!("{existing}{SCOPE_SEP}{}", scope.as_ref()),
+            None => scope.as_ref().to_string(),
+        };
+        Self {
+            backend: Arc::clone(&self.backend),
+            scope: Some(scope.into()),
+        }
+    }
+
+    /// The scope this view is restricted to, if any.
+    pub fn scope(&self) -> Option<&str> {
+        self.scope.as_deref()
+    }
+
+    /// Map a caller-facing key to its backend key.
+    fn full_key(&self, key: &str) -> String {
+        match &self.scope {
+            Some(scope) => format!("{scope}{SCOPE_SEP}{key}"),
+            None => key.to_string(),
+        }
+    }
+
+    /// The backend-key prefix for this view, if scoped.
+    fn prefix(&self) -> Option<String> {
+        self.scope.as_ref().map(|s| format!("{s}{SCOPE_SEP}"))
     }
 
     /// Get a value by key. Returns `None` if the key doesn't exist.
     pub async fn get(&self, key: &str) -> Option<String> {
-        match self.backend.get(key).await {
+        match self.backend.get(&self.full_key(key)).await {
             Ok(val) => val,
             Err(e) => {
                 eprintln!("[SharedState] get({:?}) error: {}", key, e);
@@ -373,12 +444,12 @@ impl SharedState {
 
     /// Store a value. Returns `Err` if the backend rejects it (capacity, I/O, etc.).
     pub async fn set(&self, key: &str, value: String) -> Result<(), SharedStateError> {
-        self.backend.set(key, value).await
+        self.backend.set(&self.full_key(key), value).await
     }
 
     /// Remove a key. Returns `true` if the key existed.
     pub async fn remove(&self, key: &str) -> bool {
-        match self.backend.remove(key).await {
+        match self.backend.remove(&self.full_key(key)).await {
             Ok(existed) => existed,
             Err(e) => {
                 eprintln!("[SharedState] remove({:?}) error: {}", key, e);
@@ -387,10 +458,16 @@ impl SharedState {
         }
     }
 
-    /// List all keys (sorted).
+    /// List keys (sorted). A scoped view lists only its own, prefix stripped.
     pub async fn keys(&self) -> Vec<String> {
         match self.backend.keys().await {
-            Ok(keys) => keys,
+            Ok(keys) => match self.prefix() {
+                Some(prefix) => keys
+                    .into_iter()
+                    .filter_map(|k| k.strip_prefix(&prefix).map(str::to_string))
+                    .collect(),
+                None => keys,
+            },
             Err(e) => {
                 eprintln!("[SharedState] keys() error: {}", e);
                 Vec::new()
@@ -400,14 +477,28 @@ impl SharedState {
 
     /// Human-readable summary of stored variables (key names + byte sizes).
     /// Suitable for injecting into a system prompt.
+    ///
+    /// A scoped view summarizes only its own keys. This matters more than the
+    /// other accessors: the summary is injected into the sub-agent's system
+    /// prompt, so an unscoped one would disclose every sibling's key names.
     pub async fn summary(&self) -> String {
-        match self.backend.summary().await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[SharedState] summary() error: {}", e);
-                "(error reading state)".to_string()
-            }
+        if self.scope.is_none() {
+            return match self.backend.summary().await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[SharedState] summary() error: {}", e);
+                    "(error reading state)".to_string()
+                }
+            };
         }
+        // Scoped: rebuild from this view's keys so nothing outside leaks.
+        let mut entries: Vec<(String, usize)> = Vec::new();
+        for key in self.keys().await {
+            let len = self.get(&key).await.map(|v| v.len()).unwrap_or(0);
+            entries.push((key, len));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        format_summary(entries.iter().map(|(k, n)| (k.as_str(), *n)))
     }
 }
 
