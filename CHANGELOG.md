@@ -46,6 +46,15 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **CI's MSRV job broke on unrelated PRs.** `Cargo.lock` is not committed, so
+  every run re-resolves to the newest compatible releases — and when `icu_*`
+  2.3.0 (via `reqwest` → `url` → `idna`) raised its own rust-version to 1.88,
+  the MSRV job started failing on `main` and every open PR without a commit
+  causing it. Setting `resolver = "3"` turns on cargo's MSRV-aware resolution,
+  so dependency versions are chosen against our `rust-version` instead of
+  ignoring it. No CI or dependency changes; downstream consumers resolve with
+  their own resolver and are unaffected.
+
 - **`allowed_paths` was declared but never enforced.** `ReadFileTool` accepted
   an allowlist of directory roots, defaulted it, and then ignored it — callers
   who set it believed reads were sandboxed and they were not. It is now
