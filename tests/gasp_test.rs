@@ -673,3 +673,84 @@ async fn tool_fingerprint_and_usage_reach_the_log() {
     assert!(usage["cache_read"].is_number());
     assert!(usage["cache_write"].is_number());
 }
+
+// ---------------------------------------------------------------------------
+// The documented extension path must actually be reachable (#111): recording
+// the goal/task/verdict tier alongside the recorder's run/tool tier, using
+// only `yoagent::gasp` — no direct `yoagent-state` dependency.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn extension_path_records_the_task_tier_without_a_direct_state_dependency() {
+    use yoagent::gasp::{ActorRef, NodeId, Task, TaskId, TaskStatus, YoAgentState};
+
+    ensure_git_identity();
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = GaspRecorder::init(
+        dir.path(),
+        "test-agent",
+        "w1",
+        GoalRef::New {
+            title: "extension goal".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // Every type the extension path needs must be nameable from `yoagent::gasp`.
+    let state: &YoAgentState<yoagent::gasp::GitEventStore> = recorder.state();
+    let actor: &ActorRef = recorder.actor();
+    let goal = recorder.goal().clone();
+
+    state
+        .record_task(Task {
+            id: TaskId::new("task_1"),
+            title: "ship the thing".into(),
+            summary: "planned this session".into(),
+            status: TaskStatus::Open,
+            goal: Some(goal.clone()),
+            created_by: actor.clone(),
+            metadata: serde_json::json!({"kind": "feature"}),
+        })
+        .await
+        .expect("record_task via the recorder's own state");
+
+    // And the graph is queryable — how a caller checks whether a node exists.
+    let graph = state.graph().await;
+    let node = graph
+        .nodes
+        .get(&NodeId::new("task_1"))
+        .expect("task folded into the graph");
+    assert_eq!(node.props["title"], "ship the thing");
+
+    // The task tier lands in the same log as the run tier, one writer.
+    let kinds = event_kinds_lenient(dir.path());
+    assert!(kinds.iter().any(|k| k == "task.created"), "got {kinds:?}");
+    assert!(kinds.iter().any(|k| k == "goal.created"), "got {kinds:?}");
+}
+
+#[tokio::test]
+async fn recorder_store_accessor_shares_the_lease_rather_than_colliding() {
+    use yoagent::gasp::EventStore;
+
+    ensure_git_identity();
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = GaspRecorder::init(
+        dir.path(),
+        "test-agent",
+        "w1",
+        GoalRef::New {
+            title: "lease goal".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // Reading through the recorder's own store works while it holds the lease.
+    // Opening a second GitEventStore on this root is what would collide.
+    let events = recorder.store().scan().await.expect("scan via accessor");
+    assert!(
+        events.iter().any(|e| e.kind == "goal.created"),
+        "expected the goal event through the shared store"
+    );
+}

@@ -4,7 +4,7 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## 0.16.2
+## Unreleased
 
 ### Fixed
 
@@ -14,8 +14,28 @@ adheres to [Semantic Versioning](https://semver.org/).
   the MSRV job started failing on `main` and every open PR without a commit
   causing it. Setting `resolver = "3"` turns on cargo's MSRV-aware resolution,
   so dependency versions are chosen against our `rust-version` instead of
-  ignoring it. No CI or dependency changes; downstream consumers resolve with
-  their own resolver and are unaffected.
+  ignoring it. Downstream consumers resolve with their own resolver and are
+  unaffected.
+
+- **The documented `gasp` extension path was unreachable**
+  ([#111](https://github.com/yologdev/yoagent/issues/111)). 0.16.0 re-exported
+  the types the `YoAgentState::record_*` methods *take* but not the receiver
+  they are called *on*, and `GaspRecorder` kept its state, store and actor
+  private — so an application could construct a `Task` and have nothing to
+  record it with. The workaround was a direct `yoagent-state` dependency,
+  precisely the version-skew hazard the doc comment warned against.
+
+  Both halves are fixed: `ActorRef`, `GitEventStore`, `Node`, `NodeId` and
+  `YoAgentState` are now re-exported, and `GaspRecorder` gained `state()`,
+  `store()` and `actor()`.
+
+  Prefer the accessors over opening your own store: a GASP repo is
+  single-writer behind a 600-second lease, so a second `GitEventStore` on the
+  same root collides with the recorder's rather than cooperating.
+
+## 0.16.2
+
+### Fixed
 
 - **`allowed_paths` was declared but never enforced.** `ReadFileTool` accepted
   an allowlist of directory roots, defaulted it, and then ignored it — callers
