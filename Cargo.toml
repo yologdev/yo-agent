@@ -2,6 +2,10 @@
 name = "yoagent"
 version = "0.16.2"
 edition = "2021"
+# MSRV-aware dependency resolution (cargo 1.84+): prefer dependency versions
+# whose own rust-version fits ours. Without it CI re-resolves to whatever is
+# newest and any transitive bump breaks the MSRV job on unrelated PRs.
+resolver = "3"
 description = "Simple, effective agent loop with tool execution and event streaming"
 license = "MIT"
 repository = "https://github.com/yologdev/yoagent"
