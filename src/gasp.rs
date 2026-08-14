@@ -48,18 +48,36 @@ use crate::types::*;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use yoagent_state::{
-    ActorRef, GitEventStore, Goal, NodeId, YoAgentModelCalled, YoAgentModelFinished,
-    YoAgentRunFinished, YoAgentRunStarted, YoAgentState, YoAgentStateAdapter, YoAgentStateSink,
-    YoAgentToolCalled, YoAgentToolFinished,
+    Goal, YoAgentModelCalled, YoAgentModelFinished, YoAgentRunFinished, YoAgentRunStarted,
+    YoAgentStateAdapter, YoAgentStateSink, YoAgentToolCalled, YoAgentToolFinished,
 };
 pub use yoagent_state::{GoalId, RunId, StateError};
-// The extension-path types (see [`GaspRecorder::with_store`]): everything the
-// `YoAgentState::record_*` methods take, so applications recording the
-// goal/task/verdict tier need no direct `yoagent-state` dependency (a
-// version-skewed duplicate produces baffling type errors).
+// The extension path (see [`GaspRecorder::state`]): applications recording the
+// goal/task/verdict tier need no direct `yoagent-state` dependency, so both
+// halves must be nameable here — the *arguments* to `YoAgentState::record_*`
+// and the *receiver* those methods are called on. Exporting only the arguments
+// left the path documented but unreachable (#111).
 pub use yoagent_state::{
-    Decision, DecisionStatus, EvalResult, EvalStatus, EventStore, Goal as GaspGoal, GoalStatus,
-    Hypothesis, Observation, StatePatch, Task, TaskId, TaskStatus,
+    // Receiver side.
+    ActorRef,
+    // Argument side.
+    Decision,
+    DecisionStatus,
+    EvalResult,
+    EvalStatus,
+    EventStore,
+    GitEventStore,
+    Goal as GaspGoal,
+    GoalStatus,
+    Hypothesis,
+    Node,
+    NodeId,
+    Observation,
+    StatePatch,
+    Task,
+    TaskId,
+    TaskStatus,
+    YoAgentState,
 };
 
 /// Which GASP goal recorded runs belong to (stamped into each run-boundary
@@ -211,6 +229,44 @@ impl GaspRecorder {
 
     /// The goal this recorder's runs belong to (persist it to reuse across
     /// processes via [`GoalRef::Existing`]).
+    /// The recorder's own [`YoAgentState`], for recording tiers this crate
+    /// does not model — goals, tasks, evals, decisions, patches.
+    ///
+    /// Prefer this over opening a second [`GitEventStore`] on the same root: a
+    /// GASP repo is single-writer behind a 600-second lease, so a second store
+    /// collides with this one rather than cooperating.
+    ///
+    /// ```no_run
+    /// # use yoagent::gasp::{GaspRecorder, GoalRef, Task, TaskId, TaskStatus};
+    /// # async fn demo(recorder: &GaspRecorder) -> Result<(), Box<dyn std::error::Error>> {
+    /// recorder.state().record_task(Task {
+    ///     id: TaskId::new("task_1"),
+    ///     title: "ship the thing".into(),
+    ///     summary: "planned this session".into(),
+    ///     status: TaskStatus::Open,
+    ///     goal: Some(recorder.goal().clone()),
+    ///     created_by: recorder.actor().clone(),
+    ///     metadata: serde_json::json!({}),
+    /// }).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn state(&self) -> &YoAgentState<GitEventStore> {
+        &self.state
+    }
+
+    /// The underlying event store, for callers that need it directly (e.g. to
+    /// scan events). Shares this recorder's lease — see [`state`](Self::state).
+    pub fn store(&self) -> &GitEventStore {
+        &self.store
+    }
+
+    /// The actor recorded events are attributed to — the first argument of the
+    /// `YoAgentState::record_*` methods.
+    pub fn actor(&self) -> &ActorRef {
+        &self.actor
+    }
+
     pub fn goal(&self) -> &GoalId {
         &self.goal
     }

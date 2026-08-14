@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+### Fixed
+
+- **The documented `gasp` extension path was unreachable**
+  ([#111](https://github.com/yologdev/yoagent/issues/111)). 0.16.0 re-exported
+  the types the `YoAgentState::record_*` methods *take* but not the receiver
+  they are called *on*, and `GaspRecorder` kept its state, store and actor
+  private — so an application could construct a `Task` and have nothing to
+  record it with. The workaround was a direct `yoagent-state` dependency,
+  precisely the version-skew hazard the doc comment warned against.
+
+  Both halves are fixed: `ActorRef`, `GitEventStore`, `Node`, `NodeId` and
+  `YoAgentState` are now re-exported, and `GaspRecorder` gained
+  [`state()`](https://docs.rs/yoagent/latest/yoagent/gasp/struct.GaspRecorder.html#method.state),
+  `store()` and `actor()`.
+
+  Prefer the accessors over opening your own store: a GASP repo is
+  single-writer behind a 600-second lease, so a second `GitEventStore` on the
+  same root collides with the recorder's rather than cooperating.
+
 ### Changed
 
 - **Breaking: `AgentEvent`, `StreamEvent`, `StreamDelta`, `StopReason` and
