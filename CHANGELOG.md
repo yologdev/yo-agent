@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+> The two fixes below also shipped in **0.16.3**, a maintenance release cut
+> from `v0.16.2` so consumers could take them without the breaking changes
+> queued here for 0.17.0.
+
 ### Fixed
 
 - **The documented `gasp` extension path was unreachable**
