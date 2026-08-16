@@ -755,3 +755,85 @@ async fn recorder_store_accessor_shares_the_lease_rather_than_colliding() {
         "expected the goal event through the shared store"
     );
 }
+
+/// Every struct re-exported from `yoagent::gasp` must be *constructible* using
+/// only `yoagent::gasp` — no direct `yoagent-state` dependency.
+///
+/// This is the invariant behind #111 and #115: a struct whose id or field
+/// types are missing is nameable but unbuildable, and the re-export list looks
+/// complete either way. The 0.16.3 notes demonstrated the extension path with
+/// `Task` — the one struct whose id type happened to be exported — so it
+/// compiled while three siblings did not. Constructing all of them is what
+/// makes the gap impossible to reintroduce silently.
+///
+/// This test exists to *compile*. The assertions are incidental.
+#[test]
+fn every_reexported_struct_is_constructible_from_gasp_alone() {
+    use yoagent::gasp::{
+        ActorRef, ArtifactRef, Decision, DecisionId, DecisionStatus, EvalId, EvalResult,
+        EvalStatus, GaspGoal, GoalId, GoalStatus, Hypothesis, HypothesisId, NodeId, Observation,
+        ObservationId, PatchId, RunId, StatePatch, Task, TaskId, TaskStatus,
+    };
+
+    let actor = ActorRef::agent("yoyo");
+
+    let _goal = GaspGoal {
+        id: GoalId::new("goal_1"),
+        title: "t".into(),
+        summary: "s".into(),
+        status: GoalStatus::Open,
+        owner: actor.clone(),
+        metadata: serde_json::json!({}),
+    };
+
+    let _task = Task {
+        id: TaskId::new("task_1"),
+        title: "t".into(),
+        summary: "s".into(),
+        status: TaskStatus::Open,
+        goal: Some(GoalId::new("goal_1")),
+        created_by: actor.clone(),
+        metadata: serde_json::json!({}),
+    };
+
+    // The three named in #115 — each blocked on its id type alone.
+    let _eval = EvalResult {
+        id: EvalId::new("eval_1"),
+        command: "cargo test".into(),
+        status: EvalStatus::Passed,
+        score: Some(1.0),
+        metadata: serde_json::json!({}),
+    };
+
+    let _decision = Decision {
+        id: DecisionId::new("decision_1"),
+        status: DecisionStatus::Approved,
+        reason: "green".into(),
+        decided_by: actor.clone(),
+        metadata: serde_json::json!({}),
+    };
+
+    let patch = StatePatch::new(PatchId::new("patch_1"), "title", "summary", actor.clone());
+    assert_eq!(patch.id, PatchId::new("patch_1"));
+
+    // Found by audit rather than by the report — same class, same fix.
+    let _observation = Observation {
+        id: ObservationId::new("obs_1"),
+        title: "t".into(),
+        summary: "s".into(),
+        observed_in: Some(RunId::new("run_1")),
+        metadata: serde_json::json!({}),
+    };
+
+    let _hypothesis = Hypothesis {
+        id: HypothesisId::new("hyp_1"),
+        title: "t".into(),
+        summary: "s".into(),
+        confidence: Some(0.5),
+        metadata: serde_json::json!({}),
+    };
+
+    // Field types a caller needs to populate a patch, not just open one.
+    let _evidence: Vec<NodeId> = vec![NodeId::new("node_1")];
+    let _artifacts: Vec<ArtifactRef> = Vec::new();
+}
