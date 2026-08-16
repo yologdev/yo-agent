@@ -4,6 +4,29 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.16.4
+
+### Fixed
+
+- **The `gasp` extension path still could not construct its arguments**
+  ([#115](https://github.com/yologdev/yoagent/issues/115)). 0.16.3 fixed the
+  receiver half of #111, but the recorded structs were re-exported without the
+  id types their fields require: `StatePatch`, `EvalResult` and `Decision` were
+  nameable and unbuildable. `Task` worked only because `TaskId` happened to be
+  in the list already — which is why the gap survived inspection and why the
+  0.16.3 example, which constructs a `Task`, compiled while its siblings did
+  not.
+
+  Now re-exported: `PatchId`, `EvalId`, `DecisionId`, plus `HypothesisId`,
+  `ObservationId`, `ArtifactRef`, `ExpectedEffect`, `Precondition`,
+  `ProjectRef` and `StateOp` — found by auditing every re-exported struct's
+  fields rather than only the three in the report, since `Hypothesis`,
+  `Observation` and populating a `StatePatch` had the same defect.
+
+  The invariant is now pinned mechanically: a test constructs **every**
+  re-exported struct using only `yoagent::gasp`, so a struct that is nameable
+  but unbuildable fails to compile.
+
 ## 0.16.3
 
 ### Fixed

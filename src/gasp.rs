@@ -58,21 +58,35 @@ pub use yoagent_state::{GoalId, RunId, StateError};
 // and the *receiver* those methods are called on. Exporting only the arguments
 // left the path documented but unreachable (#111).
 pub use yoagent_state::{
-    // Receiver side.
+    // Receiver side: what `record_*` is called on, and what it needs.
     ActorRef,
-    // Argument side.
+    // ...and every id / field type needed to *construct* them. A struct whose
+    // id type is missing is nameable but unbuildable — the gap behind #111 and
+    // #115, invisible by inspection because the list looks complete.
+    ArtifactRef,
+    // Argument side: the recorded structs...
     Decision,
+    DecisionId,
+    // ...their status enums...
     DecisionStatus,
+    EvalId,
     EvalResult,
     EvalStatus,
     EventStore,
+    ExpectedEffect,
     GitEventStore,
     Goal as GaspGoal,
     GoalStatus,
     Hypothesis,
+    HypothesisId,
     Node,
     NodeId,
     Observation,
+    ObservationId,
+    PatchId,
+    Precondition,
+    ProjectRef,
+    StateOp,
     StatePatch,
     Task,
     TaskId,
