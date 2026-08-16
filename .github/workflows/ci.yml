@@ -2,9 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `release/**` covers maintenance lines (e.g. 0.16.x carrying fixes without
+    # main's queued breaking changes). Without it those branches ship with no
+    # CI at all — 0.16.3 was released that way, verified only locally.
+    branches: [main, "release/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "release/**"]
 
 env:
   CARGO_TERM_COLOR: always

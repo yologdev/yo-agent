@@ -6,6 +6,37 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+> The fixes below also shipped on the **0.16.x maintenance line** — the gasp
+> extension-path and MSRV fixes in [0.16.3], and the gasp id types in [0.16.4]
+> — cut from `v0.16.2` so consumers could take them without the breaking
+> changes queued here for 0.17.0.
+
+### Fixed
+
+- **The `gasp` extension path could not construct its arguments**
+  ([#115](https://github.com/yologdev/yoagent/issues/115)). The recorded
+  structs were re-exported without the id types their fields require, so
+  `StatePatch`, `EvalResult` and `Decision` were nameable and unbuildable.
+  `Task` worked only because `TaskId` was already in the list — which is why
+  the gap survived inspection, and why the 0.16.3 example, which constructs a
+  `Task`, compiled while its siblings did not.
+
+  Now re-exported: `PatchId`, `EvalId`, `DecisionId`, `HypothesisId`,
+  `ObservationId`, `ArtifactRef`, `ExpectedEffect`, `Precondition`,
+  `ProjectRef`, `StateOp` — found by auditing every re-exported struct's
+  fields rather than only the three in the report. A test now constructs every
+  re-exported struct from `yoagent::gasp` alone, so a struct that is nameable
+  but unbuildable fails to compile.
+
+### Changed
+
+- CI runs on `release/**` as well as `main`. The 0.16.x maintenance line had
+  no CI, so 0.16.3 shipped verified only locally.
+
+[0.16.3]: https://github.com/yologdev/yoagent/releases/tag/v0.16.3
+[0.16.4]: https://github.com/yologdev/yoagent/releases/tag/v0.16.4
+
+
 ### Fixed
 
 - **The documented `gasp` extension path was unreachable**
