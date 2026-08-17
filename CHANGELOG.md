@@ -77,6 +77,16 @@ adheres to [Semantic Versioning](https://semver.org/).
   provider-side breakpoint assertions rather than reimplement the session
   simulation.
 
+- **`examples/llm_compaction_live.rs`** — a live evaluation harness for the one
+  thing mocks cannot check: whether the briefings are any good. Runs a real
+  multi-turn session at a small context budget, forces splices, records into a
+  GASP repo, and prints every briefing verbatim next to what it cost. The turns
+  establish constraints early and ask the model to recall them after the splice,
+  so a summary that drops them shows up as self-contradiction.
+
+  `YO_DRY_RUN=1` exercises the whole pipeline against a stub — no key, no bill —
+  which is how the harness's own wiring was verified before it was handed over.
+
 - `StopReason` is documented as `#[non_exhaustive]`, which it has been since
   0.17.0 — the doc comment still claimed the opposite.
 
