@@ -229,11 +229,15 @@ look roughly ten times cheaper than it is.
 
 | | DeepSeek v4 Flash | Claude Sonnet 5 |
 |---|---|---|
-| session hit rate | 83.7% | 79.2% |
+| session hit rate | **79.0–83.7%** (n=5) | **75.5–79.2%** (n=5) |
 | steady-state turn | ~98% | ~81% |
 | `cache_write` per session | **0** | 92,733 |
 | not-cached tokens from compaction | 91.9% | 49.6% |
-| turns | 15 | 20 |
+| turns | 14–15 | 19–20 |
+
+The session hit rate is measured across five runs per provider; the per-turn
+figures come from one run each, because earlier runs did not record per-turn
+`cache_write` and could not be re-derived.
 
 **Session rates are close; the mechanisms are not.** Both providers land near
 80%, even though yoagent places explicit `cache_control` breakpoints for

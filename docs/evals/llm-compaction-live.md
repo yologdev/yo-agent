@@ -28,11 +28,11 @@ the two are not comparable on `input` alone. The figures below supersede that.
 
 | | DeepSeek v4 Flash | Claude Sonnet 5 |
 |---|---|---|
-| session hit rate | 83.7% | 79.2% |
+| session hit rate | **79.0–83.7%** (n=5) | **75.5–79.2%** (n=5) |
 | steady-state turn | ~98% | ~81% |
 | `cache_write` per session | 0 | 92,733 |
 | not-cached from compaction | 91.9% | 49.6% |
-| turns | 15 | 20 |
+| turns | 14–15 | 19–20 |
 
 - **Session rates are close** despite yoagent placing explicit `cache_control`
   breakpoints for Anthropic and sending nothing to DeepSeek.
@@ -43,8 +43,12 @@ the two are not comparable on `input` alone. The figures below supersede that.
   half its non-cached total. Those writes buy the cheap reads that follow.
 - **Trigger ratio 0.6 → 0.35 was a null result** across eight earlier runs.
 
-Session lengths differ (15 vs 20 turns), so the percentages are comparable and
-the absolute totals are not. n=1 per provider at the corrected metric.
+Session hit rate spans five runs per provider — that metric always counted
+`cache_write` and was unaffected by the bug. The per-turn figures (steady state,
+compaction share) are n=1 each: earlier runs did not record per-turn
+`cache_write`, so they could not be re-derived and had to be re-measured.
+
+Session lengths differ, so percentages compare and absolute totals do not.
 
 ### Why these numbers are lower than the replay figures
 
