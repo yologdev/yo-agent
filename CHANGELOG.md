@@ -110,6 +110,15 @@ adheres to [Semantic Versioning](https://semver.org/).
   not have it: the maintenance branch would have been ahead of the development
   branch on this fix, so 0.17.0 would have regressed it.
 
+- **`ModelConfig::claude_sonnet_5` carried Sonnet 4.6's prices**, overstating
+  every `cost_usd` for that model by 50%. It shipped as $3/$15 per MTok
+  ($3.75 write, $0.30 read) against the published $2/$10 ($2.50 write, $0.20
+  read) — the introductory rate that has since become standard. Callers using
+  `CostConfig::cost_usd`, `Agent::session_cost_usd`, or the `cost_usd` field on
+  the `llm_stream` tracing span will see Sonnet 5 figures drop by a third.
+  Fable 5, Opus 5, Opus 4.8 and Haiku 4.5 were checked against the same table
+  and were correct.
+
 - **The `gasp` extension path could not construct its arguments**
   ([#115](https://github.com/yologdev/yoagent/issues/115)). The recorded
   structs were re-exported without the id types their fields require, so

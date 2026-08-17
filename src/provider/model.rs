@@ -515,10 +515,10 @@ impl ModelConfig {
             context_window: 1_000_000,
             max_tokens: 64_000,
             cost: CostConfig {
-                input_per_million: 3.0,
-                output_per_million: 15.0,
-                cache_read_per_million: 0.3,
-                cache_write_per_million: 3.75,
+                input_per_million: 2.0,
+                output_per_million: 10.0,
+                cache_read_per_million: 0.2,
+                cache_write_per_million: 2.5,
             },
             ..Self::anthropic("claude-sonnet-5", "Claude Sonnet 5")
         }
@@ -1006,7 +1006,7 @@ mod tests {
 
         let sonnet = ModelConfig::claude_sonnet_5();
         assert_eq!(sonnet.id, "claude-sonnet-5");
-        assert_eq!(sonnet.cost.output_per_million, 15.0);
+        assert_eq!(sonnet.cost.output_per_million, 10.0);
 
         let haiku = ModelConfig::claude_haiku_4_5();
         assert_eq!(haiku.id, "claude-haiku-4-5");

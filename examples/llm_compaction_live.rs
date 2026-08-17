@@ -34,7 +34,9 @@ use std::sync::Arc;
 use yoagent::context::ContextConfig;
 use yoagent::gasp::{GaspRecorder, GoalRef};
 use yoagent::llm_compaction::SUMMARY_MARKER;
-use yoagent::provider::{ModelConfig, ProviderError, StreamConfig, StreamEvent, StreamProvider};
+use yoagent::provider::{
+    CostConfig, ModelConfig, ProviderError, StreamConfig, StreamEvent, StreamProvider,
+};
 use yoagent::*;
 
 /// Dry-run double (`YO_DRY_RUN=1`): bulky deterministic text, so the harness's
@@ -99,14 +101,35 @@ fn priced(id: &str) -> ModelConfig {
         // `cache_control` on the OpenAI-compat path, and `openai_compat.rs`
         // maps `prompt_cache_hit_tokens` onto `Usage::cache_read`. So a hit
         // rate here measures *their* caching, not yoagent's placement.
-        // `ModelConfig::deepseek` carries no rates, so the cost column stays
-        // blank rather than this harness guessing at prices.
+        //
+        // Rates live here rather than in `ModelConfig::deepseek` because
+        // DeepSeek prices by time of day — off-peak is exactly half of peak
+        // (peak = 01:00-04:00 and 06:00-10:00 UTC). A crate-level preset would
+        // be wrong half the day. These are the **peak** rates, so the cost
+        // column over-reports rather than under-reports off-peak runs.
+        // DeepSeek has no cache-write category at all: populating its cache
+        // is free, which is the asymmetry the provider comparison turns on.
+        "deepseek-v4-flash" => deepseek_priced("deepseek-v4-flash", 0.44, 1.32, 0.014),
+        "deepseek-v4-pro" => deepseek_priced("deepseek-v4-pro", 1.32, 3.96, 0.044),
         other if other.starts_with("deepseek") => ModelConfig::deepseek(other, other),
         other => {
             eprintln!("note: no priced preset for '{other}' — the cost column will be blank");
             ModelConfig::anthropic(other, other)
         }
     }
+}
+
+/// A DeepSeek config carrying peak-window rates. `cache_write` is 0 because
+/// DeepSeek has no write category — populating its cache is free.
+fn deepseek_priced(id: &str, input: f64, output: f64, cache_read: f64) -> ModelConfig {
+    let mut config = ModelConfig::deepseek(id, id);
+    config.cost = CostConfig {
+        input_per_million: input,
+        output_per_million: output,
+        cache_read_per_million: cache_read,
+        cache_write_per_million: 0.0,
+    };
+    config
 }
 
 fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
