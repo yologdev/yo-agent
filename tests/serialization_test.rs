@@ -355,17 +355,55 @@ fn all_agent_events() -> Vec<AgentEvent> {
             messages_after: 13,
             tokens_before: 96_500,
             tokens_after: 41_200,
-            messages_summarized: 28,
-            summary_usage: Some(Usage {
-                input: 54_000,
-                output: 1_100,
-                cache_read: 0,
-                cache_write: 0,
-                total_tokens: 55_100,
-            }),
-            summary_cost_usd: Some(0.0451),
+            summary: Some(SummaryStats::new(
+                28,
+                Usage {
+                    input: 54_000,
+                    output: 1_100,
+                    cache_read: 0,
+                    cache_write: 0,
+                    total_tokens: 55_100,
+                },
+                Some(0.0451),
+            )),
         },
     ]
+}
+
+/// The deterministic half of the same variant. Sampled separately because it
+/// is the *more common* path and pins two things the `Summarized` sample
+/// cannot: the wire value of `CompactionMethod::Deterministic`, and the shape
+/// of an absent `summary`.
+fn deterministic_compaction_event() -> AgentEvent {
+    AgentEvent::ContextCompacted {
+        method: CompactionMethod::Deterministic,
+        messages_before: 40,
+        messages_after: 12,
+        tokens_before: 96_500,
+        tokens_after: 40_000,
+        summary: None,
+    }
+}
+
+#[test]
+fn test_context_compacted_wire_shape_is_frozen() {
+    let v = serde_json::to_value(&all_agent_events()[12]).expect("serialize");
+    assert_eq!(v["type"], "contextCompacted");
+    assert_eq!(v["method"], "summarized");
+    // camelCase, including the acronym casing a TS client hardcodes.
+    assert_eq!(v["messagesBefore"], 40);
+    assert_eq!(v["tokensAfter"], 41_200);
+    assert_eq!(v["summary"]["messagesSummarized"], 28);
+    assert_eq!(v["summary"]["usage"]["totalTokens"], 55_100);
+    assert_eq!(v["summary"]["costUsd"], 0.0451);
+
+    let d = serde_json::to_value(deterministic_compaction_event()).expect("serialize");
+    assert_eq!(d["method"], "deterministic");
+    assert!(
+        d["summary"].is_null(),
+        "an absent summary serializes as null"
+    );
+    roundtrip(&deterministic_compaction_event());
 }
 
 #[test]

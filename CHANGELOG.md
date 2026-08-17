@@ -53,13 +53,19 @@ adheres to [Semantic Versioning](https://semver.org/).
   apply to this strategy — its result is sized by `with_retain_tail_tokens`
   instead. Consuming the loop's adapted target is follow-up work.
 
-- **`AgentEvent::ContextCompacted`** with the new `CompactionMethod` enum.
-  Emitted by `LlmCompaction` on both paths — the spliced summary and the
-  deterministic fallback — carrying messages and tokens before/after, how many
-  messages the summary replaced, and the summarization request's own `Usage` and
-  dollar cost. That last part is the point: it makes an LLM compaction strategy
-  priceable against `DefaultCompaction` instead of a guess. `DefaultCompaction`
-  does not emit it (no event channel, and no request to price).
+- **`AgentEvent::ContextCompacted`**, with the new `CompactionMethod` enum and
+  `SummaryStats` payload. Emitted by `LlmCompaction` on both paths — the spliced
+  summary and the deterministic fallback — carrying messages and tokens
+  before/after plus, when a request was made, a `summary: Option<SummaryStats>`
+  holding the span it bought, its `Usage`, and its dollar cost. That last part is
+  the point: it makes an LLM compaction strategy priceable against
+  `DefaultCompaction` instead of a guess. One optional payload rather than three
+  sibling `Option`s so the cost, the span, and the fact that a request happened
+  cannot disagree. `DefaultCompaction` does not emit it (no event channel, and no
+  request to price).
+
+- `StopReason` is documented as `#[non_exhaustive]`, which it has been since
+  0.17.0 — the doc comment still claimed the opposite.
 
 ### Fixed
 
