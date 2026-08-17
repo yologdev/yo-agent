@@ -140,7 +140,12 @@ impl Default for ContextTracker {
 // Context configuration
 // ---------------------------------------------------------------------------
 
-/// Configuration for context management
+/// Configuration for context management.
+///
+/// Sizes the built-in tiered compaction. The knobs below apply to the
+/// deterministic tiers only — [`LlmCompaction`](crate::LlmCompaction), the
+/// summarizing alternative, sizes its result by its own retained-tail setting
+/// and does not read `compact_target_ratio` or `compact_headroom_turns`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextConfig {
     /// Maximum context tokens (leave room for response)

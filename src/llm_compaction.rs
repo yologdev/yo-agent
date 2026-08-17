@@ -51,6 +51,27 @@
 //! over its serialized bytes; on any mismatch the summary is discarded and a
 //! fresh one is started.
 //!
+//! # Two accepted limits
+//!
+//! **The API key is resolved once, at construction.**
+//! [`from_config`](LlmCompaction::from_config) reads the provider-conventional
+//! environment variable when the strategy is built and holds the result for its
+//! lifetime — the same contract as [`Agent`](crate::Agent), which re-resolves
+//! only on [`set_model`](crate::Agent::set_model). Fine for environment keys;
+//! wrong if the host rotates credentials mid-session, in which case build a
+//! fresh strategy rather than expecting this one to pick up the new key.
+//!
+//! **The trigger is checked once per turn.** Both the trigger and the budget are
+//! evaluated on entry to [`compact`](CompactionStrategy::compact), so a single
+//! turn that adds enough tokens to cross *both* at once gets no background head
+//! start: the budget check finds no summary ready and takes the deterministic
+//! fallback for that turn, and the summary that was spawned lands one compaction
+//! late. Correctness is unaffected — the fallback covers the budget either way —
+//! and the cost is one lossy compaction on a session whose turns are large
+//! relative to `(1 - trigger_ratio) x budget`. Lower
+//! [`with_trigger_ratio`](LlmCompaction::with_trigger_ratio) if your turns are
+//! big enough that this happens routinely.
+//!
 //! # Known limitation: the headroom policy does not apply
 //!
 //! [`ContextConfig::compact_target_ratio`] and
@@ -999,6 +1020,104 @@ mod tests {
             "the verbatim head must not also appear inside the summarized span"
         );
         assert!(transcript.contains("user message 1"));
+    }
+
+    /// A turn whose tool output is far longer than the default line cap, so
+    /// Level 1 has something real to truncate.
+    fn tool_turn(i: usize, lines: usize) -> Vec<AgentMessage> {
+        let call_id = format!("call-{i}");
+        vec![
+            AgentMessage::Llm(Message::User {
+                content: vec![Content::Text {
+                    text: format!("run command {i}"),
+                }],
+                timestamp: i as u64,
+            }),
+            AgentMessage::Llm(
+                Message::assistant(
+                    vec![Content::ToolCall {
+                        id: call_id.clone(),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": format!("cmd {i}")}),
+                        provider_metadata: None,
+                    }],
+                    StopReason::ToolUse,
+                    "mock",
+                    "mock",
+                    Usage::default(),
+                )
+                .with_timestamp(i as u64),
+            ),
+            AgentMessage::Llm(Message::ToolResult {
+                tool_call_id: call_id,
+                tool_name: "bash".into(),
+                content: vec![Content::Text {
+                    text: (0..lines)
+                        .map(|l| format!("output line {l} of turn {i}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                }],
+                is_error: false,
+                timestamp: i as u64,
+            }),
+        ]
+    }
+
+    /// The safety net: a tail bigger than the whole budget means the spliced
+    /// result is still over, so `compact_messages` has to finish the job. The
+    /// handoff asked specifically whether Level 1 stays idempotent on that
+    /// shape — it does, so the deterministic tiers can run over a spliced
+    /// history without re-truncating what they already truncated.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn over_budget_splice_is_finished_by_the_deterministic_tiers() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let strategy = mock("## Goal\nSafety net.")
+            .with_trigger_ratio(0.1)
+            // Larger than the budget: whatever is spliced cannot fit.
+            .with_retain_tail_tokens(4_000)
+            .with_event_sender(tx);
+
+        let messages: Vec<AgentMessage> = (0..30).flat_map(|i| tool_turn(i, 400)).collect();
+        let cfg = config(2_000);
+        assert!(
+            total_tokens(&messages) > 4_000,
+            "tail must exceed the budget"
+        );
+
+        strategy.compact(messages.clone(), &cfg);
+        assert!(await_summary(&strategy).await);
+        let _ = rx.try_recv(); // the first pass's deterministic event
+
+        let out = strategy.compact(messages.clone(), &cfg);
+        assert!(
+            total_tokens(&out) <= 2_000,
+            "the safety net must bring an over-budget splice back under budget"
+        );
+
+        // Level 1 is idempotent on the result: re-truncating changes nothing,
+        // so a later compaction pass will not rewrite these bytes again.
+        for msg in &out {
+            assert_eq!(
+                &context::truncate_tool_output(msg.clone(), &cfg),
+                msg,
+                "spliced history must already be Level-1 stable"
+            );
+        }
+
+        // The event still reports the splice, with post-safety-net totals.
+        match rx.try_recv().expect("splice path must emit") {
+            AgentEvent::ContextCompacted {
+                method,
+                tokens_before,
+                tokens_after,
+                ..
+            } => {
+                assert_eq!(method, CompactionMethod::Summarized);
+                assert!(tokens_after < tokens_before);
+                assert!(tokens_after <= 2_000);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     /// A provider that always fails — MockProvider never errors, so the
