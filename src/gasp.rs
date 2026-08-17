@@ -51,46 +51,26 @@ use yoagent_state::{
     Goal, YoAgentModelCalled, YoAgentModelFinished, YoAgentRunFinished, YoAgentRunStarted,
     YoAgentStateAdapter, YoAgentStateSink, YoAgentToolCalled, YoAgentToolFinished,
 };
-pub use yoagent_state::{GoalId, RunId, StateError};
 // The extension path (see [`GaspRecorder::state`]): applications recording the
-// goal/task/verdict tier need no direct `yoagent-state` dependency, so both
-// halves must be nameable here — the *arguments* to `YoAgentState::record_*`
-// and the *receiver* those methods are called on. Exporting only the arguments
-// left the path documented but unreachable (#111).
+// goal/task/verdict tier need no direct `yoagent-state` dependency, so every
+// type on that path must be nameable here. Three rounds of bug reports each
+// found one tier still missing, so the rule is now mechanical rather than
+// judged — see `tests/gasp_test.rs`:
+//
+//   1. the receiver (`YoAgentState`) and what it needs        — #111
+//   2. the recorded structs and their id types                — #115
+//   3. those structs' *field* types, and the argument types
+//      of every `YoAgentState` method                         — #117
+//
+// (3) is the one that subsumes the others: a struct can be constructible
+// without being usable, because a smart constructor defaults a field whose
+// type the caller can never name.
 pub use yoagent_state::{
-    // Receiver side: what `record_*` is called on, and what it needs.
-    ActorRef,
-    // ...and every id / field type needed to *construct* them. A struct whose
-    // id type is missing is nameable but unbuildable — the gap behind #111 and
-    // #115, invisible by inspection because the list looks complete.
-    ArtifactRef,
-    // Argument side: the recorded structs...
-    Decision,
-    DecisionId,
-    // ...their status enums...
-    DecisionStatus,
-    EvalId,
-    EvalResult,
-    EvalStatus,
-    EventStore,
-    ExpectedEffect,
-    GitEventStore,
-    Goal as GaspGoal,
-    GoalStatus,
-    Hypothesis,
-    HypothesisId,
-    Node,
-    NodeId,
-    Observation,
-    ObservationId,
-    PatchId,
-    Precondition,
-    ProjectRef,
-    StateOp,
-    StatePatch,
-    Task,
-    TaskId,
-    TaskStatus,
+    ActorRef, ArtifactRef, Decision, DecisionId, DecisionStatus, EvalId, EvalResult, EvalStatus,
+    Event, EventId, EventStore, ExpectedEffect, Frame, FrameId, GitEventStore, Goal as GaspGoal,
+    GoalId, GoalStatus, Hypothesis, HypothesisId, ModelCall, Node, NodeId, Observation,
+    ObservationId, PatchId, PatchStatus, Precondition, ProjectRef, ProjectSnapshot, RunId,
+    StateError, StateOp, StatePatch, Task, TaskId, TaskStatus, ToolCall as GaspToolCall,
     YoAgentState,
 };
 

@@ -7,9 +7,9 @@ adheres to [Semantic Versioning](https://semver.org/).
 ## Unreleased
 
 > The fixes below also shipped on the **0.16.x maintenance line** — the gasp
-> extension-path and MSRV fixes in [0.16.3], and the gasp id types in [0.16.4]
-> — cut from `v0.16.2` so consumers could take them without the breaking
-> changes queued here for 0.17.0.
+> extension-path and MSRV fixes in [0.16.3], the gasp id types in [0.16.4], and
+> the method-surface closure in [0.16.5] — cut from `v0.16.2` so consumers could
+> take them without the breaking changes queued here for 0.17.0.
 
 ### Added
 
@@ -92,6 +92,24 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The `gasp` method surface is now closed mechanically, not by judgement**
+  ([#117](https://github.com/yologdev/yoagent/issues/117)). Three rounds of the
+  same bug — [#111] (the receiver), [#115] (the recorded structs' id types),
+  [#117] (those structs' *field* types and every `YoAgentState` method's
+  argument types) — each found one more tier of `yoagent-state` type that the
+  documented extension path needs but could not name. (3) subsumes the others:
+  a struct can be constructible without being usable, because a smart
+  constructor defaults a field whose type the caller can never name.
+
+  Now also re-exported: `Event`, `EventId`, `Frame`, `FrameId`, `ModelCall`,
+  `PatchStatus`, `ProjectSnapshot`, and `ToolCall as GaspToolCall`. The rule is
+  enforced by `tests/gasp_test.rs` rather than by inspection, which is what
+  makes a fourth round unlikely.
+
+  Forward-ported from the 0.16.x line, where it shipped as [0.16.5]. `main` did
+  not have it: the maintenance branch would have been ahead of the development
+  branch on this fix, so 0.17.0 would have regressed it.
+
 - **The `gasp` extension path could not construct its arguments**
   ([#115](https://github.com/yologdev/yoagent/issues/115)). The recorded
   structs were re-exported without the id types their fields require, so
@@ -114,6 +132,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 [0.16.3]: https://github.com/yologdev/yoagent/releases/tag/v0.16.3
 [0.16.4]: https://github.com/yologdev/yoagent/releases/tag/v0.16.4
+[0.16.5]: https://github.com/yologdev/yoagent/releases/tag/v0.16.5
+[#111]: https://github.com/yologdev/yoagent/issues/111
+[#115]: https://github.com/yologdev/yoagent/issues/115
+[#117]: https://github.com/yologdev/yoagent/issues/117
 
 
 ### Fixed
