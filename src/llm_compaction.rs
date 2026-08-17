@@ -194,8 +194,11 @@ const DEFAULT_INSTRUCTION: &str = "Summarize the conversation above as a handoff
      messages. Use exactly these sections:\n\
      ## Goal\nWhat the user is trying to accomplish, verbatim where possible.\n\
      ## State & progress\nWhat has been done, what is currently in flight.\n\
-     ## Key decisions & constraints\nDecisions made and why; constraints, \
-     preferences, and facts that must not be re-litigated.\n\
+     ## Key decisions & constraints\nDecisions made and why. Record the \
+     constraints you were *given* as well as the choices made in response to \
+     them — deployment shape, scale, hard dependencies, things ruled out, \
+     stated preferences. A reader who keeps the decisions but loses the \
+     conditions that forced them cannot tell which are still binding.\n\
      ## Open items\nUnresolved questions and concrete next steps.\n\
      Be dense and factual. Include exact identifiers (paths, names, versions, \
      numbers) — those are the details the next agent cannot reconstruct.";
