@@ -836,3 +836,57 @@ fn every_reexported_struct_is_constructible_from_gasp_alone() {
     let _evidence: Vec<NodeId> = vec![NodeId::new("node_1")];
     let _artifacts: Vec<ArtifactRef> = Vec::new();
 }
+
+/// Stronger than the test above, and the reason #117 slipped past it:
+/// **constructibility is weaker than usability.** `StatePatch::new` defaults
+/// `status: PatchStatus::Proposed` internally, so a `StatePatch` can be built
+/// without the caller ever naming `PatchStatus` — construction passed while
+/// the type stayed unreachable, and advancing a patch was impossible.
+///
+/// Binding each field to an explicitly named type closes that: a field whose
+/// type is not re-exported fails to compile here. Same for the argument types
+/// of the `YoAgentState` methods the extension path calls — re-exporting the
+/// receiver makes them callable in principle, so their arguments must be
+/// nameable too.
+///
+/// This test exists to *compile*.
+#[test]
+fn every_field_and_argument_type_is_nameable_from_gasp_alone() {
+    use yoagent::gasp::{
+        ActorRef, ArtifactRef, DecisionStatus, EvalStatus, Event, EventId, ExpectedEffect, Frame,
+        FrameId, GoalId, GoalStatus, ModelCall, NodeId, PatchId, PatchStatus, Precondition,
+        ProjectRef, ProjectSnapshot, RunId, StateOp, StatePatch, TaskStatus,
+    };
+
+    let patch = StatePatch::new(PatchId::new("p1"), "t", "s", ActorRef::agent("yoyo"));
+
+    // Every field bound to a named type. `status` is the one #117 was about.
+    let _: PatchId = patch.id.clone();
+    let _: PatchStatus = patch.status.clone();
+    let _: u64 = patch.base_state_version;
+    let _: Option<ProjectRef> = patch.base_project_ref.clone();
+    let _: Vec<StateOp> = patch.ops.clone();
+    let _: Vec<Precondition> = patch.preconditions.clone();
+    let _: Vec<ExpectedEffect> = patch.expected_effects.clone();
+    let _: Vec<NodeId> = patch.evidence.clone();
+    let _: Vec<ArtifactRef> = patch.artifacts.clone();
+
+    // The status enums a caller compares or assigns.
+    let _: [PatchStatus; 1] = [PatchStatus::Proposed];
+    let _: [TaskStatus; 1] = [TaskStatus::Open];
+    let _: [GoalStatus; 1] = [GoalStatus::Open];
+    let _: [EvalStatus; 1] = [EvalStatus::Passed];
+    let _: [DecisionStatus; 1] = [DecisionStatus::Pending];
+
+    // Argument types of the remaining YoAgentState methods, so "the receiver
+    // is re-exported" actually means its methods can be called.
+    fn _takes<T>(_: Option<T>) {}
+    _takes::<Event>(None);
+    _takes::<EventId>(None);
+    _takes::<Frame>(None);
+    _takes::<FrameId>(None);
+    _takes::<ModelCall>(None);
+    _takes::<ProjectSnapshot>(None);
+    _takes::<GoalId>(None);
+    _takes::<RunId>(None);
+}

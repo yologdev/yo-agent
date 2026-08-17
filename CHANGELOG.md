@@ -4,6 +4,32 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.16.5
+
+### Fixed
+
+- **`PatchStatus` was not re-exported, so a patch could be created but never
+  advanced** ([#117](https://github.com/yologdev/yoagent/issues/117)).
+  `update_patch_status` was uncallable and `StatePatch.status` unnameable.
+
+  The 0.16.4 test did not catch it, and the reason is the useful part:
+  **constructibility is weaker than usability.** `StatePatch::new` defaults
+  `status: PatchStatus::Proposed` internally, so the struct is constructible
+  without the caller ever naming the type — the test passed while the type
+  stayed unreachable. `StatePatch` is the one re-exported struct with a smart
+  constructor, which is exactly where the two properties diverge.
+
+  Fixed with the stronger invariant instead of the symbol: a test now binds
+  **every field of every re-exported struct to an explicitly named type**, and
+  names the argument types of every `YoAgentState` method. Re-exporting the
+  receiver makes its methods callable in principle, so an unnameable argument
+  type is the same defect one tier out — that audit found `Event`, `EventId`,
+  `Frame`, `FrameId`, `ModelCall`, `ProjectSnapshot` and `ToolCall` (as
+  `GaspToolCall`) also missing, none of which were reported.
+
+  Verified by deletion: removing `PatchStatus` from the list now fails the
+  build.
+
 ## 0.16.4
 
 ### Fixed
