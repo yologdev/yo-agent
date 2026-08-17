@@ -38,9 +38,9 @@ adheres to [Semantic Versioning](https://semver.org/).
   This buys **retention quality, and costs tokens**: each summarization pays
   input tokens for the summarized span plus output tokens for the briefing, which
   `DefaultCompaction` never pays. It does **not** reduce prefix-cache breaks —
-  measured at 6 vs 6 over 120 turns at a 20k budget and 6 vs 5 over 600 turns at
-  100k. Route it at a cheap model; both paths report their own cost on the new
-  event below.
+  6 vs 6 over 120 turns at a 20k budget, 6 vs 5 over 600 turns at 100k, per
+  `tests/prefix_cache_harness.rs`. Route it at a cheap model; both paths report
+  their own cost on the new event below.
 
   ```rust,ignore
   let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"))
@@ -63,6 +63,19 @@ adheres to [Semantic Versioning](https://semver.org/).
   sibling `Option`s so the cost, the span, and the fact that a request happened
   cannot disagree. `DefaultCompaction` does not emit it (no event channel, and no
   request to price).
+
+- **`tests/prefix_cache_harness.rs`** — an `#[ignore]`d measurement harness that
+  drives any `CompactionStrategy` through a simulated session (append a turn,
+  compact, feed the result back, as the loop does) and counts the rounds that
+  rewrite history. Every prefix-cache figure quoted in the docs comes from it and
+  can be regenerated with
+  `cargo test --test prefix_cache_harness -- --ignored --nocapture`.
+
+  Deliberately not scoped to `LlmCompaction`: prefix-cache effectiveness has two
+  halves, and this covers history stability. Wiring `CacheStrategy` through the
+  non-Anthropic providers is the other half, and should extend this harness with
+  provider-side breakpoint assertions rather than reimplement the session
+  simulation.
 
 - `StopReason` is documented as `#[non_exhaustive]`, which it has been since
   0.17.0 — the doc comment still claimed the opposite.

@@ -33,13 +33,25 @@
 //! to the tokens it saved.
 //!
 //! **Does not buy: fewer prefix-cache breaks.** Both strategies rewrite history
-//! when the budget is crossed, and neither rewrites in between, so the number of
-//! cache breaks over a session is a wash — measured at 6 vs 6 over 120 turns at
-//! a 20k budget, and 6 vs 5 over 600 turns at 100k. Splicing at the last
-//! possible moment describes when this strategy breaks the cache relative to a
+//! only when the budget is crossed, and neither rewrites in between, so the
+//! number of rewrites over a session is a wash: **6 vs 6** over 120 turns at a
+//! 20k budget, **6 vs 5** over 600 turns at 100k. Splicing at the last possible
+//! moment describes when this strategy breaks the cache relative to a
 //! *synchronous* summarizer, which must break it the moment it decides to
 //! summarize. It is not an advantage over
 //! [`DefaultCompaction`](crate::context::DefaultCompaction).
+//!
+//! Those figures are reproducible rather than folklore. They come from
+//! `tests/prefix_cache_harness.rs`, measured at commit `719160f`:
+//!
+//! ```text
+//! cargo test --test prefix_cache_harness -- --ignored --nocapture
+//! ```
+//!
+//! Re-run it and update this section after any change to compaction sizing —
+//! [`ContextConfig::compact_target_ratio`], [`ContextConfig::compact_headroom_turns`],
+//! [`DEFAULT_TRIGGER_RATIO`] and the `retain_tail_tokens` derivation all move
+//! these numbers, and nothing in CI will notice if they drift.
 //!
 //! # Guarantees
 //!
