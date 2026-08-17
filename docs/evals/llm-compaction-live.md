@@ -21,34 +21,37 @@ would be false precision: session cache hit rate landed at 75.4%, 76.4% and
 
 ## Provider comparison: DeepSeek vs Anthropic
 
-Eight runs — two providers × two trigger ratios × two repetitions — 12K budget,
-`keep_first: 0`, `keep_recent: 4`, identical turn script.
+**"Not cached" is `input + cache_write`.** An earlier version of this page
+counted only `input`, which understated Anthropic roughly tenfold: Anthropic
+books a re-processed prefix to `cache_write`, DeepSeek has no write category, so
+the two are not comparable on `input` alone. The figures below supersede that.
 
-| provider | trigger | session hit rate | steady-state turn | `cache_write` | misses from compaction |
-|---|---|---|---|---|---|
-| DeepSeek v4 Flash | 0.6 | 79.6–80.7% | 98.4–98.8% | 0 | 92.8–94.2% |
-| DeepSeek v4 Flash | 0.35 | 79.0–80.0% | 98.9–99.0% | 0 | 94.4–94.7% |
-| Claude Sonnet 5 | 0.6 | 77.1–78.9% | 99.8–99.9% | 103K–126K | 9.9–11.9% |
-| Claude Sonnet 5 | 0.35 | 75.5–77.8% | 99.8% | 92K–112K | 8.8–11.9% |
+| | DeepSeek v4 Flash | Claude Sonnet 5 |
+|---|---|---|
+| session hit rate | 83.7% | 79.2% |
+| steady-state turn | ~98% | ~81% |
+| `cache_write` per session | 0 | 92,733 |
+| not-cached from compaction | 91.9% | 49.6% |
+| turns | 15 | 20 |
 
-Findings, with the reasoning in `docs/concepts/prompt-caching.md`:
+- **Session rates are close** despite yoagent placing explicit `cache_control`
+  breakpoints for Anthropic and sending nothing to DeepSeek.
+- **DeepSeek's cost is almost entirely compaction** (91.9%): populating its cache
+  is free, so between rewrites it pays only for genuinely new content.
+- **Anthropic pays continuously** — ~3,600–4,600 cache-write tokens per turn at
+  1.25× — which is why its steady-state sits near 81% and compaction is only
+  half its non-cached total. Those writes buy the cheap reads that follow.
+- **Trigger ratio 0.6 → 0.35 was a null result** across eight earlier runs.
 
-- **Session rates are indistinguishable across providers**, even though yoagent
-  places explicit `cache_control` breakpoints for Anthropic and sends nothing to
-  DeepSeek.
-- **Steady-state turns are ~99% on both.** The shortfall is compaction rewriting
-  history, not cache addressing.
-- **Only Anthropic pays a write premium** — 92K–126K cache-write tokens per
-  session at 1.25×, versus zero for DeepSeek's automatic cache. Invisible in the
-  hit rate.
-- **Trigger ratio 0.6 → 0.35 is a null result** on both providers.
+Session lengths differ (15 vs 20 turns), so the percentages are comparable and
+the absolute totals are not. n=1 per provider at the corrected metric.
 
 ### Why these numbers are lower than the replay figures
 
 `docs/concepts/prompt-caching.md` reports 93–96% from 300–2400 turn replays.
-These live runs are 14–20 turns, where the arithmetic ceiling is ~87–90%: every
+These live runs are 15–20 turns, where the arithmetic ceiling is ~88–90%: every
 turn's new content is necessarily a miss, so the best achievable rate is about
-`(n-1)/(n+1)`. **80% over 14 turns and 95% over 300 turns describe the same
+`(n-1)/(n+1)`. **80% over 15 turns and 95% over 300 turns describe the same
 behaviour.** Hit rates are not comparable across session lengths; rewrite counts
 and dollars are.
 

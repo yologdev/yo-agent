@@ -184,6 +184,13 @@ const PROBES: &[(&str, &str)] = &[
 struct TurnCache {
     turn: usize,
     hit: u64,
+    /// Prompt tokens *not* served from cache — `input + cache_write`.
+    ///
+    /// Both halves count: a provider that re-processes a rewritten prefix bills
+    /// it either way. Anthropic books it to `cache_write` (and gets a reusable
+    /// entry for the 1.25x premium); DeepSeek has no write category and books it
+    /// to `input`. Counting only `input` made compaction look ~10x cheaper on
+    /// Anthropic than on DeepSeek when both re-process the same tokens.
     miss: u64,
     /// A compaction rewrote history on this turn, so the next request's prefix
     /// diverges from what the provider cached.
@@ -495,7 +502,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             per_turn.push(TurnCache {
                 turn,
                 hit: u.cache_read,
-                miss: u.input,
+                miss: u.input + u.cache_write,
                 compacted: compactions.len() > compactions_before,
             });
         }
@@ -645,8 +652,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     println!(
-        "\n{:<6} {:>10} {:>10} {:>8}  note",
-        "turn", "hit", "miss", "rate"
+        "\n{:<6} {:>10} {:>12} {:>8}  note",
+        "turn", "hit", "not-cached", "rate"
     );
     for t in &per_turn {
         let total = t.hit + t.miss;
@@ -656,7 +663,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             t.hit as f64 / total as f64 * 100.0
         };
         println!(
-            "{:<6} {:>10} {:>10} {:>7.1}%  {}",
+            "{:<6} {:>10} {:>12} {:>7.1}%  {}",
             t.turn,
             t.hit,
             t.miss,
@@ -687,7 +694,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .saturating_sub(post_compaction_miss);
     let ceiling = (n as f64 - 1.0) / (n as f64 + 1.0) * 100.0;
 
-    println!("\nmiss decomposition ({total_miss} tokens total):");
+    println!("\nnot-cached decomposition ({total_miss} tokens = input + cache_write):");
     println!("  {first_turn_miss:>10}  turn 1 — nothing to hit yet");
     println!("  {post_compaction_miss:>10}  turns where compaction rewrote history");
     println!("  {steady_state_miss:>10}  steady state — each turn's genuinely new content");

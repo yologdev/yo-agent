@@ -221,44 +221,45 @@ session. Compare rewrite counts, or compare dollars.
 ### Measured live: DeepSeek vs Anthropic
 
 `examples/llm_compaction_live.rs` runs a real multi-turn session and reports
-per-turn cache accounting. Eight runs, two providers × two trigger ratios × two
-repetitions, 12K budget, identical turn script:
+per-turn cache accounting. **"Not cached" means `input + cache_write`** — both
+halves are prompt tokens the provider had to process and bill for. Counting only
+`input` is the trap: Anthropic books a re-processed prefix to `cache_write` and
+DeepSeek has no write category at all, so an `input`-only metric makes Anthropic
+look roughly ten times cheaper than it is.
 
-| provider | session hit rate | steady-state turn | `cache_write` | share of misses from compaction |
-|---|---|---|---|---|
-| DeepSeek v4 Flash | 79.0–80.7% | 98.4–99.0% | **0** | 93–95% |
-| Claude Sonnet 5 | 75.5–78.9% | 99.8–99.9% | 92K–126K | 9–12% |
+| | DeepSeek v4 Flash | Claude Sonnet 5 |
+|---|---|---|
+| session hit rate | 83.7% | 79.2% |
+| steady-state turn | ~98% | ~81% |
+| `cache_write` per session | **0** | 92,733 |
+| not-cached tokens from compaction | 91.9% | 49.6% |
+| turns | 15 | 20 |
 
-Three things worth taking from it.
+**Session rates are close; the mechanisms are not.** Both providers land near
+80%, even though yoagent places explicit `cache_control` breakpoints for
+Anthropic and sends nothing at all to DeepSeek. What differs is where the cost
+falls.
 
-**The session rates are indistinguishable**, despite yoagent placing explicit
-`cache_control` breakpoints for Anthropic and sending nothing at all to
-DeepSeek. Both sit in the same band, and the gap is smaller than the run-to-run
-spread. Automatic provider-side caching and framework-managed breakpoints
-arrive at the same place on this workload.
+**DeepSeek pays almost nothing between compactions.** Its steady-state turns run
+~98%: populating the cache is free, so the only non-cached tokens are the turn's
+genuinely new content. Consequently **92% of its non-cached tokens come from the
+two turns where compaction rewrote history** — for this provider, compaction is
+essentially the whole cache story.
 
-**Steady-state turns are ~99% on both.** Nearly all of the shortfall from the
-ceiling is the handful of turns where compaction rewrote history — 93–95% of all
-missed tokens on DeepSeek. Cache effectiveness is dominated by *how often
-history is rewritten*, not by how the cache is addressed.
-
-**Only Anthropic pays for writes.** A session writes 92K–126K cache-write tokens
-at a 1.25× premium; DeepSeek's automatic cache has no write category at all.
-This is invisible in the hit rate and is the clearest illustration of the point
-below — two providers can post the same rate with materially different bills.
-
-It also means the "share of misses from compaction" column reads differently per
-provider. On DeepSeek, a rewrite shows up as raw input misses, so the column
-captures compaction's full cost. On Anthropic, a rewrite mostly shows up as
-*cache writes* — raw input stays tiny — so 9–12% understates it. Compare the
-`cache_write` column instead when the provider has one.
+**Anthropic pays a write premium continuously.** Every turn writes ~3,600–4,600
+tokens at 1.25× to extend the cached prefix, which holds steady-state turns near
+81% rather than 98%. Compaction accounts for only ~50% of its non-cached tokens;
+the other half is that ongoing write traffic. The trade is real rather than
+wasteful — those writes buy the 99%-cheap reads that follow — but it means the
+two providers reach a similar hit rate with materially different bills, which is
+the point of the section below.
 
 One null result worth recording: lowering `DEFAULT_TRIGGER_RATIO` from 0.6 to
 0.35, on the theory that a slow summarizer needs more wall-clock headroom before
-the budget is crossed, changed nothing measurable on either provider
-(DeepSeek 79.6–80.7% → 79.0–80.0%; Sonnet 77.1–78.9% → 75.5–77.8%). The
+the budget is crossed, changed nothing measurable on either provider. The
 condition it was meant to address — repeated deterministic fallbacks because no
-summary arrived in time — did not occur in these runs.
+summary arrived in time — did not occur in those runs, so the hypothesis is
+untested rather than refuted.
 
 ### Judge changes in dollars, not hit rate
 
