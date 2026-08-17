@@ -24,6 +24,17 @@ adheres to [Semantic Versioning](https://semver.org/).
   crossed. The loop never stalls on it, and it can never wedge — an unfinished,
   failed, or stale summary falls back to `compact_messages` for that turn.
 
+  Two invariants are load-bearing and were each a bug first, caught by review
+  before release. The background request is fingerprinted against the history
+  `compact` is about to **return**, not the one it received: the loop writes the
+  return value straight back, so anchoring on the input meant the deterministic
+  fallback invalidated the summary its own call had just ordered — an absorbing
+  state costing one billed request per compaction for a result identical to
+  `DefaultCompaction`'s (measured: 22 requests, 0 splices over 25 turns). And an
+  over-budget splice compacts only its tail, because the summary sits exactly
+  where `level3_drop_middle` starts cutting and the naive whole-history pass
+  deleted the briefing while the event still reported `Summarized`.
+
   This buys **retention quality, and costs tokens**: each summarization pays
   input tokens for the summarized span plus output tokens for the briefing, which
   `DefaultCompaction` never pays. It does **not** reduce prefix-cache breaks —

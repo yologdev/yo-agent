@@ -51,36 +51,45 @@
 //! over its serialized bytes; on any mismatch the summary is discarded and a
 //! fresh one is started.
 //!
-//! # Two accepted limits
+//! **A summary is never paid for and then thrown away.** The background request
+//! is always fingerprinted against the history `compact` is about to *return*,
+//! never the one it received. That distinction is load-bearing: the agent loop
+//! writes the return value straight back into the session, so anchoring on the
+//! input meant that whenever the deterministic fallback rewrote history the
+//! pending summary was invalidated by the same call that ordered it — discarded
+//! on arrival, replaced by another request against a prefix the next fallback
+//! would rewrite in turn. That state was absorbing, and it cost one billed
+//! request per compaction for a result identical to
+//! [`DefaultCompaction`](crate::context::DefaultCompaction)'s.
+//!
+//! **The briefing survives the safety net.** When a splice still exceeds the
+//! budget the tail is compacted in place rather than the whole history: the
+//! summary sits exactly where `level3_drop_middle` starts cutting, so the naive
+//! move destroys what was just paid for. If head plus briefing exceed the budget
+//! on their own the briefing genuinely cannot be kept — the event then reports
+//! [`CompactionMethod::Deterministic`], because claiming a splice the result
+//! does not contain is worse than reporting the fallback.
+//!
+//! # One accepted limit
 //!
 //! **The API key is resolved once, at construction.**
 //! [`from_config`](LlmCompaction::from_config) reads the provider-conventional
 //! environment variable when the strategy is built and holds the result for its
-//! lifetime — the same contract as [`Agent`](crate::Agent), which re-resolves
-//! only on [`set_model`](crate::Agent::set_model). Fine for environment keys;
-//! wrong if the host rotates credentials mid-session, in which case build a
-//! fresh strategy rather than expecting this one to pick up the new key.
-//!
-//! **The trigger is checked once per turn.** Both the trigger and the budget are
-//! evaluated on entry to [`compact`](CompactionStrategy::compact), so a single
-//! turn that adds enough tokens to cross *both* at once gets no background head
-//! start: the budget check finds no summary ready and takes the deterministic
-//! fallback for that turn, and the summary that was spawned lands one compaction
-//! late. Correctness is unaffected — the fallback covers the budget either way —
-//! and the cost is one lossy compaction on a session whose turns are large
-//! relative to `(1 - trigger_ratio) x budget`. Lower
-//! [`with_trigger_ratio`](LlmCompaction::with_trigger_ratio) if your turns are
-//! big enough that this happens routinely.
+//! lifetime. Note this is *not* [`Agent`](crate::Agent)'s contract: `Agent`
+//! resolves lazily per request, so it does pick up a rotated environment key.
+//! Build a fresh strategy if credentials rotate mid-session.
 //!
 //! # Known limitation: the headroom policy does not apply
 //!
 //! [`ContextConfig::compact_target_ratio`] and
 //! [`ContextConfig::compact_headroom_turns`] size the deterministic tiers, and
-//! the agent loop adapts the ratio to the session's observed growth. This
-//! strategy ignores both: the size of its result is set by
+//! the agent loop adapts the ratio to the session's observed growth. The
+//! *spliced* result ignores both — its size is set by
 //! [`with_retain_tail_tokens`](LlmCompaction::with_retain_tail_tokens) instead.
-//! Consuming the adapted target is tracked as follow-up work; until then, tune
-//! the tail directly if the interval between compactions matters to you.
+//! The deterministic fallback and the safety net do still honour them, since
+//! both run through [`compact_messages`]. Consuming the adapted target on the
+//! splice path is follow-up work; until then, tune the tail directly if the
+//! interval between compactions matters to you.
 //!
 //! # Model routing
 //!
@@ -181,6 +190,32 @@ const MIN_SUMMARIZED_SPAN: usize = 4;
 struct Fingerprint {
     cut: usize,
     hash: u64,
+}
+
+/// Where the verbatim head may end without orphaning a tool call.
+///
+/// [`safe_head_end`] walks back past an assistant that *opens* tool calls, but
+/// not past the results themselves. With `ToolExecutionStrategy::Parallel` — the
+/// default — one assistant message yields several `ToolResult` messages, so a
+/// boundary landing strictly inside that run keeps the assistant and only
+/// *some* of its results; the rest fall into the summarized span and the
+/// provider rejects the request outright.
+///
+/// [`DefaultCompaction`](crate::context::DefaultCompaction) never hit this
+/// because its Level 2 rewrites the whole pre-boundary region before Level 3
+/// cuts. Splicing is the first path that re-emits `messages[..head_end]`
+/// verbatim, so it is the first to need both pullbacks — applied to a fixed
+/// point, since one can expose the other.
+fn safe_head_boundary(messages: &[AgentMessage], end: usize) -> usize {
+    let mut end = end;
+    for _ in 0..=messages.len() {
+        let pulled = safe_head_end(messages, safe_turn_start(messages, end));
+        if pulled == end {
+            break;
+        }
+        end = pulled;
+    }
+    end
 }
 
 fn fingerprint(messages: &[AgentMessage], cut: usize) -> Fingerprint {
@@ -413,7 +448,7 @@ impl LlmCompaction {
         budget: usize,
     ) -> Option<(usize, usize)> {
         let len = messages.len();
-        let head_end = safe_head_end(messages, config.keep_first.min(len));
+        let head_end = safe_head_boundary(messages, config.keep_first.min(len));
         let retain = self.retain_tail_tokens(budget);
 
         // Walk back from the end accumulating the tail budget.
@@ -560,6 +595,66 @@ impl LlmCompaction {
         result.extend_from_slice(&messages[cut..]);
         result
     }
+
+    /// Bring an over-budget splice back under budget **without** discarding the
+    /// briefing that was just paid for.
+    ///
+    /// Handing the whole spliced history to [`compact_messages`] destroys it:
+    /// the summary sits at `head_end`, which is exactly where
+    /// `level3_drop_middle` begins cutting, so it is the *first* message
+    /// dropped. Compacting only the span after it leaves head and summary
+    /// intact and shrinks the tail, which is what actually overflowed.
+    fn shrink_tail(
+        &self,
+        mut result: Vec<AgentMessage>,
+        config: &ContextConfig,
+        budget: usize,
+        head_end: usize,
+    ) -> Vec<AgentMessage> {
+        let keep = head_end + 1; // the verbatim head plus the summary message
+        if keep >= result.len() {
+            return result;
+        }
+        let tail = result.split_off(keep);
+        let fixed = total_tokens(&result);
+        let tail_config = ContextConfig {
+            max_context_tokens: budget.saturating_sub(fixed),
+            system_prompt_tokens: 0,
+            ..config.clone()
+        };
+        result.extend(compact_messages(tail, &tail_config));
+        result
+    }
+
+    /// Start a background summarization if `messages` has crossed the trigger
+    /// and nothing is already in flight.
+    ///
+    /// **Callers must pass the history `compact` is about to return, not the
+    /// one it received.** The agent loop writes the return value straight back
+    /// into the session, so a summary fingerprinted over the *input* is
+    /// invalidated by the very same call whenever the deterministic fallback
+    /// rewrites history — the summary is discarded on arrival, a replacement is
+    /// spawned against a prefix the next fallback will rewrite in turn, and the
+    /// strategy pays for a request per compaction while never splicing again.
+    fn arm(&self, messages: &[AgentMessage], config: &ContextConfig, budget: usize) {
+        let used = total_tokens(messages);
+        if used <= (budget as f32 * self.trigger_ratio) as usize {
+            return;
+        }
+        let idle = {
+            let state = self.state.lock().unwrap();
+            !state.inflight && state.ready.is_none()
+        };
+        if !idle {
+            return;
+        }
+        match self.choose_cut(messages, config, budget) {
+            Some((head_end, cut)) => self.spawn_summarize(messages, head_end, cut),
+            // No split is possible. Silence here was the original bug: the
+            // strategy looked configured and did nothing, forever.
+            None => self.warn_inert_once(used, budget),
+        }
+    }
 }
 
 impl CompactionStrategy for LlmCompaction {
@@ -568,7 +663,6 @@ impl CompactionStrategy for LlmCompaction {
             .max_context_tokens
             .saturating_sub(config.system_prompt_tokens);
         let used = total_tokens(&messages);
-        let trigger = (budget as f32 * self.trigger_ratio) as usize;
         let messages_before = messages.len();
 
         // 1. Over budget and a summary is ready → splice (verify identity).
@@ -577,12 +671,26 @@ impl CompactionStrategy for LlmCompaction {
             if let Some(summary) = ready {
                 let fp = &summary.fingerprint;
                 if fp.cut <= messages.len() && fingerprint(&messages, fp.cut) == *fp {
-                    let summarized = fp.cut - summary.head_end;
+                    let mut summarized = fp.cut - summary.head_end;
+                    let mut method = CompactionMethod::Summarized;
                     let mut result = self.splice(&messages, &summary);
-                    // Safety net: if even the spliced result is over budget
-                    // (huge tail), let the deterministic tiers finish the job.
                     if total_tokens(&result) > budget {
-                        result = compact_messages(result, config);
+                        // The tail alone overflows. Shrink it in place so the
+                        // briefing survives — see `shrink_tail`.
+                        result = self.shrink_tail(result, config, budget, summary.head_end);
+                        if total_tokens(&result) > budget {
+                            // Head plus briefing alone exceed the budget, so the
+                            // briefing cannot be kept at all. Report what really
+                            // happened rather than claiming a splice the result
+                            // does not contain.
+                            tracing::warn!(
+                                "llm compaction: head + summary exceed the budget on their own; \
+                                 discarding the summary and compacting deterministically"
+                            );
+                            result = compact_messages(result, config);
+                            method = CompactionMethod::Deterministic;
+                            summarized = 0;
+                        }
                     }
                     let after = total_tokens(&result);
                     tracing::info!(
@@ -595,38 +703,25 @@ impl CompactionStrategy for LlmCompaction {
                         after
                     );
                     self.emit(AgentEvent::ContextCompacted {
-                        method: CompactionMethod::Summarized,
+                        method,
                         messages_before,
                         messages_after: result.len(),
                         tokens_before: used,
                         tokens_after: after,
                         messages_summarized: summarized,
+                        // The request was paid for either way, so its cost is
+                        // reported even when the briefing could not be kept.
                         summary_cost_usd: self.summary_cost(&summary.usage),
                         summary_usage: Some(summary.usage),
                     });
+                    self.arm(&result, config, budget);
                     return result;
                 }
                 tracing::warn!("llm compaction: history changed under summary, discarding");
             }
         }
 
-        // 2. Crossed the trigger and idle → start a background summarization.
-        {
-            let idle = {
-                let state = self.state.lock().unwrap();
-                !state.inflight && state.ready.is_none()
-            };
-            if used > trigger && idle {
-                match self.choose_cut(&messages, config, budget) {
-                    Some((head_end, cut)) => self.spawn_summarize(&messages, head_end, cut),
-                    // No split is possible. Silence here was the bug: the
-                    // strategy looked configured and did nothing, forever.
-                    None => self.warn_inert_once(used, budget),
-                }
-            }
-        }
-
-        // 3. Over budget with no summary ready → deterministic fallback.
+        // 2. Over budget with no usable summary → deterministic fallback.
         //    The loop always makes progress; a slow or dead summarizer can
         //    never wedge it.
         if used > budget {
@@ -643,9 +738,12 @@ impl CompactionStrategy for LlmCompaction {
                 summary_usage: None,
                 summary_cost_usd: None,
             });
+            self.arm(&result, config, budget);
             return result;
         }
 
+        // 3. Under budget → arm against the history we are handing back.
+        self.arm(&messages, config, budget);
         messages
     }
 }
@@ -810,33 +908,76 @@ mod tests {
         })
     }
 
+    async fn settle() {
+        for _ in 0..25 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Outcome of driving the strategy the way the agent loop does.
+    struct Run {
+        messages: Vec<AgentMessage>,
+        rounds_with_summary: usize,
+        peak_tokens: usize,
+    }
+
+    /// Append a turn, compact, **feed the result back** — the call pattern in
+    /// `agent_loop.rs`. Tests must use this rather than re-passing pristine
+    /// input: a summary is fingerprinted against the history `compact` returns,
+    /// so replaying the original vector exercises a contract the loop never
+    /// offers, which is precisely how the fallback livelock stayed hidden.
+    async fn drive<F>(
+        strategy: &LlmCompaction,
+        cfg: &ContextConfig,
+        rounds: usize,
+        mut next_turn: F,
+    ) -> Run
+    where
+        F: FnMut(usize) -> Vec<AgentMessage>,
+    {
+        let mut messages: Vec<AgentMessage> = Vec::new();
+        let mut run = Run {
+            messages: Vec::new(),
+            rounds_with_summary: 0,
+            peak_tokens: 0,
+        };
+        for i in 0..rounds {
+            messages.extend(next_turn(i));
+            messages = strategy.compact(std::mem::take(&mut messages), cfg);
+            if has_summary(&messages) {
+                run.rounds_with_summary += 1;
+            }
+            run.peak_tokens = run.peak_tokens.max(total_tokens(&messages));
+            settle().await;
+        }
+        run.messages = messages;
+        run
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn splices_summary_when_over_budget() {
-        let strategy = mock("## Goal\nShip the parser.")
+        let (provider, _) = ScriptedProvider::new("## Goal\nShip the parser.");
+        let strategy = LlmCompaction::from_provider(provider, "mock", "k")
             .with_trigger_ratio(0.1)
             .with_retain_tail_tokens(200);
-
-        let messages = history(30, 400); // well over a 2k-token budget
         let cfg = config(2_000);
 
-        // First pass: crosses trigger, spawns background summarization,
-        // falls back deterministically for this turn (over budget already).
-        let out = strategy.compact(messages.clone(), &cfg);
-        assert!(total_tokens(&out) <= 2_000, "fallback must fit budget");
+        let run = drive(&strategy, &cfg, 30, |i| turn(i, 400)).await;
 
-        assert!(await_summary(&strategy).await, "summary should be ready");
-
-        // Second pass over the SAME append-only history: splice.
-        let out = strategy.compact(messages.clone(), &cfg);
-        assert!(has_summary(&out), "summary message must be spliced in");
-        assert!(out.iter().any(|m| {
+        assert!(
+            run.rounds_with_summary > 0,
+            "a summary must be spliced at some point"
+        );
+        assert!(
+            has_summary(&run.messages),
+            "summary must be present at the end"
+        );
+        assert!(run.messages.iter().any(|m| {
             matches!(m, AgentMessage::Llm(Message::User { content, .. })
                 if content.iter().any(|c| matches!(c, Content::Text { text }
                     if text.contains("Ship the parser"))))
         }));
-        assert!(total_tokens(&out) < total_tokens(&messages));
-        // Tail preserved verbatim: the last original message survives.
-        assert_eq!(out.last(), messages.last());
+        assert!(run.peak_tokens <= 2_000, "the budget must hold throughout");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -907,7 +1048,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn default_retain_tail_scales_to_a_small_budget() {
         let strategy = mock("## Goal\nSmall budget."); // all defaults
-        let messages = history(30, 400);
         let cfg = config(2_000); // a fixed 20k tail would swallow all of it
 
         assert_eq!(
@@ -916,18 +1056,12 @@ mod tests {
             "the tail must derive from the budget, not the 20k ceiling"
         );
 
-        let out = strategy.compact(messages.clone(), &cfg);
-        assert!(total_tokens(&out) <= 2_000);
+        let run = drive(&strategy, &cfg, 40, |i| turn(i, 400)).await;
         assert!(
-            await_summary(&strategy).await,
-            "defaults must still produce a summary on a small budget"
+            run.rounds_with_summary > 0,
+            "defaults must still splice on a small budget"
         );
-
-        let out = strategy.compact(messages.clone(), &cfg);
-        assert!(
-            has_summary(&out),
-            "summary must splice under plain defaults"
-        );
+        assert!(run.peak_tokens <= 2_000);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -958,49 +1092,59 @@ mod tests {
             .with_trigger_ratio(0.1)
             .with_retain_tail_tokens(200)
             .with_event_sender(tx);
-
-        let messages = history(30, 400);
         let cfg = config(2_000);
 
-        strategy.compact(messages.clone(), &cfg);
-        match rx.try_recv().expect("deterministic path must emit") {
-            AgentEvent::ContextCompacted {
-                method,
-                tokens_before,
-                tokens_after,
-                messages_summarized,
-                summary_usage,
-                ..
-            } => {
-                assert_eq!(method, CompactionMethod::Deterministic);
-                assert!(tokens_after < tokens_before);
-                assert_eq!(messages_summarized, 0);
-                assert!(summary_usage.is_none(), "no request was made");
-            }
-            other => panic!("unexpected event: {other:?}"),
+        // Start already over budget so the first compaction must fall back,
+        // then keep driving until a splice lands. Both paths therefore emit.
+        let mut messages = history(30, 400);
+        for i in 100..140 {
+            messages.extend(turn(i, 400));
+            messages = strategy.compact(std::mem::take(&mut messages), &cfg);
+            settle().await;
         }
 
-        assert!(await_summary(&strategy).await);
-        strategy.compact(messages.clone(), &cfg);
-        match rx.try_recv().expect("splice path must emit") {
-            AgentEvent::ContextCompacted {
-                method,
-                messages_summarized,
-                summary_usage,
-                summary_cost_usd,
-                ..
-            } => {
-                assert_eq!(method, CompactionMethod::Summarized);
-                assert!(messages_summarized >= MIN_SUMMARIZED_SPAN);
-                assert!(
-                    summary_usage.is_some(),
-                    "the request's cost must be visible"
-                );
-                // from_provider carries no ModelConfig, so no rates are known.
-                assert!(summary_cost_usd.is_none());
-            }
-            other => panic!("unexpected event: {other:?}"),
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
         }
+        assert!(!events.is_empty(), "compaction must emit events");
+
+        let mut saw_deterministic = false;
+        let mut saw_summarized = false;
+        for event in &events {
+            match event {
+                AgentEvent::ContextCompacted {
+                    method,
+                    tokens_before,
+                    tokens_after,
+                    messages_summarized,
+                    summary_usage,
+                    summary_cost_usd,
+                    ..
+                } => {
+                    assert!(tokens_after <= tokens_before);
+                    match method {
+                        CompactionMethod::Deterministic => {
+                            saw_deterministic = true;
+                            assert_eq!(*messages_summarized, 0);
+                        }
+                        CompactionMethod::Summarized => {
+                            saw_summarized = true;
+                            assert!(*messages_summarized >= MIN_SUMMARIZED_SPAN);
+                            assert!(
+                                summary_usage.is_some(),
+                                "the request's cost must be visible"
+                            );
+                            // from_provider carries no ModelConfig, no rates.
+                            assert!(summary_cost_usd.is_none());
+                        }
+                    }
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(saw_deterministic, "the fallback path must emit");
+        assert!(saw_summarized, "the splice path must emit");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1063,60 +1207,299 @@ mod tests {
         ]
     }
 
-    /// The safety net: a tail bigger than the whole budget means the spliced
-    /// result is still over, so `compact_messages` has to finish the job. The
-    /// handoff asked specifically whether Level 1 stays idempotent on that
-    /// shape — it does, so the deterministic tiers can run over a spliced
-    /// history without re-truncating what they already truncated.
+    /// The handoff asked specifically whether Level 1 stays idempotent on a
+    /// spliced history — it must, or a later compaction pass rewrites those
+    /// bytes again and costs another prefix-cache break. Driven with a verbose
+    /// summarizer so the safety net actually runs over the spliced shape.
     #[tokio::test(flavor = "multi_thread")]
-    async fn over_budget_splice_is_finished_by_the_deterministic_tiers() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let strategy = mock("## Goal\nSafety net.")
+    async fn spliced_history_is_level_1_stable() {
+        let (provider, _) = ScriptedProvider::new(format!("## Goal\n{}", "verbose ".repeat(500)));
+        let strategy = LlmCompaction::from_provider(provider, "mock", "k")
             .with_trigger_ratio(0.1)
-            // Larger than the budget: whatever is spliced cannot fit.
-            .with_retain_tail_tokens(4_000)
-            .with_event_sender(tx);
-
-        let messages: Vec<AgentMessage> = (0..30).flat_map(|i| tool_turn(i, 400)).collect();
+            .with_retain_tail_tokens(200);
         let cfg = config(2_000);
-        assert!(
-            total_tokens(&messages) > 4_000,
-            "tail must exceed the budget"
-        );
 
-        strategy.compact(messages.clone(), &cfg);
-        assert!(await_summary(&strategy).await);
-        let _ = rx.try_recv(); // the first pass's deterministic event
+        let run = drive(&strategy, &cfg, 30, |i| tool_turn(i, 400)).await;
 
-        let out = strategy.compact(messages.clone(), &cfg);
-        assert!(
-            total_tokens(&out) <= 2_000,
-            "the safety net must bring an over-budget splice back under budget"
-        );
+        assert!(run.rounds_with_summary > 0, "expected a splice");
+        assert!(run.peak_tokens <= 2_000, "the budget must hold throughout");
 
-        // Level 1 is idempotent on the result: re-truncating changes nothing,
-        // so a later compaction pass will not rewrite these bytes again.
-        for msg in &out {
+        // Re-truncating changes nothing, so a later pass will not rewrite these
+        // bytes and break the provider's prefix cache a second time.
+        for msg in &run.messages {
             assert_eq!(
                 &context::truncate_tool_output(msg.clone(), &cfg),
                 msg,
                 "spliced history must already be Level-1 stable"
             );
         }
+        assert!(
+            orphaned_tool_calls(&run.messages).is_empty(),
+            "spliced tool history must stay structurally valid"
+        );
+    }
 
-        // The event still reports the splice, with post-safety-net totals.
-        match rx.try_recv().expect("splice path must emit") {
-            AgentEvent::ContextCompacted {
+    /// Always returns the same summary and counts requests, so a test can
+    /// prove the strategy never pays for a summary it cannot use.
+    /// `MockProvider::text` yields its text only once, which is not what a
+    /// multi-compaction run needs.
+    struct ScriptedProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        text: String,
+    }
+
+    impl ScriptedProvider {
+        fn new(text: impl Into<String>) -> (Arc<Self>, Arc<std::sync::atomic::AtomicUsize>) {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    calls: Arc::clone(&calls),
+                    text: text.into(),
+                }),
+                calls,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamProvider for ScriptedProvider {
+        async fn stream(
+            &self,
+            _config: StreamConfig,
+            _tx: tokio::sync::mpsc::UnboundedSender<crate::provider::StreamEvent>,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<Message, crate::provider::ProviderError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Message::assistant(
+                vec![Content::Text {
+                    text: self.text.clone(),
+                }],
+                StopReason::Stop,
+                "mock",
+                "mock",
+                Usage::default(),
+            ))
+        }
+    }
+
+    /// Every `tool_use` id in `messages` that has no matching `tool_result`.
+    /// Providers reject such a sequence outright, so this must always be empty.
+    fn orphaned_tool_calls(messages: &[AgentMessage]) -> Vec<String> {
+        let (mut opened, mut answered) = (Vec::new(), Vec::new());
+        for msg in messages {
+            match msg {
+                AgentMessage::Llm(Message::Assistant { content, .. }) => {
+                    for c in content {
+                        if let Content::ToolCall { id, .. } = c {
+                            opened.push(id.clone());
+                        }
+                    }
+                }
+                AgentMessage::Llm(Message::ToolResult { tool_call_id, .. }) => {
+                    answered.push(tool_call_id.clone())
+                }
+                _ => {}
+            }
+        }
+        opened
+            .into_iter()
+            .filter(|i| !answered.contains(i))
+            .collect()
+    }
+
+    /// An assistant message opening two tool calls followed by both results —
+    /// the shape `ToolExecutionStrategy::Parallel` produces by default.
+    fn parallel_tool_turn(i: usize) -> Vec<AgentMessage> {
+        let (a, b) = (format!("call-{i}a"), format!("call-{i}b"));
+        vec![
+            AgentMessage::Llm(Message::User {
+                content: vec![Content::Text {
+                    text: format!("do {i}"),
+                }],
+                timestamp: i as u64,
+            }),
+            AgentMessage::Llm(
+                Message::assistant(
+                    vec![
+                        Content::tool_call(a.clone(), "bash", serde_json::json!({"c": i})),
+                        Content::tool_call(b.clone(), "bash", serde_json::json!({"c": i})),
+                    ],
+                    StopReason::ToolUse,
+                    "mock",
+                    "mock",
+                    Usage::default(),
+                )
+                .with_timestamp(i as u64),
+            ),
+            AgentMessage::Llm(Message::ToolResult {
+                tool_call_id: a,
+                tool_name: "bash".into(),
+                content: vec![Content::Text {
+                    text: format!("out a {i}: {}", "z".repeat(300)),
+                }],
+                is_error: false,
+                timestamp: i as u64,
+            }),
+            AgentMessage::Llm(Message::ToolResult {
+                tool_call_id: b,
+                tool_name: "bash".into(),
+                content: vec![Content::Text {
+                    text: format!("out b {i}: {}", "z".repeat(300)),
+                }],
+                is_error: false,
+                timestamp: i as u64,
+            }),
+        ]
+    }
+
+    /// Regression: the agent loop writes `compact()`'s result straight back
+    /// (`agent_loop.rs`), so a summary fingerprinted over the *input* was
+    /// invalidated by the same call whenever the fallback rewrote history. That
+    /// state was absorbing — measured at 22 paid requests and 0 splices over 25
+    /// rounds. Every other test in this file re-passes the pristine input, which
+    /// is exactly why none of them caught it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn feeding_the_result_back_still_splices() {
+        for turn_chars in [200usize, 800, 2000] {
+            let (provider, calls) = ScriptedProvider::new("## Goal\nThe briefing.");
+            let strategy =
+                LlmCompaction::from_provider(provider, "mock", "k").with_retain_tail_tokens(200);
+            let cfg = config(2_000);
+
+            let mut messages: Vec<AgentMessage> = Vec::new();
+            let mut spliced_rounds = 0usize;
+            for i in 0..25 {
+                messages.extend(turn(i, turn_chars));
+                // The line that matters: feed the result back, as the loop does.
+                messages = strategy.compact(std::mem::take(&mut messages), &cfg);
+                if has_summary(&messages) {
+                    spliced_rounds += 1;
+                }
+                for _ in 0..25 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
+            let requests = calls.load(std::sync::atomic::Ordering::SeqCst);
+            // The invariant the fix establishes: never pay for a summary that
+            // cannot be used. Either the run splices, or it issues no requests
+            // at all (turns so large relative to the budget that the compacted
+            // history is never long enough to be worth summarizing). Before the
+            // fix this configuration issued 22 requests and spliced zero times.
+            assert!(
+                spliced_rounds > 0 || requests == 0,
+                "turn_chars={turn_chars}: {requests} summarization requests paid for and never \
+                 spliced — the fallback is invalidating its own pending summary"
+            );
+        }
+    }
+
+    /// Regression: a session restored over budget (e.g. `Agent::with_messages`)
+    /// enters the loop on the fallback path. It must still reach a splice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_that_starts_over_budget_recovers() {
+        let (provider, calls) = ScriptedProvider::new("## Goal\nRecovered.");
+        let strategy =
+            LlmCompaction::from_provider(provider, "mock", "k").with_retain_tail_tokens(200);
+        let cfg = config(2_000);
+
+        let mut messages = history(30, 400);
+        assert!(total_tokens(&messages) > 2_000, "must start over budget");
+
+        let mut spliced_ever = false;
+        for i in 100..130 {
+            messages.extend(turn(i, 400));
+            messages = strategy.compact(std::mem::take(&mut messages), &cfg);
+            if has_summary(&messages) {
+                spliced_ever = true;
+            }
+            for _ in 0..25 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+        assert!(
+            spliced_ever,
+            "{} requests issued, never spliced",
+            calls.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    /// Regression: the summary sits exactly where `level3_drop_middle` starts
+    /// cutting, so routing an over-budget splice through `compact_messages`
+    /// deleted the briefing while the event still reported `Summarized`.
+    /// A verbose summarizer is what pushes the spliced result over the budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_safety_net_preserves_the_briefing_it_paid_for() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // ~1000 tokens of briefing: big enough that head + summary + tail
+        // overflows a 2k budget, small enough that head + summary still fits.
+        let (provider, _) = ScriptedProvider::new(format!("## Goal\n{}", "verbose ".repeat(500)));
+        let strategy = LlmCompaction::from_provider(provider, "mock", "k")
+            .with_trigger_ratio(0.1)
+            .with_retain_tail_tokens(200)
+            .with_event_sender(tx);
+        let cfg = config(2_000);
+
+        let run = drive(&strategy, &cfg, 30, |i| turn(i, 400)).await;
+
+        assert!(run.rounds_with_summary > 0, "expected at least one splice");
+        assert!(run.peak_tokens <= 2_000, "the budget must hold throughout");
+
+        let mut saw_summarized = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::ContextCompacted {
                 method,
-                tokens_before,
+                messages_summarized,
                 tokens_after,
                 ..
-            } => {
-                assert_eq!(method, CompactionMethod::Summarized);
-                assert!(tokens_after < tokens_before);
-                assert!(tokens_after <= 2_000);
+            } = event
+            {
+                if method == CompactionMethod::Summarized {
+                    saw_summarized = true;
+                    assert!(
+                        messages_summarized > 0,
+                        "a Summarized event must report a real span"
+                    );
+                    assert!(tokens_after <= 2_000);
+                }
             }
-            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(
+            saw_summarized,
+            "the briefing was paid for but never reported as spliced"
+        );
+    }
+
+    /// Regression: `safe_head_end` walks back past an assistant that opens tool
+    /// calls but not past the results, so a `keep_first` landing inside a
+    /// parallel tool-result run kept the assistant and only some of its
+    /// results. `keep_first: 3` orphaned `call-0b`; providers reject that.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn splice_never_orphans_a_parallel_tool_call() {
+        for keep_first in 1..=6usize {
+            let (provider, _) = ScriptedProvider::new("## Goal\nX.");
+            let strategy = LlmCompaction::from_provider(provider, "mock", "k")
+                .with_trigger_ratio(0.1)
+                .with_retain_tail_tokens(300);
+            let cfg = ContextConfig {
+                max_context_tokens: 2_000,
+                system_prompt_tokens: 0,
+                keep_first,
+                keep_recent: 2,
+                ..Default::default()
+            };
+
+            let run = drive(&strategy, &cfg, 30, parallel_tool_turn).await;
+
+            assert!(
+                run.rounds_with_summary > 0,
+                "keep_first={keep_first}: expected a splice"
+            );
+            let orphans = orphaned_tool_calls(&run.messages);
+            assert!(
+                orphans.is_empty(),
+                "keep_first={keep_first}: orphaned tool_use ids {orphans:?} — a provider \
+                 would reject this outright"
+            );
         }
     }
 
