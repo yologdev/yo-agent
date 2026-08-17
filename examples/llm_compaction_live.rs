@@ -20,6 +20,7 @@
 //!
 //! | var | default | why you'd change it |
 //! |---|---|---|
+//! | `YO_TRIGGER` | `0.6` | fraction of budget at which summarization starts; lower buys wall-clock headroom |
 //! | `YO_BUDGET` | `12000` (`4000` in dry run) | smaller splices sooner and costs less; larger is more realistic |
 //! | `YO_MODEL` | `claude-sonnet-5` | the session's model |
 //! | `YO_SUMMARIZER` | `claude-haiku-4-5` | the model that writes briefings — the thing under evaluation |
@@ -94,6 +95,13 @@ fn priced(id: &str) -> ModelConfig {
         "claude-opus-5" => ModelConfig::claude_opus_5(),
         "claude-opus-4-8" => ModelConfig::claude_opus_4_8(),
         "claude-fable-5" => ModelConfig::claude_fable_5(),
+        // DeepSeek caches automatically, server-side: this crate sends no
+        // `cache_control` on the OpenAI-compat path, and `openai_compat.rs`
+        // maps `prompt_cache_hit_tokens` onto `Usage::cache_read`. So a hit
+        // rate here measures *their* caching, not yoagent's placement.
+        // `ModelConfig::deepseek` carries no rates, so the cost column stays
+        // blank rather than this harness guessing at prices.
+        other if other.starts_with("deepseek") => ModelConfig::deepseek(other, other),
         other => {
             eprintln!("note: no priced preset for '{other}' — the cost column will be blank");
             ModelConfig::anthropic(other, other)
@@ -163,6 +171,24 @@ const PROBES: &[(&str, &str)] = &[
          storing there?",
     ),
 ];
+
+/// Per-turn prompt-cache accounting, so a session-level hit rate can be
+/// decomposed rather than just reported.
+///
+/// A growing conversation has an inherent miss floor: every turn's *new*
+/// content has never been seen, so it cannot hit. With `n` turns each adding
+/// roughly the same number of tokens, the best achievable rate is about
+/// `(n-1)/(n+1)` — 88% at 16 turns, 90% at 19, and 96% only past ~49. Comparing
+/// a measured rate against that ceiling separates "the cache is working" from
+/// "the session was too short for a high number to be possible".
+struct TurnCache {
+    turn: usize,
+    hit: u64,
+    miss: u64,
+    /// A compaction rewrote history on this turn, so the next request's prefix
+    /// diverges from what the provider cached.
+    compacted: bool,
+}
 
 /// One probe's answer and which constraints it turned out to carry.
 struct ProbeResult {
@@ -292,20 +318,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The stub never authenticates; this only silences the resolver warning.
         std::env::set_var("YOAGENT_API_KEY", "dry-run");
     }
-    if !dry_run && std::env::var("ANTHROPIC_API_KEY").is_err() {
-        eprintln!(
-            "ANTHROPIC_API_KEY is not set — this harness makes real API calls.\n\
-             Set YO_DRY_RUN=1 to exercise the harness itself against a stub first."
-        );
-        std::process::exit(1);
+    let model: String = env_or("YO_MODEL", "claude-sonnet-5".to_string());
+    let summarizer: String = env_or("YO_SUMMARIZER", "claude-haiku-4-5".to_string());
+    if !dry_run {
+        for cfg in [priced(&model), priced(&summarizer)] {
+            if yoagent::provider::resolve_api_key(&cfg.provider).is_none() {
+                eprintln!(
+                    "no API key found for provider '{}' (needed by model '{}').\n\
+                     Set YO_DRY_RUN=1 to exercise the harness against a stub instead.",
+                    cfg.provider, cfg.id
+                );
+                std::process::exit(1);
+            }
+        }
     }
 
     // The stub's answers are much shorter than a real model's, so the dry run
     // needs a smaller budget to reach a splice in a sensible number of turns.
     let budget: usize = env_or("YO_BUDGET", if dry_run { 4_000 } else { 12_000 });
     let max_turns: usize = env_or("YO_MAX_TURNS", 40);
-    let model: String = env_or("YO_MODEL", "claude-sonnet-5".to_string());
-    let summarizer: String = env_or("YO_SUMMARIZER", "claude-haiku-4-5".to_string());
+    let trigger_ratio: f32 = env_or("YO_TRIGGER", 0.6);
     let repo: String = env_or("YO_REPO", "/tmp/yoagent-compaction-live".to_string());
 
     if dry_run {
@@ -320,6 +352,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if dry_run { "dry-run stub" } else { &summarizer }
     );
     println!("budget        : {budget} tokens");
+    println!("trigger ratio : {trigger_ratio}");
     println!("gasp repo     : {repo}\n");
 
     let recorder = GaspRecorder::init(
@@ -362,7 +395,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         LlmCompaction::from_config(priced(&summarizer))
     }
     // The event carries the cost; the strategy's own `info!` carries the rest.
-    .with_event_sender(compact_tx.clone());
+    .with_event_sender(compact_tx.clone())
+    // The trigger is expressed in tokens but what it has to outrun is
+    // wall-clock: the summarization must finish inside the
+    // `(1 - ratio) x budget` of growth left before the budget is crossed. A
+    // slow summarizer against fast-growing turns needs a lower ratio.
+    .with_trigger_ratio(trigger_ratio);
     let compaction = if std::env::var("YO_OLD_INSTRUCTION").is_ok() {
         println!("*** CONTROL: pre-fix instruction ***");
         compaction.with_instruction(OLD_INSTRUCTION_CLAUSE)
@@ -394,6 +432,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pre_splice = Tokens::default();
     let mut first_splice_turn: Option<usize> = None;
     let mut probe_results: Vec<ProbeResult> = Vec::new();
+    let mut per_turn: Vec<TurnCache> = Vec::new();
 
     let splices = |c: &[(CompactionMethod, usize, usize, Option<SummaryStats>)]| {
         c.iter()
@@ -432,12 +471,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_ids.push(id);
         }
 
-        if let Some(u) = last_usage(agent.messages()) {
-            tokens.add(&u);
+        let turn_usage = last_usage(agent.messages());
+        if let Some(u) = &turn_usage {
+            tokens.add(u);
             if first_splice_turn.is_none() {
-                pre_splice.add(&u);
+                pre_splice.add(u);
             }
         }
+        let compactions_before = compactions.len();
         while let Ok(event) = compact_rx.try_recv() {
             if let AgentEvent::ContextCompacted {
                 method,
@@ -449,6 +490,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 compactions.push((method, tokens_before, tokens_after, summary));
             }
+        }
+        if let Some(u) = &turn_usage {
+            per_turn.push(TurnCache {
+                turn,
+                hit: u.cache_read,
+                miss: u.input,
+                compacted: compactions.len() > compactions_before,
+            });
         }
         for briefing in briefings(agent.messages()) {
             if seen_briefings.insert(briefing.clone()) {
@@ -596,9 +645,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     println!(
-        "\nEvery compaction rewrites history, which discards the provider's prefix\n\
-         cache from that point on — so the drop between the two phases is the\n\
-         cost of compacting at all, not of choosing this strategy over the default."
+        "\n{:<6} {:>10} {:>10} {:>8}  note",
+        "turn", "hit", "miss", "rate"
+    );
+    for t in &per_turn {
+        let total = t.hit + t.miss;
+        let rate = if total == 0 {
+            0.0
+        } else {
+            t.hit as f64 / total as f64 * 100.0
+        };
+        println!(
+            "{:<6} {:>10} {:>10} {:>7.1}%  {}",
+            t.turn,
+            t.hit,
+            t.miss,
+            rate,
+            if t.compacted {
+                "<- compaction rewrote history"
+            } else {
+                ""
+            }
+        );
+    }
+
+    // Decompose the misses. Turn 1 can never hit; a turn whose predecessor
+    // rewrote history starts from a prefix the provider has not seen.
+    let n = per_turn.len().max(1);
+    let first_turn_miss: u64 = per_turn.first().map(|t| t.miss).unwrap_or(0);
+    // The miss lands on the turn whose request carries the rewritten history —
+    // that is the compacting turn itself, not the one after it.
+    let post_compaction_miss: u64 = per_turn
+        .iter()
+        .skip(1)
+        .filter(|t| t.compacted)
+        .map(|t| t.miss)
+        .sum();
+    let total_miss: u64 = per_turn.iter().map(|t| t.miss).sum();
+    let steady_state_miss = total_miss
+        .saturating_sub(first_turn_miss)
+        .saturating_sub(post_compaction_miss);
+    let ceiling = (n as f64 - 1.0) / (n as f64 + 1.0) * 100.0;
+
+    println!("\nmiss decomposition ({total_miss} tokens total):");
+    println!("  {first_turn_miss:>10}  turn 1 — nothing to hit yet");
+    println!("  {post_compaction_miss:>10}  turns where compaction rewrote history");
+    println!("  {steady_state_miss:>10}  steady state — each turn's genuinely new content");
+    println!(
+        "\nceiling for a {n}-turn session of roughly uniform turns: ~{ceiling:.0}%\n\
+         (every turn's new content is necessarily a miss, so the best achievable\n\
+          rate rises with turn count: ~88% at 16 turns, ~90% at 19, ~96% past 49.\n\
+          Compare the measured rate against this, not against 100%.)"
     );
 
     println!("\n{}", "=".repeat(72));

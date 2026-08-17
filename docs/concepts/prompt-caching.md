@@ -198,6 +198,68 @@ Priced as input-token spend across the whole session:
 
 The gap widens with session length, which is the point: the old behaviour degraded as history accumulated, and the new behaviour does not.
 
+### Read a hit rate against its session length, not against 100%
+
+A hit rate is only interpretable next to the number of turns that produced it.
+Every turn's *new* content has never been sent before, so it can never hit. With
+`n` turns of roughly equal size, the arithmetic ceiling is about
+
+```text
+(n − 1) / (n + 1)
+```
+
+— roughly 87% at 14 turns, 90% at 19, 95% at 39, and 96% only past 49. The
+93–96% figures in the replay table above come from 300–2400 turn sessions, where
+the ceiling is above 99% and the measured shortfall is genuinely about rewrites.
+The same code measured over a 14-turn session reads ~80%, and that is not a
+regression — it is the ceiling.
+
+The practical consequence: **do not compare hit rates across sessions of
+different lengths**, and do not treat a published figure as a target for a short
+session. Compare rewrite counts, or compare dollars.
+
+### Measured live: DeepSeek vs Anthropic
+
+`examples/llm_compaction_live.rs` runs a real multi-turn session and reports
+per-turn cache accounting. Eight runs, two providers × two trigger ratios × two
+repetitions, 12K budget, identical turn script:
+
+| provider | session hit rate | steady-state turn | `cache_write` | share of misses from compaction |
+|---|---|---|---|---|
+| DeepSeek v4 Flash | 79.0–80.7% | 98.4–99.0% | **0** | 93–95% |
+| Claude Sonnet 5 | 75.5–78.9% | 99.8–99.9% | 92K–126K | 9–12% |
+
+Three things worth taking from it.
+
+**The session rates are indistinguishable**, despite yoagent placing explicit
+`cache_control` breakpoints for Anthropic and sending nothing at all to
+DeepSeek. Both sit in the same band, and the gap is smaller than the run-to-run
+spread. Automatic provider-side caching and framework-managed breakpoints
+arrive at the same place on this workload.
+
+**Steady-state turns are ~99% on both.** Nearly all of the shortfall from the
+ceiling is the handful of turns where compaction rewrote history — 93–95% of all
+missed tokens on DeepSeek. Cache effectiveness is dominated by *how often
+history is rewritten*, not by how the cache is addressed.
+
+**Only Anthropic pays for writes.** A session writes 92K–126K cache-write tokens
+at a 1.25× premium; DeepSeek's automatic cache has no write category at all.
+This is invisible in the hit rate and is the clearest illustration of the point
+below — two providers can post the same rate with materially different bills.
+
+It also means the "share of misses from compaction" column reads differently per
+provider. On DeepSeek, a rewrite shows up as raw input misses, so the column
+captures compaction's full cost. On Anthropic, a rewrite mostly shows up as
+*cache writes* — raw input stays tiny — so 9–12% understates it. Compare the
+`cache_write` column instead when the provider has one.
+
+One null result worth recording: lowering `DEFAULT_TRIGGER_RATIO` from 0.6 to
+0.35, on the theory that a slow summarizer needs more wall-clock headroom before
+the budget is crossed, changed nothing measurable on either provider
+(DeepSeek 79.6–80.7% → 79.0–80.0%; Sonnet 77.1–78.9% → 75.5–77.8%). The
+condition it was meant to address — repeated deterministic fallbacks because no
+summary arrived in time — did not occur in these runs.
+
 ### Judge changes in dollars, not hit rate
 
 Hit rate is a fair proxy while you are removing needless rewrites. It stops being one the moment a change also moves context size — **a larger context can raise the hit rate while raising the bill**, because more of what you carry is cached but you are carrying more of it. Every tuning decision above was made on input-token spend for that reason.
