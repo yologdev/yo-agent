@@ -46,6 +46,10 @@
 - [Configuration](reference/configuration.md)
 - [API Reference](reference/api.md)
 
+# Evaluations
+
+- [LlmCompaction: live evaluation](evals/llm-compaction-live.md)
+
 # Architecture
 
 - [Overview](architecture/overview.md)

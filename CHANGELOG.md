@@ -11,6 +11,85 @@ adheres to [Semantic Versioning](https://semver.org/).
 > — cut from `v0.16.2` so consumers could take them without the breaking
 > changes queued here for 0.17.0.
 
+### Added
+
+- **`LlmCompaction` — an opt-in compaction strategy that summarizes instead of
+  dropping.** `DefaultCompaction`'s lossy tiers discard early decisions and
+  constraints outright. `LlmCompaction` sends a standalone summarization request
+  and splices a prose handoff briefing in where the dropped span used to be.
+
+  `CompactionStrategy::compact` is synchronous and sits on the hot path before
+  every turn, so the request runs in the background: it starts when usage crosses
+  `trigger_ratio · budget` and the result is spliced when the budget is actually
+  crossed. The loop never stalls on it, and it can never wedge — an unfinished,
+  failed, or stale summary falls back to `compact_messages` for that turn.
+
+  Two invariants are load-bearing and were each a bug first, caught by review
+  before release. The background request is fingerprinted against the history
+  `compact` is about to **return**, not the one it received: the loop writes the
+  return value straight back, so anchoring on the input meant the deterministic
+  fallback invalidated the summary its own call had just ordered — an absorbing
+  state costing one billed request per compaction for a result identical to
+  `DefaultCompaction`'s (measured: 22 requests, 0 splices over 25 turns). And an
+  over-budget splice compacts only its tail, because the summary sits exactly
+  where `level3_drop_middle` starts cutting and the naive whole-history pass
+  deleted the briefing while the event still reported `Summarized`.
+
+  This buys **retention quality, and costs tokens**: each summarization pays
+  input tokens for the summarized span plus output tokens for the briefing, which
+  `DefaultCompaction` never pays. It does **not** reduce prefix-cache breaks —
+  6 vs 6 over 120 turns at a 20k budget, 6 vs 5 over 600 turns at 100k, per
+  `tests/prefix_cache_harness.rs`. Route it at a cheap model; both paths report
+  their own cost on the new event below.
+
+  ```rust,ignore
+  let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"))
+      .with_compaction_strategy(LlmCompaction::from_config(
+          ModelConfig::anthropic("claude-haiku-4-5", "Haiku 4.5"),
+      ));
+  ```
+
+  Known limitation: `compact_target_ratio` / `compact_headroom_turns` do not
+  apply to this strategy — its result is sized by `with_retain_tail_tokens`
+  instead. Consuming the loop's adapted target is follow-up work.
+
+- **`AgentEvent::ContextCompacted`**, with the new `CompactionMethod` enum and
+  `SummaryStats` payload. Emitted by `LlmCompaction` on both paths — the spliced
+  summary and the deterministic fallback — carrying messages and tokens
+  before/after plus, when a request was made, a `summary: Option<SummaryStats>`
+  holding the span it bought, its `Usage`, and its dollar cost. That last part is
+  the point: it makes an LLM compaction strategy priceable against
+  `DefaultCompaction` instead of a guess. One optional payload rather than three
+  sibling `Option`s so the cost, the span, and the fact that a request happened
+  cannot disagree. `DefaultCompaction` does not emit it (no event channel, and no
+  request to price).
+
+- **`tests/prefix_cache_harness.rs`** — an `#[ignore]`d measurement harness that
+  drives any `CompactionStrategy` through a simulated session (append a turn,
+  compact, feed the result back, as the loop does) and counts the rounds that
+  rewrite history. Every prefix-cache figure quoted in the docs comes from it and
+  can be regenerated with
+  `cargo test --test prefix_cache_harness -- --ignored --nocapture`.
+
+  Deliberately not scoped to `LlmCompaction`: prefix-cache effectiveness has two
+  halves, and this covers history stability. Wiring `CacheStrategy` through the
+  non-Anthropic providers is the other half, and should extend this harness with
+  provider-side breakpoint assertions rather than reimplement the session
+  simulation.
+
+- **`examples/llm_compaction_live.rs`** — a live evaluation harness for the one
+  thing mocks cannot check: whether the briefings are any good. Runs a real
+  multi-turn session at a small context budget, forces splices, records into a
+  GASP repo, and prints every briefing verbatim next to what it cost. The turns
+  establish constraints early and ask the model to recall them after the splice,
+  so a summary that drops them shows up as self-contradiction.
+
+  `YO_DRY_RUN=1` exercises the whole pipeline against a stub — no key, no bill —
+  which is how the harness's own wiring was verified before it was handed over.
+
+- `StopReason` is documented as `#[non_exhaustive]`, which it has been since
+  0.17.0 — the doc comment still claimed the opposite.
+
 ### Fixed
 
 - **The `gasp` extension path could not construct its arguments**

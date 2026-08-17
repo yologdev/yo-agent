@@ -284,10 +284,10 @@ impl From<Message> for AgentMessage {
 
 /// Why the model stopped generating.
 ///
-/// Deliberately NOT `#[non_exhaustive]`: this is a control-flow enum, and a
-/// new variant (like `Refusal`, added for the 0.9.0 breaking release)
-/// should be a compile error for
-/// downstream matches rather than silently falling into a wildcard arm.
+/// `#[non_exhaustive]` since 0.17.0: stop reasons grow with provider features,
+/// so every addition was otherwise a breaking release. Downstream `match` arms
+/// need a `_ =>` wildcard; inside this crate the enum is still exhaustive, so
+/// adding a variant remains a compile error where it matters most.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
@@ -598,6 +598,79 @@ pub enum AgentEvent {
     InputRejected {
         reason: String,
     },
+    /// History was compacted before a turn.
+    ///
+    /// Emitted by [`LlmCompaction`](crate::LlmCompaction) on both of its paths
+    /// — the spliced summary and the deterministic fallback — so a consumer can
+    /// tell which one ran and what it cost. The built-in
+    /// [`DefaultCompaction`](crate::context::DefaultCompaction) does not emit
+    /// this; it has no event channel and never issues a request.
+    ContextCompacted {
+        /// Which compaction path produced this result.
+        method: CompactionMethod,
+        messages_before: usize,
+        messages_after: usize,
+        tokens_before: usize,
+        tokens_after: usize,
+        /// What the summarization request produced and cost, when one was
+        /// made. `None` on a purely deterministic compaction.
+        ///
+        /// Present as one optional payload rather than three sibling fields so
+        /// the cost, the span it bought, and the fact that a request happened
+        /// cannot disagree with each other.
+        summary: Option<SummaryStats>,
+    },
+}
+
+/// What a summarization request produced, carried by
+/// [`AgentEvent::ContextCompacted`].
+///
+/// Weigh [`usage`](Self::usage) against the event's `tokens_before -
+/// tokens_after` to decide whether an LLM compaction strategy earns its keep.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SummaryStats {
+    /// Messages the briefing replaced.
+    ///
+    /// Zero when a briefing was produced but could not be kept — the request
+    /// was still paid for, so the event still reports it, but `method` will be
+    /// [`CompactionMethod::Deterministic`].
+    pub messages_summarized: usize,
+    /// Tokens the summarization request itself consumed.
+    pub usage: Usage,
+    /// Dollar cost of `usage`, when the summarization model's rates are
+    /// configured (see [`CostConfig`](crate::provider::CostConfig)).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+impl SummaryStats {
+    /// A record of one summarization request.
+    pub fn new(messages_summarized: usize, usage: Usage, cost_usd: Option<f64>) -> Self {
+        Self {
+            messages_summarized,
+            usage,
+            cost_usd,
+        }
+    }
+}
+
+/// Which compaction path produced an [`AgentEvent::ContextCompacted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum CompactionMethod {
+    /// History was replaced by an LLM-written summary.
+    Summarized,
+    /// Deterministic tiered compaction ran: truncate → summarize → drop.
+    ///
+    /// On [`LlmCompaction`](crate::LlmCompaction) this means no briefing made
+    /// it into the result — none was ready, one was discarded as stale, or one
+    /// was produced but could not be kept within the budget. The loop stayed
+    /// unblocked; the compaction was lossy. Check `summary` to tell a free
+    /// fallback from one that still paid for a request.
+    Deterministic,
 }
 
 /// Incremental content delta carried by [`AgentEvent::MessageUpdate`].
@@ -765,6 +838,7 @@ mod wire_tag_freeze {
             AgentEvent::ToolExecutionEnd { .. } => "toolExecutionEnd",
             AgentEvent::ProgressMessage { .. } => "progressMessage",
             AgentEvent::InputRejected { .. } => "inputRejected",
+            AgentEvent::ContextCompacted { .. } => "contextCompacted",
         }
     }
 

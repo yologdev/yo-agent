@@ -272,6 +272,14 @@ it injects the `shared_state` tool and a state summary into the sub-agent's syst
 
 - **`ContextTracker`** — hybrid real-usage + estimation, calibrated against actual provider usage
 - **Tiered compaction** — truncate tool outputs → summarise old turns → drop middle turns
+- **`LlmCompaction`** — opt-in alternative that summarises the dropped span with a background LLM request instead of discarding it. The request runs off the hot path and is spliced in on a later turn, so the loop never stalls and can never wedge on it — an unfinished or failed summary falls back to the deterministic tiers. Buys retention quality; costs tokens the default never spends, and does *not* reduce prefix-cache breaks. Both paths report their own cost on `AgentEvent::ContextCompacted`
+
+  ```rust,ignore
+  let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"))
+      .with_compaction_strategy(LlmCompaction::from_config(
+          ModelConfig::anthropic("claude-haiku-4-5", "Haiku 4.5"),  // cheap model for summaries
+      ));
+  ```
 - **`Session`** — history as an id/parent tree with `append`, `seek`, `checkpoint`, `branch_tips`, and JSONL persistence. Appending after a seek forks a branch; it never overwrites
 - **Skills** — load [AgentSkills](https://agentskills.io)-standard `SKILL.md` directories. The agent sees a compact index and reads the full skill on demand, so skills stay cross-compatible with Claude Code, Codex CLI, Cursor, and others
 - **Structured outputs** — `prompt_structured::<T>()` returns typed, schema-validated replies, enforced natively where supported (Anthropic tool-forcing, OpenAI `json_schema`, Gemini `responseSchema`)

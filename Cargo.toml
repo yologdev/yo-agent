@@ -64,3 +64,7 @@ wiremock = "0.6"
 [[example]]
 name = "gasp_emit"
 required-features = ["gasp"]
+
+[[example]]
+name = "llm_compaction_live"
+required-features = ["gasp"]

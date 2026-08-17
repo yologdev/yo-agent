@@ -140,7 +140,13 @@ impl Default for ContextTracker {
 // Context configuration
 // ---------------------------------------------------------------------------
 
-/// Configuration for context management
+/// Configuration for context management.
+///
+/// Sizes the built-in tiered compaction. [`LlmCompaction`](crate::LlmCompaction),
+/// the summarizing alternative, reads `keep_first`, `keep_recent` and the token
+/// budget the same way, but sizes its *spliced* result by its own retained-tail
+/// setting rather than by `compact_target_ratio` / `compact_headroom_turns` —
+/// which still apply on its deterministic fallback path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextConfig {
     /// Maximum context tokens (leave room for response)
@@ -345,6 +351,12 @@ pub trait CompactionStrategy: Send + Sync {
 /// This is used automatically when no custom `CompactionStrategy` is set.
 /// You can also compose it inside a custom strategy — run your logic first,
 /// then delegate to `compact_messages()` for the actual reduction.
+///
+/// This is deterministic and free, but the lossy tiers discard early decisions
+/// outright. [`LlmCompaction`](crate::LlmCompaction) is the alternative: it
+/// spends tokens on a background summarization request and splices the result
+/// in as prose. It costs money per compaction and does not reduce prefix-cache
+/// breaks — see its module docs for the trade-off.
 pub struct DefaultCompaction;
 
 impl CompactionStrategy for DefaultCompaction {
@@ -630,7 +642,7 @@ fn compaction_marker(timestamp: u64) -> AgentMessage {
     })
 }
 
-fn message_timestamp(msg: &AgentMessage) -> u64 {
+pub(crate) fn message_timestamp(msg: &AgentMessage) -> u64 {
     match msg {
         AgentMessage::Llm(
             Message::User { timestamp, .. }
@@ -657,7 +669,7 @@ fn is_tool_result(msg: &AgentMessage) -> bool {
 /// Pull a kept-head boundary back so the head never ends on an assistant
 /// message whose tool results are about to be dropped — providers reject a
 /// `tool_use` with no matching `tool_result`.
-fn safe_head_end(messages: &[AgentMessage], mut end: usize) -> usize {
+pub(crate) fn safe_head_end(messages: &[AgentMessage], mut end: usize) -> usize {
     while end > 0 && opens_tool_calls(&messages[end - 1]) {
         end -= 1;
     }
@@ -675,7 +687,7 @@ fn safe_tail_start(messages: &[AgentMessage], mut start: usize) -> usize {
 
 /// Pull a boundary back onto the start of the turn it lands in, so the turn's
 /// assistant message and its tool results stay on the same side of the split.
-fn safe_turn_start(messages: &[AgentMessage], mut start: usize) -> usize {
+pub(crate) fn safe_turn_start(messages: &[AgentMessage], mut start: usize) -> usize {
     while start > 0 && start < messages.len() && is_tool_result(&messages[start]) {
         start -= 1;
     }
