@@ -34,7 +34,7 @@ adheres to [Semantic Versioning](https://semver.org/).
   ```rust,ignore
   let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"))
       .with_compaction_strategy(LlmCompaction::from_config(
-          ModelConfig::anthropic("claude-haiku-4-5-20251001", "Haiku 4.5"),
+          ModelConfig::anthropic("claude-haiku-4-5", "Haiku 4.5"),
       ));
   ```
 

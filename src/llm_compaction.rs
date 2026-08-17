@@ -73,7 +73,7 @@
 //!
 //! // Provider and key resolved from the config, same as `Agent::from_config`.
 //! let compaction = LlmCompaction::from_config(ModelConfig::anthropic(
-//!     "claude-haiku-4-5-20251001",
+//!     "claude-haiku-4-5",
 //!     "Haiku 4.5",
 //! ));
 //!
@@ -349,7 +349,7 @@ impl LlmCompaction {
     /// let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"))
     ///     .with_compaction_strategy(
     ///         LlmCompaction::from_config(ModelConfig::anthropic(
-    ///             "claude-haiku-4-5-20251001",
+    ///             "claude-haiku-4-5",
     ///             "Haiku 4.5",
     ///         ))
     ///         .with_event_sender(tx.clone()),
