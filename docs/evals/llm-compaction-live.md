@@ -29,26 +29,58 @@ the two are not comparable on `input` alone. The figures below supersede that.
 | | DeepSeek v4 Flash | Claude Sonnet 5 |
 |---|---|---|
 | session hit rate | **79.0–83.7%** (n=5) | **75.5–79.2%** (n=5) |
-| steady-state turn | ~98% | ~81% |
+| mature-turn hit rate, median | **98.4%** | 88.8% |
+| mature-turn hit rate, peak | **99.7%** | 96.0% |
 | `cache_write` per session | 0 | 92,733 |
 | not-cached from compaction | 91.9% | 49.6% |
+| session cost | **$0.031** | $0.783 |
+| cost per turn | **$0.0021** | $0.0392 |
+| same session with caching off | $0.066 (**−53%**) | $1.377 (**−43%**) |
+| output share of the bill | 73% | 61% |
 | turns | 14–15 | 19–20 |
 
 - **Session rates are close** despite yoagent placing explicit `cache_control`
   breakpoints for Anthropic and sending nothing to DeepSeek.
 - **DeepSeek's cost is almost entirely compaction** (91.9%): populating its cache
   is free, so between rewrites it pays only for genuinely new content.
-- **Anthropic pays continuously** — ~3,600–4,600 cache-write tokens per turn at
-  1.25× — which is why its steady-state sits near 81% and compaction is only
-  half its non-cached total. Those writes buy the cheap reads that follow.
+- **Anthropic pays continuously** — ~2,000–4,600 cache-write tokens per turn at
+  1.25× — so its curve climbs more slowly and tops out at 96%, and compaction is
+  only half its non-cached total. Those writes cost 3.3× the reads they enable
+  ($0.232 vs $0.071) yet still leave the session 43% cheaper than no caching at
+  all, so the trade is right even though the ratio looks wrong.
 - **Trigger ratio 0.6 → 0.35 was a null result** across eight earlier runs.
 
+**"Steady state" is a range, not a number.** Within a compaction cycle the hit
+rate climbs monotonically — each turn adds a roughly fixed amount of new content
+(26–158 tokens on DeepSeek, 532–4,592 on Sonnet) to a prefix that keeps growing —
+then resets when compaction truncates the prefix. DeepSeek's cycle reads 88.3 →
+92.8 → 95.2 → … → 99.6%. The **peak** is what a mature prefix achieves; the
+**median** is what this budget actually delivers, and it moves with compaction
+frequency, so it describes the configuration rather than the provider. A
+supporting floor on DeepSeek: it quantises hits to 64-token blocks (every
+`cache_read` in the run is an exact multiple of 64), so a trailing partial block
+never hits.
+
+An earlier version of this page reported Sonnet's steady state as ~81%. That was
+read off the middle of its ramp rather than computed, and it understated the
+mature-prefix figure by 15 points.
+
 Session hit rate spans five runs per provider — that metric always counted
-`cache_write` and was unaffected by the bug. The per-turn figures (steady state,
-compaction share) are n=1 each: earlier runs did not record per-turn
+`cache_write` and was unaffected by the bug. The per-turn figures (mature-turn
+rates, compaction share, cost) are n=1 each: earlier runs did not record per-turn
 `cache_write`, so they could not be re-derived and had to be re-measured.
 
-Session lengths differ, so percentages compare and absolute totals do not.
+Costs come from the recorded token counts at list prices —
+`ModelConfig::claude_sonnet_5` ($2/$10 per MTok, $2.50 write, $0.20 read) and
+DeepSeek's **peak-window** rate, which is double its off-peak rate, so that
+column over-reports an off-peak run by up to 2×.
+
+**The 25× cost gap is not a caching result.** The sessions are not matched:
+Sonnet ran 20 turns to DeepSeek's 15 and emitted 2.8× the output tokens, and
+output is the majority of both bills. What the runs do compare cleanly is the
+shape — zero writes versus continuous writes, 92% versus 50% of non-cached
+tokens attributable to compaction. Session lengths differ, so percentages
+compare and absolute totals do not.
 
 ### Why these numbers are lower than the replay figures
 
@@ -88,7 +120,9 @@ git checkout feat/llm-compaction
 # prefix-cache measurements (no API key needed)
 cargo test --test prefix_cache_harness -- --ignored --nocapture --test-threads=1
 
-# live briefing evaluation (needs ANTHROPIC_API_KEY; ~$0.15/run)
+# live briefing evaluation (needs ANTHROPIC_API_KEY; measured $0.78 for a
+# 20-turn Sonnet 5 run — set YO_MAX_TURNS lower to spend less, or point
+# YO_MODEL/YO_SUMMARIZER at deepseek-v4-flash for ~$0.03)
 cargo run --example llm_compaction_live --features gasp
 
 # harness plumbing only, no key, no bill

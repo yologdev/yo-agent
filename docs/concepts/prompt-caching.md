@@ -230,33 +230,63 @@ look roughly ten times cheaper than it is.
 | | DeepSeek v4 Flash | Claude Sonnet 5 |
 |---|---|---|
 | session hit rate | **79.0–83.7%** (n=5) | **75.5–79.2%** (n=5) |
-| steady-state turn | ~98% | ~81% |
+| mature-turn hit rate, median | **98.4%** | 88.8% |
+| mature-turn hit rate, peak | **99.7%** | 96.0% |
 | `cache_write` per session | **0** | 92,733 |
 | not-cached tokens from compaction | 91.9% | 49.6% |
+| session cost | **$0.031** | $0.783 |
+| cost per turn | **$0.0021** | $0.0392 |
+| same session with caching off | $0.066 (**−53%**) | $1.377 (**−43%**) |
+| output share of the bill | 73% | 61% |
 | turns | 14–15 | 19–20 |
 
 The session hit rate is measured across five runs per provider; the per-turn
 figures come from one run each, because earlier runs did not record per-turn
-`cache_write` and could not be re-derived.
+`cache_write` and could not be re-derived. Costs are computed from the recorded
+token counts at list prices — Anthropic's from `ModelConfig::claude_sonnet_5`,
+DeepSeek's at its **peak-window** rate (it charges half off-peak, so that column
+over-reports an off-peak run by up to 2×).
+
+**There is no single "steady-state" number.** Within one compaction cycle the
+hit rate climbs monotonically, because each turn adds a roughly constant amount
+of new content to a prefix that keeps growing: on DeepSeek the residual is
+26–158 tokens a turn, so it goes 88% → 95% → 99.6% across ten turns, then resets
+when compaction truncates the prefix. Quote the **peak** for what a mature prefix
+achieves and the **median** for what a session with this budget actually
+experiences; the median moves with how often you compact, so it is a property of
+your configuration, not of the provider.
+
+DeepSeek also quantises hits to 64-token blocks — every `cache_read` figure in
+that run is an exact multiple of 64 — so a trailing partial block is always
+uncached. That alone caps a single turn a fraction of a point below 100%.
 
 **Session rates are close; the mechanisms are not.** Both providers land near
 80%, even though yoagent places explicit `cache_control` breakpoints for
 Anthropic and sends nothing at all to DeepSeek. What differs is where the cost
 falls.
 
-**DeepSeek pays almost nothing between compactions.** Its steady-state turns run
-~98%: populating the cache is free, so the only non-cached tokens are the turn's
-genuinely new content. Consequently **92% of its non-cached tokens come from the
-two turns where compaction rewrote history** — for this provider, compaction is
-essentially the whole cache story.
+**DeepSeek pays almost nothing between compactions.** Populating the cache is
+free, so the only non-cached tokens are the turn's genuinely new content.
+Consequently **92% of its non-cached tokens come from the two turns where
+compaction rewrote history** — for this provider, compaction is essentially the
+whole cache story.
 
-**Anthropic pays a write premium continuously.** Every turn writes ~3,600–4,600
-tokens at 1.25× to extend the cached prefix, which holds steady-state turns near
-81% rather than 98%. Compaction accounts for only ~50% of its non-cached tokens;
-the other half is that ongoing write traffic. The trade is real rather than
-wasteful — those writes buy the 99%-cheap reads that follow — but it means the
-two providers reach a similar hit rate with materially different bills, which is
-the point of the section below.
+**Anthropic pays a write premium continuously.** Every turn writes ~2,000–4,600
+tokens at 1.25× to extend the cached prefix, which is why its curve climbs more
+slowly and tops out at 96% rather than 99.7%. Compaction accounts for only ~50%
+of its non-cached tokens; the other half is that ongoing write traffic. In
+dollars those writes cost **3.3× the reads they enable** ($0.232 vs $0.071) —
+which sounds damning until you price the counterfactual: the same session with
+caching off costs $1.377, so the writes are still a 43% saving. Buying reads with
+writes is the correct trade; it just means the two providers reach a similar hit
+rate with materially different bills.
+
+**Do not read the 25× cost gap as a caching result.** The two sessions are not
+matched: Sonnet ran 20 turns to DeepSeek's 15 and emitted 2.8× the output
+tokens, and output is the majority of both bills (61% and 73%). The comparison
+that is controlled is the *shape* — zero writes versus continuous writes, 92%
+versus 50% of waste attributable to compaction. The absolute dollars are one
+session each and should be treated as illustrative.
 
 One null result worth recording: lowering `DEFAULT_TRIGGER_RATIO` from 0.6 to
 0.35, on the theory that a slow summarizer needs more wall-clock headroom before
