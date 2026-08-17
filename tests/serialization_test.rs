@@ -349,6 +349,22 @@ fn all_agent_events() -> Vec<AgentEvent> {
         AgentEvent::InputRejected {
             reason: "injection detected".into(),
         },
+        AgentEvent::ContextCompacted {
+            method: CompactionMethod::Summarized,
+            messages_before: 40,
+            messages_after: 13,
+            tokens_before: 96_500,
+            tokens_after: 41_200,
+            messages_summarized: 28,
+            summary_usage: Some(Usage {
+                input: 54_000,
+                output: 1_100,
+                cache_read: 0,
+                cache_write: 0,
+                total_tokens: 55_100,
+            }),
+            summary_cost_usd: Some(0.0451),
+        },
     ]
 }
 
@@ -397,6 +413,7 @@ fn expected_event_tag(event: &AgentEvent) -> &'static str {
         AgentEvent::ToolExecutionEnd { .. } => "toolExecutionEnd",
         AgentEvent::ProgressMessage { .. } => "progressMessage",
         AgentEvent::InputRejected { .. } => "inputRejected",
+        AgentEvent::ContextCompacted { .. } => "contextCompacted",
         _ => "unknown",
     }
 }
@@ -412,7 +429,7 @@ fn expected_delta_tag(delta: &StreamDelta) -> &'static str {
 }
 
 /// Number of arms in `expected_event_tag` — bump together with the match.
-const EVENT_VARIANT_COUNT: usize = 12;
+const EVENT_VARIANT_COUNT: usize = 13;
 
 #[test]
 fn test_agent_event_type_tags_are_frozen() {

@@ -74,8 +74,8 @@
 
 pub mod agent;
 pub mod agent_loop;
-pub mod compaction_llm;
 pub mod context;
+pub mod llm_compaction;
 pub mod mcp;
 pub mod provider;
 pub mod retry;
@@ -96,8 +96,8 @@ pub mod gasp;
 
 pub use agent::{Agent, AgentBuildError, StructuredPromptError};
 pub use agent_loop::{agent_loop, agent_loop_continue};
-pub use compaction_llm::LlmCompaction;
 pub use context::{CompactionStrategy, DefaultCompaction};
+pub use llm_compaction::LlmCompaction;
 pub use retry::RetryConfig;
 pub use session::{Session, SessionEntry, SessionError};
 pub use shared_state::SharedState;

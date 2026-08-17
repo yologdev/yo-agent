@@ -11,6 +11,45 @@ adheres to [Semantic Versioning](https://semver.org/).
 > — cut from `v0.16.2` so consumers could take them without the breaking
 > changes queued here for 0.17.0.
 
+### Added
+
+- **`LlmCompaction` — an opt-in compaction strategy that summarizes instead of
+  dropping.** `DefaultCompaction`'s lossy tiers discard early decisions and
+  constraints outright. `LlmCompaction` sends a standalone summarization request
+  and splices a prose handoff briefing in where the dropped span used to be.
+
+  `CompactionStrategy::compact` is synchronous and sits on the hot path before
+  every turn, so the request runs in the background: it starts when usage crosses
+  `trigger_ratio · budget` and the result is spliced when the budget is actually
+  crossed. The loop never stalls on it, and it can never wedge — an unfinished,
+  failed, or stale summary falls back to `compact_messages` for that turn.
+
+  This buys **retention quality, and costs tokens**: each summarization pays
+  input tokens for the summarized span plus output tokens for the briefing, which
+  `DefaultCompaction` never pays. It does **not** reduce prefix-cache breaks —
+  measured at 6 vs 6 over 120 turns at a 20k budget and 6 vs 5 over 600 turns at
+  100k. Route it at a cheap model; both paths report their own cost on the new
+  event below.
+
+  ```rust,ignore
+  let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"))
+      .with_compaction_strategy(LlmCompaction::from_config(
+          ModelConfig::anthropic("claude-haiku-4-5-20251001", "Haiku 4.5"),
+      ));
+  ```
+
+  Known limitation: `compact_target_ratio` / `compact_headroom_turns` do not
+  apply to this strategy — its result is sized by `with_retain_tail_tokens`
+  instead. Consuming the loop's adapted target is follow-up work.
+
+- **`AgentEvent::ContextCompacted`** with the new `CompactionMethod` enum.
+  Emitted by `LlmCompaction` on both paths — the spliced summary and the
+  deterministic fallback — carrying messages and tokens before/after, how many
+  messages the summary replaced, and the summarization request's own `Usage` and
+  dollar cost. That last part is the point: it makes an LLM compaction strategy
+  priceable against `DefaultCompaction` instead of a guess. `DefaultCompaction`
+  does not emit it (no event channel, and no request to price).
+
 ### Fixed
 
 - **The `gasp` extension path could not construct its arguments**

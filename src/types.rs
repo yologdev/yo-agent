@@ -598,6 +598,46 @@ pub enum AgentEvent {
     InputRejected {
         reason: String,
     },
+    /// History was compacted before a turn.
+    ///
+    /// Emitted by [`LlmCompaction`](crate::LlmCompaction) on both of its paths
+    /// — the spliced summary and the deterministic fallback — so a consumer can
+    /// tell which one ran and what it cost. The built-in
+    /// [`DefaultCompaction`](crate::context::DefaultCompaction) does not emit
+    /// this; it has no event channel and never issues a request.
+    ContextCompacted {
+        /// Which compaction path produced this result.
+        method: CompactionMethod,
+        messages_before: usize,
+        messages_after: usize,
+        tokens_before: usize,
+        tokens_after: usize,
+        /// Messages replaced by the summary. Zero on the deterministic path.
+        messages_summarized: usize,
+        /// What producing the summary cost. `None` on the deterministic path,
+        /// which issues no request.
+        ///
+        /// This is the number to weigh against `tokens_before - tokens_after`
+        /// when deciding whether an LLM compaction strategy earns its keep.
+        summary_usage: Option<Usage>,
+        /// Dollar cost of `summary_usage`, when the summarization model's rates
+        /// are configured (see [`CostConfig`](crate::provider::CostConfig)).
+        summary_cost_usd: Option<f64>,
+    },
+}
+
+/// Which compaction path produced an [`AgentEvent::ContextCompacted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum CompactionMethod {
+    /// History was replaced by an LLM-written summary.
+    Summarized,
+    /// Deterministic tiered compaction ran: truncate → summarize → drop.
+    ///
+    /// On [`LlmCompaction`](crate::LlmCompaction) this means no summary was
+    /// ready in time — the loop stayed unblocked, but the compaction was lossy.
+    Deterministic,
 }
 
 /// Incremental content delta carried by [`AgentEvent::MessageUpdate`].
@@ -765,6 +805,7 @@ mod wire_tag_freeze {
             AgentEvent::ToolExecutionEnd { .. } => "toolExecutionEnd",
             AgentEvent::ProgressMessage { .. } => "progressMessage",
             AgentEvent::InputRejected { .. } => "inputRejected",
+            AgentEvent::ContextCompacted { .. } => "contextCompacted",
         }
     }
 

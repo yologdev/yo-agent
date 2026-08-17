@@ -345,6 +345,12 @@ pub trait CompactionStrategy: Send + Sync {
 /// This is used automatically when no custom `CompactionStrategy` is set.
 /// You can also compose it inside a custom strategy — run your logic first,
 /// then delegate to `compact_messages()` for the actual reduction.
+///
+/// This is deterministic and free, but the lossy tiers discard early decisions
+/// outright. [`LlmCompaction`](crate::LlmCompaction) is the alternative: it
+/// spends tokens on a background summarization request and splices the result
+/// in as prose. It costs money per compaction and does not reduce prefix-cache
+/// breaks — see its module docs for the trade-off.
 pub struct DefaultCompaction;
 
 impl CompactionStrategy for DefaultCompaction {
