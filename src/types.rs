@@ -700,8 +700,18 @@ pub enum ToolError {
 #[non_exhaustive]
 pub enum AgentEvent {
     AgentStart,
+    /// The run finished. Carries the messages it produced and a
+    /// [`SessionStats`] rollup of what they cost.
+    ///
+    /// The variant is `#[non_exhaustive]` — the payload is expected to grow.
+    /// Match with `..`.
+    #[non_exhaustive]
     AgentEnd {
         messages: Vec<AgentMessage>,
+        /// `#[serde(default)]`: `AgentEvent` is a frozen wire format, and
+        /// archived streams predate this field.
+        #[serde(default)]
+        stats: SessionStats,
     },
     TurnStart,
     TurnEnd {
@@ -764,6 +774,150 @@ pub enum AgentEvent {
         /// cannot disagree with each other.
         summary: Option<SummaryStats>,
     },
+}
+
+impl AgentEvent {
+    /// Construct an [`AgentEvent::AgentEnd`].
+    ///
+    /// The variant is `#[non_exhaustive]` — its payload grows — so downstream
+    /// crates (and tests) build it here rather than with a struct literal.
+    pub fn agent_end(messages: Vec<AgentMessage>, stats: SessionStats) -> Self {
+        Self::AgentEnd { messages, stats }
+    }
+}
+
+/// Session-level rollup carried by [`AgentEvent::AgentEnd`].
+///
+/// The per-turn numbers already existed — `Usage` on every assistant message,
+/// `tokens_cached` on the `llm_stream` span, `cache_read` in the GASP record —
+/// but nothing summed them, so answering "what was this run's cache hit rate"
+/// meant replaying the whole event stream. Any change that moves caching
+/// (breakpoint placement, compaction strategy, model choice) had to be judged
+/// by hand-built harnesses instead of a number the library reports.
+///
+/// ```
+/// # use yoagent::{SessionStats, Usage};
+/// # let stats = SessionStats::default();
+/// // Reading your cache hit rate:
+/// println!("{:.1}% cached over {} turns", stats.cache_hit_rate() * 100.0, stats.turns);
+/// ```
+///
+/// **Hit rate is `cache_read / (input + cache_read + cache_write)`** — cache
+/// writes count against you, because they are prompt tokens the provider
+/// processed and billed. Counting only `input` shrinks the denominator and so
+/// **overstates** the rate for a write-charging provider: Anthropic books a
+/// re-processed prefix to `cache_write`, and an `input`-only metric makes it
+/// look roughly ten times cheaper than it is. See
+/// `docs/evals/llm-compaction-live.md`, where that error was made and caught.
+///
+/// Read a rate against its session length, not against 100%: every turn's new
+/// content is necessarily a miss, so the ceiling is about `(n-1)/(n+1)` — ~88%
+/// at 15 turns, ~96% only past 49.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SessionStats {
+    /// Provider usage summed over every LLM turn in this run.
+    ///
+    /// `total_tokens` is **not** summed and stays 0 — see [`record_turn`] for
+    /// why. Derive a total from the four components instead.
+    ///
+    /// [`record_turn`]: SessionStats::record_turn
+    #[serde(default)]
+    pub usage: Usage,
+    /// LLM turns taken. Tool executions are not turns; an errored turn counts,
+    /// because the provider billed it, and provider retries within one turn do
+    /// not appear separately.
+    #[serde(default)]
+    pub turns: u32,
+    /// Dollar cost of [`usage`](Self::usage), when the model's rates are
+    /// configured (see [`CostConfig`](crate::provider::CostConfig)).
+    ///
+    /// `None` means "cannot price this", never "free" — all-zero rates mean
+    /// pricing is unknown, which is the case for custom and local models.
+    ///
+    /// Scope: this run's own turns. A [`SubAgentTool`](crate::SubAgentTool)
+    /// runs its own loop on a private channel, so a delegating agent's real
+    /// spend is higher than this reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// Times the loop observed compaction rewrite history.
+    ///
+    /// Counts any turn where the strategy returned a different message count or
+    /// a different *estimated* token total ([`context::total_tokens`]), so
+    /// in-place tool-output truncation is included alongside reshaping. A
+    /// compaction that runs and reclaims nothing is indistinguishable from no
+    /// compaction at all.
+    ///
+    /// [`context::total_tokens`]: crate::context::total_tokens
+    ///
+    /// Deliberately **not** split into spliced-summary vs deterministic
+    /// fallback, and carrying no summarization spend. That detail exists — on
+    /// [`AgentEvent::ContextCompacted`], with its [`SummaryStats`] — but
+    /// [`CompactionStrategy::compact`](crate::context::CompactionStrategy::compact)
+    /// is synchronous and has no event channel, so the loop cannot see it. Wire
+    /// `LlmCompaction::with_event_sender` to the same channel and aggregate the
+    /// two together — the events *describe* the same compactions this counts,
+    /// with the breakdown attached, so do not sum the two. Folding a guess in
+    /// here would be worse than the gap.
+    #[serde(default)]
+    pub compactions: u32,
+}
+
+impl SessionStats {
+    /// A rollup with the given figures.
+    ///
+    /// This struct is `#[non_exhaustive]`, so downstream crates cannot use a
+    /// struct literal; without this the only construction path would be
+    /// `Default::default()` plus field assignment.
+    pub fn new(usage: Usage, turns: u32, cost_usd: Option<f64>, compactions: u32) -> Self {
+        Self {
+            usage,
+            turns,
+            cost_usd,
+            compactions,
+        }
+    }
+
+    /// Fraction of prompt tokens served from cache across the whole session
+    /// (0.0–1.0). Delegates to [`Usage::cache_hit_rate`] so there is one
+    /// definition of the metric rather than two that can drift.
+    pub fn cache_hit_rate(&self) -> f64 {
+        self.usage.cache_hit_rate()
+    }
+
+    /// Fold one turn's usage into the rollup, costing it when rates are known.
+    ///
+    /// `total_tokens` is deliberately not summed. It is a per-response provider
+    /// report, and the providers disagree on it: `anthropic.rs` never sets it
+    /// at all, `bedrock.rs` computes `input + output` and so excludes cache,
+    /// and the rest pass through a payload value that includes cached tokens.
+    /// Summing it would launder that inconsistency into a session-level number
+    /// that reads as authoritative and is 0 for every Anthropic run. The four
+    /// components sum cleanly; derive a total from those.
+    ///
+    /// Cost accrues per turn rather than once at the end. Today that is
+    /// arithmetically identical — `CostConfig::cost_usd` is linear in every
+    /// `Usage` field and `config.model_config` is fixed for the life of a run
+    /// (`run_loop` holds `&AgentLoopConfig`, and `set_model` needs `&mut self`).
+    /// It is written this way so a per-turn model override stays correct if one
+    /// is ever introduced, and so `cost_usd` reflects whether any turn was
+    /// priceable rather than requiring a separate check.
+    pub(crate) fn record_turn(
+        &mut self,
+        usage: &Usage,
+        cost: Option<&crate::provider::CostConfig>,
+    ) {
+        self.usage.input += usage.input;
+        self.usage.output += usage.output;
+        self.usage.cache_read += usage.cache_read;
+        self.usage.cache_write += usage.cache_write;
+        self.turns += 1;
+
+        if let Some(cost) = cost.filter(|c| c.is_configured()) {
+            *self.cost_usd.get_or_insert(0.0) += cost.cost_usd(usage);
+        }
+    }
 }
 
 /// What a summarization request produced, carried by

@@ -480,11 +480,30 @@ async fn record_event(
             // durable log.
             tracking.outcome = "rejected".to_string();
         }
-        AgentEvent::AgentEnd { .. } if tracking.started && !tracking.finished => {
+        AgentEvent::AgentEnd { stats, .. } if tracking.started && !tracking.finished => {
+            // The session rollup goes into the durable record so an audit can
+            // compare runs without replaying every model.finished entry.
             sink.on_run_finished(YoAgentRunFinished {
                 run_id: tracking.run_id.clone(),
                 outcome: tracking.outcome.clone(),
-                metadata: serde_json::json!({}),
+                metadata: {
+                    // Serialize the struct rather than hand-building the
+                    // object: a second hand-maintained shape would drift from
+                    // the event wire format, and an auditor comparing the two
+                    // would silently be comparing different keys.
+                    let mut m = serde_json::to_value(stats).unwrap_or_else(
+                        |_| serde_json::json!({ "error": "session stats not serializable" }),
+                    );
+                    // Derived, so it is not a struct field — but it is the
+                    // number an audit actually reads.
+                    if let Some(obj) = m.as_object_mut() {
+                        obj.insert(
+                            "cacheHitRate".into(),
+                            serde_json::json!(stats.cache_hit_rate()),
+                        );
+                    }
+                    m
+                },
             })
             .await?;
             tracking.finished = true;

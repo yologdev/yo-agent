@@ -157,7 +157,11 @@ pub async fn agent_loop(
                         reason: reason.clone(),
                     })
                     .ok();
-                    tx.send(AgentEvent::AgentEnd { messages: vec![] }).ok();
+                    tx.send(AgentEvent::AgentEnd {
+                        messages: vec![],
+                        stats: SessionStats::default(),
+                    })
+                    .ok();
                     return vec![];
                 }
             }
@@ -208,15 +212,16 @@ pub async fn agent_loop(
         .ok();
     }
 
-    {
+    let stats = {
         use tracing::Instrument;
         run_loop(context, &mut new_messages, config, &tx, &cancel)
             .instrument(tracing::info_span!("agent_loop", model = %config.model))
-            .await;
-    }
+            .await
+    };
 
     tx.send(AgentEvent::AgentEnd {
         messages: new_messages.clone(),
+        stats,
     })
     .ok();
     new_messages
@@ -246,15 +251,16 @@ pub async fn agent_loop_continue(
     tx.send(AgentEvent::AgentStart).ok();
     tx.send(AgentEvent::TurnStart).ok();
 
-    {
+    let stats = {
         use tracing::Instrument;
         run_loop(context, &mut new_messages, config, &tx, &cancel)
             .instrument(tracing::info_span!("agent_loop", model = %config.model))
-            .await;
-    }
+            .await
+    };
 
     tx.send(AgentEvent::AgentEnd {
         messages: new_messages.clone(),
+        stats,
     })
     .ok();
     new_messages
@@ -270,7 +276,8 @@ async fn run_loop(
     config: &AgentLoopConfig,
     tx: &mpsc::UnboundedSender<AgentEvent>,
     cancel: &tokio_util::sync::CancellationToken,
-) {
+) -> SessionStats {
+    let mut stats = SessionStats::default();
     let mut first_turn = true;
     let mut turn_number: usize = 0;
     // Rolling growth measurement feeding `compact_headroom_turns`.
@@ -294,7 +301,7 @@ async fn run_loop(
     // Outer loop: follow-ups after agent would stop
     loop {
         if cancel.is_cancelled() {
-            return;
+            return stats;
         }
 
         let mut steering_after_tools: Option<Vec<AgentMessage>> = None;
@@ -302,7 +309,7 @@ async fn run_loop(
         // Inner loop: runs at least once, then continues if tool calls or pending messages
         loop {
             if cancel.is_cancelled() {
-                return;
+                return stats;
             }
 
             if !first_turn {
@@ -347,14 +354,14 @@ async fn run_loop(
                     .ok();
                     context.messages.push(limit_msg.clone());
                     new_messages.push(limit_msg);
-                    return;
+                    return stats;
                 }
             }
 
             // before_turn callback — abort if it returns false
             if let Some(ref before_turn) = config.before_turn {
                 if !before_turn(&context.messages, turn_number) {
-                    return;
+                    return stats;
                 }
             }
 
@@ -451,13 +458,22 @@ async fn run_loop(
                     .as_deref()
                     .unwrap_or(&DefaultCompaction);
                 let before_len = context.messages.len();
+                // Already computed above over the same unmutated history.
+                let before_tokens = estimated;
                 context.messages =
                     strategy.compact(std::mem::take(&mut context.messages), effective_config);
-                if context.messages.len() != before_len {
-                    // Messages shifted; re-baseline from the next real usage.
+                let after_tokens = context::total_tokens(&context.messages);
+                // Length alone would miss level-1 truncation, which rewrites
+                // tool outputs in place and leaves the count unchanged — and
+                // that is exactly the case where the tracker's baseline goes
+                // stale, so both the reset and the counter key off the same
+                // test rather than the reset keying off length alone.
+                if context.messages.len() != before_len || after_tokens != before_tokens {
+                    // History moved; re-baseline from the next real usage.
                     context_tracker.reset();
+                    stats.compactions += 1;
                 }
-                last_context_tokens = Some(context::total_tokens(&context.messages));
+                last_context_tokens = Some(after_tokens);
             }
 
             // Stream assistant response, under an llm_stream span that
@@ -502,6 +518,7 @@ async fn run_loop(
             new_messages.push(agent_msg.clone());
             if let Message::Assistant { usage, .. } = &message {
                 context_tracker.record_usage(usage, context.messages.len() - 1);
+                stats.record_turn(usage, config.model_config.as_ref().map(|mc| &mc.cost));
             }
 
             // Check for error/abort
@@ -528,7 +545,7 @@ async fn run_loop(
                         tool_results: vec![],
                     })
                     .ok();
-                    return;
+                    return stats;
                 }
             }
 
@@ -648,6 +665,8 @@ async fn run_loop(
 
         break;
     }
+
+    stats
 }
 
 /// Stream an assistant response from the LLM.
