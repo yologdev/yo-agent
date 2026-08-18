@@ -64,16 +64,7 @@ async fn test_sub_agent_basic() {
     let params = serde_json::json!({"task": "Tell me about Rust"});
 
     let result = sub_agent
-        .execute(
-            params,
-            ToolContext {
-                tool_call_id: "tc-1".into(),
-                tool_name: "researcher".into(),
-                cancel: CancellationToken::new(),
-                on_update: None,
-                on_progress: None,
-            },
-        )
+        .execute(params, ToolContext::new("tc-1", "researcher"))
         .await
         .expect("sub-agent should succeed");
 
@@ -150,16 +141,7 @@ async fn test_sub_agent_with_tools() {
     let params = serde_json::json!({"task": "Echo hello"});
 
     let result = sub_agent
-        .execute(
-            params,
-            ToolContext {
-                tool_call_id: "tc-1".into(),
-                tool_name: "echo_agent".into(),
-                cancel: CancellationToken::new(),
-                on_update: None,
-                on_progress: None,
-            },
-        )
+        .execute(params, ToolContext::new("tc-1", "echo_agent"))
         .await
         .expect("sub-agent should succeed");
 
@@ -190,13 +172,7 @@ async fn test_sub_agent_cancellation() {
     let result = sub_agent
         .execute(
             params,
-            ToolContext {
-                tool_call_id: "tc-1".into(),
-                tool_name: "cancelled_agent".into(),
-                cancel,
-                on_update: None,
-                on_progress: None,
-            },
+            ToolContext::new("tc-1", "cancelled_agent").with_cancel(cancel),
         )
         .await
         .expect("should return a result even when cancelled");
@@ -242,16 +218,7 @@ async fn test_sub_agent_max_turns() {
     let params = serde_json::json!({"task": "Keep going"});
 
     let result = sub_agent
-        .execute(
-            params,
-            ToolContext {
-                tool_call_id: "tc-1".into(),
-                tool_name: "limited_agent".into(),
-                cancel: CancellationToken::new(),
-                on_update: None,
-                on_progress: None,
-            },
-        )
+        .execute(params, ToolContext::new("tc-1", "limited_agent"))
         .await
         .expect("sub-agent should succeed");
 
@@ -405,13 +372,7 @@ async fn test_sub_agent_event_forwarding() {
     let result = sub_agent
         .execute(
             params,
-            ToolContext {
-                tool_call_id: "tc-1".into(),
-                tool_name: "streaming_agent".into(),
-                cancel: CancellationToken::new(),
-                on_update: Some(on_update),
-                on_progress: None,
-            },
+            ToolContext::new("tc-1", "streaming_agent").with_on_update(on_update),
         )
         .await
         .expect("sub-agent should succeed");
@@ -450,16 +411,7 @@ async fn test_sub_agent_missing_task_parameter() {
     let params = serde_json::json!({}); // Missing "task"
 
     let result = sub_agent
-        .execute(
-            params,
-            ToolContext {
-                tool_call_id: "tc-1".into(),
-                tool_name: "test_agent".into(),
-                cancel: CancellationToken::new(),
-                on_update: None,
-                on_progress: None,
-            },
-        )
+        .execute(params, ToolContext::new("tc-1", "test_agent"))
         .await;
     assert!(result.is_err());
 
@@ -551,13 +503,7 @@ async fn capture_system_prompt(
     sub_agent
         .execute(
             serde_json::json!({"task": "do work"}),
-            ToolContext {
-                tool_call_id: "tc-1".into(),
-                tool_name: "sub".into(),
-                cancel: CancellationToken::new(),
-                on_update: None,
-                on_progress: None,
-            },
+            ToolContext::new("tc-1", "sub"),
         )
         .await
         .expect("sub-agent should succeed");
@@ -761,13 +707,7 @@ impl yoagent::provider::StreamProvider for StreamConfigCapture {
 async fn run_sub_agent(tool: &SubAgentTool) {
     tool.execute(
         serde_json::json!({"task": "go"}),
-        ToolContext {
-            tool_call_id: "tc-cfg".into(),
-            tool_name: "cfg".into(),
-            cancel: CancellationToken::new(),
-            on_update: None,
-            on_progress: None,
-        },
+        ToolContext::new("tc-cfg", "cfg"),
     )
     .await
     .expect("sub-agent should succeed");
@@ -826,13 +766,7 @@ async fn test_sub_agent_from_provider_construction() {
     let result = tool
         .execute(
             serde_json::json!({"task": "go"}),
-            ToolContext {
-                tool_call_id: "tc-fp".into(),
-                tool_name: "researcher".into(),
-                cancel: CancellationToken::new(),
-                on_update: None,
-                on_progress: None,
-            },
+            ToolContext::new("tc-fp", "researcher"),
         )
         .await
         .expect("sub-agent should succeed");
@@ -937,13 +871,7 @@ async fn test_sub_agent_tool_middleware_denies() {
     let result = tool
         .execute(
             serde_json::json!({"task": "go"}),
-            ToolContext {
-                tool_call_id: "tc-mw".into(),
-                tool_name: "gated".into(),
-                cancel: CancellationToken::new(),
-                on_update: None,
-                on_progress: None,
-            },
+            ToolContext::new("tc-mw", "gated"),
         )
         .await
         .expect("sub-agent completes despite denial");

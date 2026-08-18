@@ -105,34 +105,28 @@ async fn main() {
 
     // --- Parent: single call triggers the full recursive chain ---
     let buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    let ctx = ToolContext {
-        tool_call_id: "tc-rlm".into(),
-        tool_name: "lead_analyst".into(),
-        cancel: tokio_util::sync::CancellationToken::new(),
-        on_update: Some(Arc::new({
-            let buf = buf.clone();
-            move |result: ToolResult| {
-                for content in &result.content {
-                    if let Content::Text { text } = content {
-                        let mut b = buf.lock().unwrap();
-                        if text.starts_with("[sub-agent calling tool:") {
-                            if !b.is_empty() {
-                                eprintln!("[lead] {}", b.drain(..).collect::<String>());
-                            }
-                            eprintln!("[lead] {}", text);
-                            return;
+    let ctx = ToolContext::new("tc-rlm", "lead_analyst").with_on_update(Arc::new({
+        let buf = buf.clone();
+        move |result: ToolResult| {
+            for content in &result.content {
+                if let Content::Text { text } = content {
+                    let mut b = buf.lock().unwrap();
+                    if text.starts_with("[sub-agent calling tool:") {
+                        if !b.is_empty() {
+                            eprintln!("[lead] {}", b.drain(..).collect::<String>());
                         }
-                        b.push_str(text);
-                        while let Some(pos) = b.find('\n') {
-                            let line: String = b.drain(..=pos).collect();
-                            eprint!("[lead] {}", line);
-                        }
+                        eprintln!("[lead] {}", text);
+                        return;
+                    }
+                    b.push_str(text);
+                    while let Some(pos) = b.find('\n') {
+                        let line: String = b.drain(..=pos).collect();
+                        eprint!("[lead] {}", line);
                     }
                 }
             }
-        })),
-        on_progress: None,
-    };
+        }
+    }));
 
     let result = lead_analyst
         .execute(

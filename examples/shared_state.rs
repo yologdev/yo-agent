@@ -106,13 +106,7 @@ async fn main() {
     // --- Run all three in parallel ---
     println!("Dispatching 3 sub-agents in parallel...\n");
 
-    let ctx = |name: &str| ToolContext {
-        tool_call_id: format!("tc-{}", name),
-        tool_name: name.to_string(),
-        cancel: tokio_util::sync::CancellationToken::new(),
-        on_update: None,
-        on_progress: None,
-    };
+    let ctx = |name: &str| ToolContext::new(format!("tc-{}", name), name.to_string());
 
     let (r1, r2, r3) = tokio::join!(
         error_analyst.execute(

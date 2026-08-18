@@ -184,6 +184,17 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking: `ToolContext` is `#[non_exhaustive]`** and gained
+  `ToolContext::new` plus `with_cancel` / `with_on_update` / `with_on_progress`.
+
+  Its doc has always claimed that "adding fields to `ToolContext` is
+  non-breaking". That was false — the struct carried no attribute, so every
+  field addition broke downstream struct literals. Making it true cost 20
+  literal rewrites across this repo's own tests and examples, which is a fair
+  measure of what a future field would have cost everyone else. Tools *receive*
+  this type rather than construct it, so implementors are unaffected; only
+  code that builds one directly needs the constructor.
+
 - **Breaking: `AgentEvent::AgentEnd` gained a `stats` field** and the variant is
   now `#[non_exhaustive]`. Match with `..`, and construct via
   `AgentEvent::agent_end(messages, stats)` rather than a struct literal. The
