@@ -51,12 +51,33 @@ fn print_banner() {
     println!("{DIM}  Type /quit to exit, /clear to reset{RESET}\n");
 }
 
-fn print_usage(usage: &Usage) {
-    if usage.input > 0 || usage.output > 0 {
+/// Print the session rollup that `AgentEnd` carries.
+///
+/// Hit rate counts `cache_write` against you — those are prompt tokens the
+/// provider processed and billed. Read it against the session length rather
+/// than against 100%: every turn's new content is necessarily a miss.
+fn print_stats(stats: &SessionStats) {
+    let u = &stats.usage;
+    if u.input == 0 && u.output == 0 && u.cache_read == 0 && u.cache_write == 0 {
+        return;
+    }
+    println!(
+        "\n{DIM}  tokens: {} in / {} out over {} turn(s){RESET}",
+        u.input, u.output, stats.turns
+    );
+    if u.cache_read > 0 || u.cache_write > 0 {
         println!(
-            "\n{DIM}  tokens: {} in / {} out{RESET}",
-            usage.input, usage.output
+            "{DIM}  cache: {:.1}% hit ({} read, {} write){RESET}",
+            stats.cache_hit_rate() * 100.0,
+            u.cache_read,
+            u.cache_write
         );
+    }
+    if stats.compactions > 0 {
+        println!("{DIM}  compactions: {}{RESET}", stats.compactions);
+    }
+    if let Some(cost) = stats.cost_usd {
+        println!("{DIM}  cost: ${cost:.4}{RESET}");
     }
 }
 
@@ -197,7 +218,7 @@ async fn main() {
 
         // Send to agent
         let mut rx = agent.prompt(input).await;
-        let mut last_usage = Usage::default();
+        let mut session_stats = SessionStats::default();
         let mut in_text = false;
 
         while let Some(event) = rx.recv().await {
@@ -292,14 +313,8 @@ async fn main() {
                         .unwrap_or("request declined by the model's safety system");
                     println!("{RED}  refused: {msg}{RESET}");
                 }
-                AgentEvent::AgentEnd { messages } => {
-                    // Extract usage from the last assistant message
-                    for msg in messages.iter().rev() {
-                        if let AgentMessage::Llm(Message::Assistant { usage, .. }) = msg {
-                            last_usage = usage.clone();
-                            break;
-                        }
-                    }
+                AgentEvent::AgentEnd { stats, .. } => {
+                    session_stats = stats.clone();
                 }
                 _ => {}
             }
@@ -308,7 +323,7 @@ async fn main() {
         if in_text {
             println!();
         }
-        print_usage(&last_usage);
+        print_stats(&session_stats);
         println!();
     }
 

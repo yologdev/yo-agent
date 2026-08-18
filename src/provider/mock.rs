@@ -5,11 +5,20 @@ use crate::types::*;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-/// A mock response: either plain text or tool calls
+/// A mock response: either plain text or tool calls.
+///
+/// `#[non_exhaustive]`: this is a test double whose shapes grow with the
+/// features under test — `TextWithUsage` was itself a later addition.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum MockResponse {
     Text(String),
     ToolCalls(Vec<MockToolCall>),
+    /// Text plus a chosen `Usage`, for asserting on token accounting.
+    ///
+    /// `Text` reports `Usage::default()`, which cannot distinguish a rollup
+    /// that sums from one that copies the last turn.
+    TextWithUsage(String, Usage),
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +81,21 @@ impl StreamProvider for MockProvider {
         let _ = tx.send(StreamEvent::Start);
 
         let message = match response {
+            MockResponse::TextWithUsage(text, usage) => {
+                let _ = tx.send(StreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: text.clone(),
+                });
+                Message::Assistant {
+                    content: vec![Content::Text { text }],
+                    stop_reason: StopReason::Stop,
+                    model: "mock".into(),
+                    provider: "mock".into(),
+                    usage,
+                    timestamp: now_ms(),
+                    error_message: None,
+                }
+            }
             MockResponse::Text(text) => {
                 let _ = tx.send(StreamEvent::TextDelta {
                     content_index: 0,

@@ -1777,7 +1777,7 @@ async fn test_filter_reject_returns_empty() {
     assert!(events.iter().any(|e| matches!(e, AgentEvent::AgentStart)));
     assert!(events
         .iter()
-        .any(|e| matches!(e, AgentEvent::AgentEnd { messages } if messages.is_empty())));
+        .any(|e| matches!(e, AgentEvent::AgentEnd { messages, .. } if messages.is_empty())));
 }
 
 #[tokio::test]
@@ -2531,4 +2531,387 @@ async fn per_tool_override_exempts_a_tool_from_capping() {
 async fn tool_output_is_untouched_without_a_context_config() {
     let (messages, _) = run_with_context_config(None).await;
     assert_eq!(tool_result_lines(&messages), 500);
+}
+
+// ---------------------------------------------------------------------------
+// Session rollup on AgentEnd (issue #124)
+// ---------------------------------------------------------------------------
+
+fn usage(input: u64, output: u64, cache_read: u64, cache_write: u64) -> Usage {
+    Usage {
+        input,
+        output,
+        cache_read,
+        cache_write,
+        total_tokens: input + output + cache_read + cache_write,
+    }
+}
+
+fn agent_end_stats(events: &[AgentEvent]) -> SessionStats {
+    events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::AgentEnd { stats, .. } => Some(stats.clone()),
+            _ => None,
+        })
+        .expect("AgentEnd must be emitted")
+}
+
+/// Distinct usage per turn, so a rollup that copies the last turn instead of
+/// summing cannot pass.
+#[tokio::test]
+async fn agent_end_carries_a_summed_session_rollup() {
+    let provider = MockProvider::new(vec![
+        MockResponse::ToolCalls(vec![MockToolCall {
+            provider_metadata: None,
+            name: "silent_tool".into(),
+            arguments: serde_json::json!({}),
+        }]),
+        MockResponse::TextWithUsage("done".into(), usage(7, 70, 700, 7000)),
+    ]);
+
+    // The first turn's usage rides on the tool-call response, which
+    // MockProvider reports as Usage::default() — so this asserts the loop sums
+    // whatever each turn reported, zeros included.
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut context = AgentContext {
+        messages: vec![],
+        tools: vec![Box::new(SilentTool)],
+        system_prompt: String::new(),
+    };
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user("go"))],
+        &mut context,
+        &make_config(provider),
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let stats = agent_end_stats(&collect_events(rx));
+    assert_eq!(stats.turns, 2, "two LLM turns: tool call, then text");
+    assert_eq!(stats.usage.input, 7);
+    assert_eq!(stats.usage.output, 70);
+    assert_eq!(stats.usage.cache_read, 700);
+    assert_eq!(stats.usage.cache_write, 7000);
+
+    // 700 / (7 + 700 + 7000) — cache_write counts against the rate, because
+    // those are prompt tokens the provider processed and billed.
+    let expected = 700.0 / 7707.0;
+    assert!(
+        (stats.cache_hit_rate() - expected).abs() < 1e-9,
+        "hit rate {} != {expected}",
+        stats.cache_hit_rate()
+    );
+}
+
+/// Three turns with different usage each: proves accumulation, not overwrite.
+#[tokio::test]
+async fn rollup_accumulates_across_every_turn() {
+    let provider = MockProvider::new(vec![
+        MockResponse::TextWithUsage("a".into(), usage(1, 2, 3, 4)),
+        MockResponse::TextWithUsage("b".into(), usage(10, 20, 30, 40)),
+        MockResponse::TextWithUsage("c".into(), usage(100, 200, 300, 400)),
+    ]);
+
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut context = AgentContext {
+        messages: vec![],
+        tools: vec![],
+        system_prompt: String::new(),
+    };
+    let mut config = make_config(provider);
+    // Two follow-ups, so the loop takes three turns in one run.
+    let pending = std::sync::Arc::new(std::sync::Mutex::new(vec![
+        AgentMessage::Llm(Message::user("second")),
+        AgentMessage::Llm(Message::user("third")),
+    ]));
+    let handout = pending.clone();
+    config.get_follow_up_messages = Some(Box::new(move || {
+        let mut q = handout.lock().unwrap();
+        if q.is_empty() {
+            vec![]
+        } else {
+            vec![q.remove(0)]
+        }
+    }));
+
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user("first"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let stats = agent_end_stats(&collect_events(rx));
+    assert_eq!(stats.turns, 3);
+    assert_eq!(stats.usage.input, 111);
+    assert_eq!(stats.usage.output, 222);
+    assert_eq!(stats.usage.cache_read, 333);
+    assert_eq!(stats.usage.cache_write, 444);
+}
+
+/// A run that produced no LLM turn reports zeros rather than a bogus rate.
+#[tokio::test]
+async fn rollup_of_an_empty_run_is_zero_not_nan() {
+    let stats = SessionStats::default();
+    assert_eq!(stats.turns, 0);
+    assert_eq!(stats.cache_hit_rate(), 0.0);
+    assert!(stats.cache_hit_rate().is_finite());
+}
+
+/// The wire format is frozen and archived streams predate `stats`. Without
+/// `#[serde(default)]` on the field and on every `SessionStats` field, replaying
+/// yesterday's JSONL fails outright.
+#[test]
+fn archived_agent_end_without_stats_still_deserializes() {
+    let legacy = r#"{"type":"agentEnd","messages":[]}"#;
+    let event: AgentEvent = serde_json::from_str(legacy).expect("legacy agentEnd must load");
+    match event {
+        AgentEvent::AgentEnd { stats, .. } => assert_eq!(stats, SessionStats::default()),
+        other => panic!("wrong variant: {other:?}"),
+    }
+
+    // ...and a partially-written rollup, which is what a future field addition
+    // looks like to an older reader.
+    let partial = r#"{"type":"agentEnd","messages":[],"stats":{"turns":3}}"#;
+    let event: AgentEvent = serde_json::from_str(partial).expect("partial stats must load");
+    match event {
+        AgentEvent::AgentEnd { stats, .. } => {
+            assert_eq!(stats.turns, 3);
+            assert_eq!(stats.compactions, 0);
+            assert_eq!(stats.cost_usd, None);
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+}
+
+/// `cost_usd` accrues only when the model has configured rates. `None` means
+/// "cannot price this", never "free".
+#[tokio::test]
+async fn cost_accrues_when_rates_are_configured_and_stays_none_otherwise() {
+    let responses = || {
+        vec![
+            MockResponse::TextWithUsage("a".into(), usage(1_000_000, 0, 0, 0)),
+            MockResponse::TextWithUsage("b".into(), usage(0, 1_000_000, 0, 0)),
+        ]
+    };
+
+    // Unpriced: no model_config at all.
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut context = AgentContext {
+        messages: vec![],
+        tools: vec![],
+        system_prompt: String::new(),
+    };
+    let mut config = make_config(MockProvider::new(responses()));
+    config.get_follow_up_messages = follow_up_once();
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user("go"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(
+        agent_end_stats(&collect_events(rx)).cost_usd,
+        None,
+        "an unpriced model must report None, not Some(0.0)"
+    );
+
+    // Priced: $3/M in, $15/M out. One million of each => 3.0 + 15.0.
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut context = AgentContext {
+        messages: vec![],
+        tools: vec![],
+        system_prompt: String::new(),
+    };
+    let mut priced = yoagent::provider::ModelConfig::anthropic("mock", "Mock");
+    priced.cost = yoagent::provider::CostConfig {
+        input_per_million: 3.0,
+        output_per_million: 15.0,
+        cache_read_per_million: 0.0,
+        cache_write_per_million: 0.0,
+    };
+    let mut config = make_config(MockProvider::new(responses()));
+    config.model_config = Some(priced);
+    config.get_follow_up_messages = follow_up_once();
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user("go"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+    let cost = agent_end_stats(&collect_events(rx))
+        .cost_usd
+        .expect("priced model must report a cost");
+    assert!((cost - 18.0).abs() < 1e-9, "cost {cost} != 18.0");
+}
+
+/// Hand out exactly one follow-up, so the loop takes two turns.
+fn follow_up_once() -> Option<Box<dyn Fn() -> Vec<AgentMessage> + Send + Sync>> {
+    let pending = std::sync::Arc::new(std::sync::Mutex::new(vec![AgentMessage::Llm(
+        Message::user("again"),
+    )]));
+    Some(Box::new(move || {
+        let mut q = pending.lock().unwrap();
+        if q.is_empty() {
+            vec![]
+        } else {
+            vec![q.remove(0)]
+        }
+    }))
+}
+
+/// `total_tokens` is not summed: providers disagree on it (Anthropic never sets
+/// it, Bedrock excludes cache), so a session-level sum would read as
+/// authoritative while being 0 for every Anthropic run.
+#[tokio::test]
+async fn total_tokens_is_not_summed_into_the_rollup() {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut context = AgentContext {
+        messages: vec![],
+        tools: vec![],
+        system_prompt: String::new(),
+    };
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user("go"))],
+        &mut context,
+        &make_config(MockProvider::new(vec![MockResponse::TextWithUsage(
+            "a".into(),
+            usage(5, 6, 7, 8),
+        )])),
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let stats = agent_end_stats(&collect_events(rx));
+    assert_eq!(stats.usage.input, 5);
+    assert_eq!(
+        stats.usage.total_tokens, 0,
+        "total_tokens must stay 0; derive a total from the components"
+    );
+}
+
+/// A strategy that never changes anything must not be counted. This is the
+/// most likely implementation slip — counting *invocations* of `compact`
+/// rather than *effective* compactions — and it would make the number useless
+/// for anyone tuning a strategy.
+#[tokio::test]
+async fn a_no_op_compaction_is_not_counted() {
+    struct NoOp;
+    impl yoagent::context::CompactionStrategy for NoOp {
+        fn compact(
+            &self,
+            messages: Vec<AgentMessage>,
+            _config: &yoagent::context::ContextConfig,
+        ) -> Vec<AgentMessage> {
+            messages
+        }
+    }
+
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut context = AgentContext {
+        messages: vec![],
+        tools: vec![],
+        system_prompt: String::new(),
+    };
+    let mut config = make_config(MockProvider::new(vec![
+        MockResponse::TextWithUsage("a".into(), usage(10, 10, 0, 0)),
+        MockResponse::TextWithUsage("b".into(), usage(10, 10, 0, 0)),
+    ]));
+    // A tiny budget guarantees `compact` is called on every turn.
+    config.context_config = Some(yoagent::context::ContextConfig {
+        max_context_tokens: 10,
+        system_prompt_tokens: 0,
+        ..Default::default()
+    });
+    config.compaction_strategy = Some(std::sync::Arc::new(NoOp));
+    config.get_follow_up_messages = follow_up_once();
+
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user("go"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(
+        agent_end_stats(&collect_events(rx)).compactions,
+        0,
+        "compact() ran every turn but changed nothing — nothing to count"
+    );
+}
+
+/// The `||` clause the counting comment exists for: a strategy that rewrites
+/// content in place, leaving the message count identical. A length-only check
+/// silently misses it.
+#[tokio::test]
+async fn an_in_place_rewrite_is_counted_despite_an_unchanged_message_count() {
+    struct ShrinkInPlace;
+    impl yoagent::context::CompactionStrategy for ShrinkInPlace {
+        fn compact(
+            &self,
+            messages: Vec<AgentMessage>,
+            _config: &yoagent::context::ContextConfig,
+        ) -> Vec<AgentMessage> {
+            let before = messages.len();
+            let out: Vec<AgentMessage> = messages
+                .into_iter()
+                .map(|m| match m {
+                    AgentMessage::Llm(Message::User { timestamp, .. }) => {
+                        AgentMessage::Llm(Message::User {
+                            content: vec![Content::Text { text: "x".into() }],
+                            timestamp,
+                        })
+                    }
+                    other => other,
+                })
+                .collect();
+            assert_eq!(out.len(), before, "this strategy must not change length");
+            out
+        }
+    }
+
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut context = AgentContext {
+        messages: vec![],
+        tools: vec![],
+        system_prompt: String::new(),
+    };
+    let mut config = make_config(MockProvider::new(vec![MockResponse::TextWithUsage(
+        "a".into(),
+        usage(10, 10, 0, 0),
+    )]));
+    config.context_config = Some(yoagent::context::ContextConfig {
+        max_context_tokens: 10,
+        system_prompt_tokens: 0,
+        ..Default::default()
+    });
+    config.compaction_strategy = Some(std::sync::Arc::new(ShrinkInPlace));
+
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user(
+            "a considerably longer opening message than the replacement",
+        ))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(
+        agent_end_stats(&collect_events(rx)).compactions,
+        1,
+        "token total moved while the count did not — the || clause must catch it"
+    );
 }

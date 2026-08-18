@@ -301,9 +301,7 @@ fn sample_tool_result() -> ToolResult {
 fn all_agent_events() -> Vec<AgentEvent> {
     vec![
         AgentEvent::AgentStart,
-        AgentEvent::AgentEnd {
-            messages: vec![sample_assistant()],
-        },
+        AgentEvent::agent_end(vec![sample_assistant()], SessionStats::default()),
         AgentEvent::TurnStart,
         AgentEvent::TurnEnd {
             message: sample_assistant(),

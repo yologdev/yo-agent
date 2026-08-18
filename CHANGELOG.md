@@ -90,6 +90,47 @@ adheres to [Semantic Versioning](https://semver.org/).
 - `StopReason` is documented as `#[non_exhaustive]`, which it has been since
   0.17.0 — the doc comment still claimed the opposite.
 
+- **`AgentEvent::AgentEnd` carries a `SessionStats` rollup**
+  ([#124](https://github.com/yologdev/yoagent/issues/124)). Every per-turn
+  number already existed — `Usage` on each assistant message, `tokens_cached`
+  on the `llm_stream` span, `cache_read` in the GASP record — but nothing
+  summed them, so "what was this run's cache hit rate" meant replaying the
+  event stream. Cache-affecting changes were judged by hand-built harnesses
+  instead of a number the library reports; #123 and the #119 evaluation both
+  had to do exactly that.
+
+  ```rust,ignore
+  AgentEvent::AgentEnd { stats, .. } => {
+      println!("{:.1}% cached over {} turns", stats.cache_hit_rate() * 100.0, stats.turns);
+  }
+  ```
+
+  Carries summed `usage`, `turns`, `cost_usd` when rates are configured, and
+  `compactions`. Hit rate delegates to `Usage::cache_hit_rate` so there is one
+  definition rather than two that drift — and it counts `cache_write` against
+  you, because those are prompt tokens the provider processed and billed.
+
+  `usage.total_tokens` is deliberately **not** summed and stays 0. It is a
+  per-response provider report and the providers disagree: `anthropic.rs` never
+  sets it, `bedrock.rs` computes `input + output` and excludes cache, and the
+  rest pass through a payload value that includes cached tokens. Summing it
+  would launder that into a session-level figure that reads as authoritative
+  and is 0 for every Anthropic run. Derive a total from the four components.
+
+  Scope: a run's own turns. `SubAgentTool` runs its own loop on a private
+  channel, so a delegating agent's real spend is higher than this reports.
+
+  `compactions` counts turns where the strategy changed the message count *or*
+  the token total, so in-place tool-output truncation is included rather than
+  missed by a length check. It is deliberately not split into spliced-summary
+  vs deterministic fallback and carries no summarization spend: that detail
+  lives on `AgentEvent::ContextCompacted`, and `CompactionStrategy::compact` is
+  synchronous with no event channel, so the loop cannot see it. Wire
+  `LlmCompaction::with_event_sender` to the same channel to aggregate both.
+
+  The GASP run-close record now carries the same rollup, so an audit can
+  compare runs without replaying every `model.finished` entry.
+
 - **`CacheStrategy` is no longer Anthropic-only**
   ([#123](https://github.com/yologdev/yoagent/issues/123)). The 0.16.x line
   engineered byte-stable compaction so cached prefixes survive — and that
@@ -142,6 +183,19 @@ adheres to [Semantic Versioning](https://semver.org/).
   automatic — with a per-protocol table. Anthropic behaviour is unchanged.
 
 ### Changed
+
+- **Breaking: `AgentEvent::AgentEnd` gained a `stats` field** and the variant is
+  now `#[non_exhaustive]`. Match with `..`, and construct via
+  `AgentEvent::agent_end(messages, stats)` rather than a struct literal. The
+  field and every `SessionStats` field carry `#[serde(default)]`, so archived
+  event streams written before this release still deserialize — `AgentEvent` is
+  a frozen wire format, and a missing-field error would have broken every
+  replay consumer.
+
+- **Breaking: `MockResponse` is `#[non_exhaustive]`** and gained
+  `TextWithUsage(String, Usage)`, so a test can set a turn's usage. `Text`
+  reports `Usage::default()`, which cannot distinguish a rollup that sums from
+  one that copies the last turn.
 
 - **Breaking: `CacheConfig` is `#[non_exhaustive]`** and gained `session_key`.
   Construct with `CacheConfig::new()` / `::disabled()` / `::default()` and the

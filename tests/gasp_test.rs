@@ -487,7 +487,8 @@ async fn stop_reasons_map_to_distinct_outcomes() {
             )),
         })
         .unwrap();
-        tx.send(AgentEvent::AgentEnd { messages: vec![] }).unwrap();
+        tx.send(AgentEvent::agent_end(vec![], Default::default()))
+            .unwrap();
         drop(tx);
         handle.await.unwrap().unwrap().expect("recorded");
 
