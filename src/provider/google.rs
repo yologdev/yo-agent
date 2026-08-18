@@ -2,6 +2,26 @@
 //!
 //! Uses the `streamGenerateContent` endpoint with SSE streaming.
 //! API key is passed as a query parameter.
+//!
+//! # Prompt caching: implicit only, deliberately
+//!
+//! This provider sends no cache directives and ignores [`CacheStrategy`].
+//! Gemini caches implicitly on its own, and the `cachedContentTokenCount` this
+//! module reads back into [`Usage::cache_read`] reports the result of that
+//! automatic behaviour — it is telemetry, not an acknowledgement of anything
+//! the client asked for.
+//!
+//! Gemini's *explicit* caching is a separate resource with a different
+//! lifecycle: you create a `CachedContent` object, receive a handle, reference
+//! it by name on later requests, and manage its TTL and its own billing line.
+//! That does not fit behind [`CacheStrategy`], which describes where to place
+//! markers inside a single request. Wiring it here would mean either
+//! misrepresenting a stateful resource as a per-request flag, or silently
+//! creating server-side objects with a lifetime the caller cannot see.
+//!
+//! It is worth doing as its own API — with explicit create/reference/expire
+//! surface — and it is not worth pretending the current enum can express it.
+//! See yologdev/yoagent#123.
 
 use super::traits::*;
 use crate::types::*;

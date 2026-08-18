@@ -414,6 +414,30 @@ fn build_request_body(
         body["tools"] = serde_json::json!(tools);
     }
 
+    // Prompt caching. OpenAI caches prefixes automatically once they exceed
+    // ~1024 tokens, so there are no breakpoints to place — `prompt_cache_key`
+    // only routes requests from one conversation toward the same cache. Gated
+    // on the compat flag because the field is OpenAI's: a strict compat server
+    // that validates unknown keys would reject the request outright, and the
+    // providers that cache automatically were never reading it anyway.
+    if compat.supports_prompt_cache_key {
+        if let Some(key) = config.cache_session_key() {
+            body["prompt_cache_key"] = serde_json::json!(key);
+        }
+    } else if config.cache_config.session_key.is_some() && config.cache_config.hints_enabled() {
+        // A *derived* key going unsent is a missed optimization and stays
+        // quiet. An *explicitly configured* one going unsent is a user
+        // instruction being discarded — someone isolating tenants gets exactly
+        // the sharing they were preventing. Matches the convention stated on
+        // `StreamConfig::output_schema` and honoured by five providers.
+        warn!(
+            "CacheConfig::session_key is set, but provider '{}' does not accept \
+             prompt_cache_key; the key is ignored and requests will not be routed \
+             by session",
+            model_config.provider
+        );
+    }
+
     // Structured outputs: native json_schema response format.
     if let Some(schema) = &config.output_schema {
         body["response_format"] = serde_json::json!({
@@ -671,7 +695,172 @@ mod tests {
         assert!(body.get("max_completion_tokens").is_none());
         assert_eq!(body["thinking"]["type"], "disabled");
         assert!(body.get("reasoning_effort").is_none());
+        // Anthropic's breakpoint markers never belong on this path.
         assert!(!body.to_string().contains("cache_control"));
+        // Nor does OpenAI's routing key: DeepSeek caches automatically and
+        // does not read it, so `supports_prompt_cache_key` stays off. Caching
+        // is enabled here — this asserts the compat gate, not the master
+        // switch.
+        assert!(config.cache_config.enabled);
+        assert!(!compat.supports_prompt_cache_key);
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    fn assistant(text: &str) -> Message {
+        Message::assistant(
+            vec![Content::Text { text: text.into() }],
+            StopReason::Stop,
+            "gpt-5.5",
+            "openai",
+            Usage::default(),
+        )
+    }
+
+    /// Build a body against native OpenAI, which is the only compat provider
+    /// with `supports_prompt_cache_key` on.
+    fn openai_body(cache_config: CacheConfig, messages: Vec<Message>) -> serde_json::Value {
+        let model_config = ModelConfig::openai("gpt-5.5", "GPT-5.5");
+        let compat = model_config.compat.as_ref().unwrap().clone();
+        let mut config = StreamConfig::new("gpt-5.5", "test");
+        config.system_prompt = "You are helpful.".into();
+        config.messages = messages;
+        config.model_config = Some(model_config.clone());
+        config.cache_config = cache_config;
+        build_request_body(&config, &model_config, &compat)
+    }
+
+    #[test]
+    fn prompt_cache_key_is_sent_when_caching_is_enabled() {
+        let body = openai_body(CacheConfig::default(), vec![Message::user("Hello")]);
+        let key = body["prompt_cache_key"]
+            .as_str()
+            .expect("enabled caching must send a routing key");
+        assert!(key.starts_with("yo-"), "unexpected key shape: {key}");
+    }
+
+    #[test]
+    fn prompt_cache_key_is_absent_when_caching_is_off() {
+        for cfg in [
+            CacheConfig::disabled(),
+            CacheConfig {
+                strategy: CacheStrategy::Disabled,
+                ..CacheConfig::default()
+            },
+        ] {
+            let body = openai_body(cfg, vec![Message::user("Hello")]);
+            assert!(
+                body.get("prompt_cache_key").is_none(),
+                "disabled caching must send no routing key"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_session_key_wins_over_derivation() {
+        let body = openai_body(
+            CacheConfig::default().with_session_key("tenant-42/session-7"),
+            vec![Message::user("Hello")],
+        );
+        assert_eq!(body["prompt_cache_key"], "tenant-42/session-7");
+    }
+
+    /// The point of keying on the *head* rather than the whole message list:
+    /// a key that changed every turn would route each request to a fresh cache
+    /// and defeat the feature it exists to serve.
+    #[test]
+    fn derived_key_is_stable_as_the_conversation_grows() {
+        let turn_1 = openai_body(CacheConfig::default(), vec![Message::user("Hello")]);
+        let turn_5 = openai_body(
+            CacheConfig::default(),
+            vec![
+                Message::user("Hello"),
+                assistant("Hi"),
+                Message::user("Second"),
+                assistant("Sure"),
+                Message::user("Third"),
+            ],
+        );
+        assert_eq!(turn_1["prompt_cache_key"], turn_5["prompt_cache_key"]);
+    }
+
+    #[test]
+    fn key_survives_a_compaction_marker_replacing_the_head() {
+        let normal = openai_body(
+            CacheConfig::default(),
+            vec![Message::user("Deploy the API")],
+        );
+        // What `compact_messages` leaves at index 0 once it drops the head.
+        // Referencing the constant rather than copying its text, so changing
+        // the marker cannot silently stop covering this scenario.
+        let compacted = openai_body(
+            CacheConfig::default(),
+            vec![
+                Message::user(crate::context::COMPACTION_MARKER),
+                Message::user("Later turn"),
+            ],
+        );
+        assert_eq!(normal["prompt_cache_key"], compacted["prompt_cache_key"]);
+    }
+
+    /// `prompt_cache_key` must reach **only** native OpenAI. The failure this
+    /// guards is the one the gate exists for: a strict compat server rejects
+    /// the entire request over an unknown field. Nothing else pins this — a
+    /// future preset written as `..OpenAiCompat::openai()` (the pattern
+    /// `gpt_5_5` already uses) would switch it on silently.
+    #[test]
+    fn prompt_cache_key_reaches_only_native_openai() {
+        let must_not_send = [
+            ModelConfig::deepseek("deepseek-v4-flash", "DeepSeek"),
+            ModelConfig::groq("llama-3.3-70b", "Llama"),
+            ModelConfig::xai("grok-4-1-fast", "Grok"),
+            ModelConfig::mistral("mistral-large", "Mistral"),
+            ModelConfig::zai("glm-4", "Z.ai"),
+            ModelConfig::qwen("qwen-max", "Qwen"),
+            ModelConfig::minimax("abab-6", "MiniMax"),
+            ModelConfig::meta("llama-4", "Meta"),
+        ];
+
+        for model_config in must_not_send {
+            let compat = model_config.compat.as_ref().cloned().unwrap_or_default();
+            assert!(
+                !compat.supports_prompt_cache_key,
+                "{} must not advertise prompt_cache_key support",
+                model_config.provider
+            );
+
+            let mut config = StreamConfig::new(model_config.id.clone(), "test");
+            config.system_prompt = "You are helpful.".into();
+            config.messages = vec![Message::user("Hello")];
+            config.model_config = Some(model_config.clone());
+
+            let body = build_request_body(&config, &model_config, &compat);
+            assert!(
+                body.get("prompt_cache_key").is_none(),
+                "{} must not receive prompt_cache_key",
+                model_config.provider
+            );
+        }
+
+        // ...and the one that must.
+        let openai = ModelConfig::openai("gpt-5.5", "GPT-5.5");
+        assert!(openai.compat.as_ref().unwrap().supports_prompt_cache_key);
+    }
+
+    /// An explicit key set against a provider that cannot carry it is a user
+    /// instruction being discarded; the request goes out without it and the
+    /// call site warns rather than dropping it silently.
+    #[test]
+    fn ungated_provider_sends_no_key_even_when_set_explicitly() {
+        let model_config = ModelConfig::deepseek("deepseek-v4-flash", "DeepSeek V4 Flash");
+        let compat = model_config.compat.as_ref().unwrap().clone();
+        let mut config = StreamConfig::new("deepseek-v4-flash", "test");
+        config.system_prompt = "You are helpful.".into();
+        config.messages = vec![Message::user("Hello")];
+        config.model_config = Some(model_config.clone());
+        config.cache_config = CacheConfig::default().with_session_key("tenant-42");
+
+        let body = build_request_body(&config, &model_config, &compat);
+        assert!(body.get("prompt_cache_key").is_none());
     }
 
     #[test]

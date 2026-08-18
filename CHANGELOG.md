@@ -90,6 +90,82 @@ adheres to [Semantic Versioning](https://semver.org/).
 - `StopReason` is documented as `#[non_exhaustive]`, which it has been since
   0.17.0 — the doc comment still claimed the opposite.
 
+- **`CacheStrategy` is no longer Anthropic-only**
+  ([#123](https://github.com/yologdev/yoagent/issues/123)). The 0.16.x line
+  engineered byte-stable compaction so cached prefixes survive — and that
+  engineering paid off on one protocol out of seven, because `cache_config`
+  was read only by `anthropic.rs`. This takes it to two of seven: Azure, the
+  OpenAI Responses path and Bedrock all accept cache directives and remain
+  unwired.
+
+  Native OpenAI now receives `prompt_cache_key`. OpenAI caches prefixes ≥1024
+  tokens automatically, so there are no breakpoints to place; the key routes
+  requests to a machine, and the cache itself stays content-addressed. It is
+  derived from the **system prompt**, which is the cacheable prefix and which
+  `StreamConfig` carries in its own field where compaction cannot reach it.
+
+  Sessions sharing a system prompt therefore share a key. That is the correct
+  grouping — they share the cached prefix — but it concentrates traffic, so
+  high-volume deployments should set the new `CacheConfig::session_key`
+  explicitly to spread load.
+
+  A first implementation also mixed in the first user message, for session
+  discrimination, and review caught that it does not survive the crate's own
+  compaction: `compact_messages` can drop the head and insert a *constant*
+  marker at index 0 (constant on purpose, so the cached prefix stays
+  byte-stable). The derived key then drifted mid-session **and** collapsed onto
+  one value for every session sharing a system prompt — failing precisely on
+  long sessions, which are the ones caching exists for. Session identity is not
+  recoverable from a per-request snapshot. `derived_key_survives_compaction_that_rewrites_the_head`
+  pins it; the original tests only appended messages, which is the one condition
+  under which the broken derivation held.
+
+  `CacheConfig` with every `Manual` flag off now means "no hints" on every
+  protocol, matching what Anthropic already did by placing no breakpoints.
+  Setting `session_key` on a provider that cannot carry it now warns rather
+  than discarding it silently, per the convention stated on
+  `StreamConfig::output_schema`.
+
+  Gated on the new `OpenAiCompat::supports_prompt_cache_key`, on only for
+  native OpenAI. The field is OpenAI's, and a strict compat server that
+  validates unknown keys would reject the request rather than ignore it.
+
+  **Gemini stays implicit-only, on purpose.** Its explicit caching is a
+  stateful `CachedContent` resource with its own handle, TTL and billing line
+  — not something `CacheStrategy` can express without misrepresenting it as a
+  per-request flag. Recorded in the `google` module docs so it isn't
+  re-litigated.
+
+  `CacheStrategy`'s rustdoc previously read *"Anthropic-specific; other
+  providers handle caching automatically regardless of this setting"* and is
+  rewritten around the two shapes — explicit-breakpoint vs key-routed vs
+  automatic — with a per-protocol table. Anthropic behaviour is unchanged.
+
+### Changed
+
+- **Breaking: `CacheConfig` is `#[non_exhaustive]`** and gained `session_key`.
+  Construct with `CacheConfig::new()` / `::disabled()` / `::default()` and the
+  `with_session_key` / `with_strategy` builders instead of a struct literal.
+  `with_strategy` exists because `CacheStrategy::Manual` would otherwise be
+  unreachable from outside the crate.
+
+- **Breaking: `OpenAiCompat` is `#[non_exhaustive]`** and gained
+  `supports_prompt_cache_key`. It is the crate's most literal instance of a
+  growing quirk list — ten flags, one per provider difference — and the
+  documented extension point for custom compat servers, so it was the struct
+  most likely to be literal-constructed downstream and the one where every
+  future flag would break users again. Construct from a preset
+  (`OpenAiCompat::openai()`, `::deepseek()`, …) or `Default::default()` and
+  adjust fields. The new flag carries `#[serde(default)]`, so a `ModelConfig`
+  persisted by an older version deserializes with cache routing **off** until
+  re-created from a preset.
+
+- **Breaking: `CacheStrategy` is `#[non_exhaustive]`.** It is a data/policy
+  enum whose growth this release was already debating, which is the crate's
+  stated test for the attribute (`StopReason` took the same trade; control-flow
+  enums like `ToolDecision` deliberately do not). Downstream `match` arms need
+  a `_ =>`.
+
 ### Fixed
 
 - **The `gasp` method surface is now closed mechanically, not by judgement**

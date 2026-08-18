@@ -115,6 +115,74 @@ impl StreamConfig {
             output_schema: None,
         }
     }
+
+    /// The cache-routing key for this request, or `None` when no key should be
+    /// sent.
+    ///
+    /// Returns [`CacheConfig::session_key`] when the caller set a non-blank
+    /// one. Otherwise derives a key from the **system prompt alone**.
+    ///
+    /// # Why only the system prompt
+    ///
+    /// `prompt_cache_key` routes a request to a machine; the cache itself is
+    /// content-addressed. So the key should group requests that share a
+    /// *cacheable prefix*, and the system prompt is exactly that prefix —
+    /// it is what the provider caches, and `StreamConfig` carries it in its
+    /// own field where compaction cannot reach it.
+    ///
+    /// An earlier version also mixed in the first user message, for session
+    /// discrimination. That was wrong, and measurably so: compaction rewrites
+    /// the head. When [`crate::context::compact_messages`] drops far enough to
+    /// re-enter `keep_within_budget`, it inserts a *constant* marker message at
+    /// index 0 — constant on purpose, so the cached prefix stays byte-stable.
+    /// The derived key then drifted mid-session **and** collapsed onto one
+    /// value for every session sharing a system prompt. Session identity is not
+    /// recoverable from a per-request snapshot; inferring it from mutable
+    /// content produced a key that failed exactly on long sessions, which are
+    /// the ones caching exists for.
+    ///
+    /// # Consequence, and the escape hatch
+    ///
+    /// Sessions sharing a system prompt now share a key **by design**. That is
+    /// the correct grouping — they share the cached prefix — but it also
+    /// concentrates traffic on one cache. High-volume deployments should set
+    /// [`CacheConfig::session_key`] explicitly to spread load, which is also
+    /// what OpenAI recommends for a hot key.
+    ///
+    /// Only consumed by key-routed protocols; providers taking explicit
+    /// breakpoints ignore it.
+    pub fn cache_session_key(&self) -> Option<String> {
+        let cache = &self.cache_config;
+        if !cache.hints_enabled() {
+            return None;
+        }
+        // A blank explicit key is worse than none: it would send
+        // `prompt_cache_key: ""` and route every such caller together. Treat it
+        // as unset rather than honouring it literally.
+        if let Some(key) = cache.session_key.as_deref().map(str::trim) {
+            if !key.is_empty() {
+                return Some(key.to_string());
+            }
+        }
+
+        match self.system_prompt.trim() {
+            "" => None,
+            sys => Some(format!("yo-{:016x}", fnv1a(sys))),
+        }
+    }
+}
+
+/// FNV-1a. Chosen over `DefaultHasher` for the same reason the GASP recorder
+/// does: `DefaultHasher` is neither guaranteed stable across Rust releases nor
+/// documented as such, and a cache key that moves between compiler versions
+/// silently stops matching.
+fn fnv1a(s: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in s.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// JSON-Schema constraint for structured outputs.
@@ -480,5 +548,219 @@ mod tests {
         assert!(!is_context_overflow_message("invalid api key"));
         assert!(!is_context_overflow_message("internal server error"));
         assert!(!is_context_overflow_message(""));
+    }
+
+    fn config_with(system: &str, messages: Vec<Message>) -> StreamConfig {
+        let mut c = StreamConfig::new("m", "k");
+        c.system_prompt = system.into();
+        c.messages = messages;
+        c
+    }
+
+    #[test]
+    fn session_key_is_none_when_caching_is_off() {
+        let mut c = config_with("sys", vec![Message::user("hi")]);
+        c.cache_config = CacheConfig::disabled();
+        assert!(c.cache_session_key().is_none());
+
+        c.cache_config = CacheConfig {
+            strategy: CacheStrategy::Disabled,
+            ..CacheConfig::default()
+        };
+        assert!(c.cache_session_key().is_none());
+    }
+
+    #[test]
+    fn explicit_session_key_is_returned_verbatim() {
+        let mut c = config_with("sys", vec![Message::user("hi")]);
+        c.cache_config = CacheConfig::default().with_session_key("abc");
+        assert_eq!(c.cache_session_key().as_deref(), Some("abc"));
+    }
+
+    /// The load-bearing property: appending turns must not move the key, or
+    /// every request routes to a fresh cache.
+    #[test]
+    fn derived_key_ignores_everything_after_the_first_user_message() {
+        let a = config_with("sys", vec![Message::user("first")]);
+        let b = config_with(
+            "sys",
+            vec![
+                Message::user("first"),
+                Message::user("second"),
+                Message::user("third"),
+            ],
+        );
+        assert_eq!(a.cache_session_key(), b.cache_session_key());
+        assert!(a.cache_session_key().is_some());
+    }
+
+    /// Regression: the key must survive **compaction**, not merely appending.
+    ///
+    /// The first version of this derivation mixed in the first user message.
+    /// `compact_messages` can drop the head and insert a deliberately constant
+    /// marker at index 0, so the key drifted mid-session *and* every session
+    /// sharing a system prompt collapsed onto one value — the exact
+    /// route-unrelated-sessions-together harm the empty-head guard exists to
+    /// prevent, arriving through a different door. Appending-only tests could
+    /// not see it, because they assert stability under the one condition where
+    /// the old derivation held.
+    #[test]
+    fn derived_key_survives_compaction_that_rewrites_the_head() {
+        use crate::context::{compact_messages, ContextConfig};
+
+        let cfg = ContextConfig {
+            // Small enough that the retained tail alone busts the target, which
+            // is what re-enters `keep_within_budget` and drops the head.
+            max_context_tokens: 400,
+            system_prompt_tokens: 0,
+            ..ContextConfig::default()
+        };
+
+        let conversation = |tag: &str| -> Vec<crate::types::AgentMessage> {
+            (0..80)
+                .map(|i| {
+                    crate::types::AgentMessage::Llm(Message::User {
+                        content: vec![Content::Text {
+                            text: format!("{tag} message {i} {}", "filler ".repeat(40)),
+                        }],
+                        timestamp: i as u64,
+                    })
+                })
+                .collect()
+        };
+
+        let key_of = |msgs: &[crate::types::AgentMessage]| {
+            let mut c = StreamConfig::new("m", "k");
+            c.system_prompt = "shared system prompt".into();
+            c.messages = msgs
+                .iter()
+                .filter_map(|m| match m {
+                    crate::types::AgentMessage::Llm(l) => Some(l.clone()),
+                    _ => None,
+                })
+                .collect();
+            c.cache_session_key()
+        };
+
+        let (a, b) = (conversation("alpha"), conversation("bravo"));
+        let (a_before, b_before) = (key_of(&a), key_of(&b));
+        let (a_len, b_len) = (a.len(), b.len());
+        let (a_compacted, b_compacted) = (compact_messages(a, &cfg), compact_messages(b, &cfg));
+
+        // Without this the test passes vacuously if a future ContextConfig
+        // default stops triggering compaction at this size.
+        assert!(
+            a_compacted.len() < a_len && b_compacted.len() < b_len,
+            "precondition: compaction must actually have fired"
+        );
+        assert!(
+            matches!(
+                &a_compacted[0],
+                crate::types::AgentMessage::Llm(Message::User { content, .. })
+                    if content.iter().any(|c| matches!(
+                        c, Content::Text { text } if text == crate::context::COMPACTION_MARKER
+                    ))
+            ),
+            "precondition: the head was dropped and replaced by the marker"
+        );
+
+        let (a_after, b_after) = (key_of(&a_compacted), key_of(&b_compacted));
+        assert!(a_before.is_some(), "precondition: a key is derived at all");
+        assert_eq!(a_before, a_after, "compaction must not move the key");
+        assert_eq!(b_before, b_after, "compaction must not move the key");
+    }
+
+    #[test]
+    fn distinct_system_prompts_derive_distinct_keys() {
+        let a = config_with("sys A", vec![Message::user("same")]);
+        let b = config_with("sys B", vec![Message::user("same")]);
+        assert_ne!(a.cache_session_key(), b.cache_session_key());
+    }
+
+    /// Documents the deliberate consequence of keying on the system prompt
+    /// alone: sessions of the same agent share a key. That is the correct
+    /// grouping — they share the cached prefix — and the reason
+    /// `session_key` exists for deployments that need them apart.
+    #[test]
+    fn sessions_sharing_a_system_prompt_share_a_key_by_design() {
+        let a = config_with("same", vec![Message::user("deploy the API")]);
+        let b = config_with("same", vec![Message::user("write a poem")]);
+        assert_eq!(a.cache_session_key(), b.cache_session_key());
+
+        let mut split = config_with("same", vec![Message::user("write a poem")]);
+        split.cache_config = CacheConfig::default().with_session_key("tenant-7/session-3");
+        assert_ne!(a.cache_session_key(), split.cache_session_key());
+    }
+
+    /// Message content of every kind is outside the derivation, so a
+    /// multimodal or tool-only head cannot produce a degenerate key.
+    #[test]
+    fn non_text_content_does_not_affect_the_key() {
+        let text_only = config_with("sys", vec![Message::user("hello")]);
+        let image_only = config_with(
+            "sys",
+            vec![Message::User {
+                content: vec![Content::Image {
+                    data: "AAAA".into(),
+                    mime_type: "image/png".into(),
+                }],
+                timestamp: 0,
+            }],
+        );
+        assert_eq!(
+            text_only.cache_session_key(),
+            image_only.cache_session_key()
+        );
+        assert!(text_only.cache_session_key().is_some());
+    }
+
+    /// Nothing distinctive to key on — hashing the empty string would route
+    /// unrelated sessions together, which is worse than sending no key.
+    #[test]
+    fn empty_system_prompt_yields_no_key() {
+        assert!(config_with("", vec![]).cache_session_key().is_none());
+        assert!(config_with("   ", vec![Message::user("hi")])
+            .cache_session_key()
+            .is_none());
+    }
+
+    /// A blank explicit key would send `prompt_cache_key: ""`, routing every
+    /// caller who did that onto one cache — strictly worse than no key.
+    #[test]
+    fn blank_explicit_session_key_is_treated_as_unset() {
+        let mut c = config_with("sys", vec![Message::user("hi")]);
+        c.cache_config = CacheConfig::default().with_session_key("   ");
+        assert_eq!(
+            c.cache_session_key(),
+            config_with("sys", vec![]).cache_session_key(),
+            "blank key must fall through to derivation, not send an empty string"
+        );
+    }
+
+    /// `Manual` with every flag off means "cache nothing" — Anthropic honours
+    /// it by placing no breakpoints, so a key-routed provider must not read the
+    /// same value as "yes".
+    #[test]
+    fn manual_with_all_flags_off_sends_no_key() {
+        let mut c = config_with("sys", vec![Message::user("hi")]);
+        c.cache_config = CacheConfig::default().with_strategy(CacheStrategy::Manual {
+            cache_system: false,
+            cache_tools: false,
+            cache_messages: false,
+        });
+        assert!(c.cache_session_key().is_none());
+
+        // But a Manual that asks for *something* still routes.
+        c.cache_config = CacheConfig::default().with_strategy(CacheStrategy::Manual {
+            cache_system: true,
+            cache_tools: false,
+            cache_messages: false,
+        });
+        assert!(c.cache_session_key().is_some());
+    }
+
+    #[test]
+    fn a_system_prompt_alone_is_enough_to_derive_a_key() {
+        assert!(config_with("sys", vec![]).cache_session_key().is_some());
     }
 }

@@ -568,15 +568,20 @@ fn build_request_body(config: &StreamConfig, is_oauth: bool) -> serde_json::Valu
     // When caching is disabled or strategy is Disabled, no markers are added.
     // -----------------------------------------------------------------------
     let cache = &config.cache_config;
-    let caching_enabled = cache.enabled && cache.strategy != CacheStrategy::Disabled;
+    // Shared with the key-routed path so every protocol agrees on what "off"
+    // means — including `Manual` with every flag false, which this match would
+    // resolve to `(false, false, false)` anyway but which a protocol reading
+    // only `enabled`/`Disabled` would otherwise treat as "on".
+    let caching_enabled = cache.hints_enabled();
     let (cache_system, cache_tools, cache_messages) = match &cache.strategy {
         CacheStrategy::Auto => (true, true, true),
-        CacheStrategy::Disabled => (false, false, false),
         CacheStrategy::Manual {
             cache_system,
             cache_tools,
             cache_messages,
         } => (*cache_system, *cache_tools, *cache_messages),
+        // `Disabled`, and anything added later, place nothing.
+        _ => (false, false, false),
     };
 
     // Breakpoint 3: scan backwards from second-to-last message to find one with
@@ -920,6 +925,7 @@ mod tests {
         let config = CacheConfig {
             enabled: false,
             strategy: CacheStrategy::Auto,
+            ..CacheConfig::default()
         };
         let body = build_request_body(&make_config(config), false);
 
@@ -951,6 +957,7 @@ mod tests {
                 cache_tools: false,
                 cache_messages: false,
             },
+            ..CacheConfig::default()
         };
         let body = build_request_body(&make_config(config), false);
 
@@ -1068,6 +1075,7 @@ mod tests {
             cache_config: CacheConfig {
                 enabled: false,
                 strategy: CacheStrategy::Disabled,
+                ..CacheConfig::default()
             },
             output_schema: None,
         };
@@ -1124,6 +1132,7 @@ mod tests {
             cache_config: CacheConfig {
                 enabled: false,
                 strategy: CacheStrategy::Disabled,
+                ..CacheConfig::default()
             },
             output_schema: None,
         };
