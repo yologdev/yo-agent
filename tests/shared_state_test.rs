@@ -1,7 +1,6 @@
 //! Tests for SharedState and its integration with SubAgentTool.
 
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 use yoagent::provider::mock::*;
 use yoagent::provider::MockProvider;
 use yoagent::provider::ModelConfig;
@@ -39,13 +38,7 @@ async fn test_sub_agent_reads_shared_state() {
     let result = sub_agent
         .execute(
             serde_json::json!({"task": "What happened in the build?"}),
-            ToolContext {
-                tool_call_id: "tc-1".into(),
-                tool_name: "analyzer".into(),
-                cancel: CancellationToken::new(),
-                on_update: None,
-                on_progress: None,
-            },
+            ToolContext::new("tc-1", "analyzer"),
         )
         .await
         .expect("sub-agent should succeed");
@@ -87,13 +80,7 @@ async fn test_sub_agent_writes_shared_state() {
     sub_agent
         .execute(
             serde_json::json!({"task": "Summarize"}),
-            ToolContext {
-                tool_call_id: "tc-1".into(),
-                tool_name: "writer".into(),
-                cancel: CancellationToken::new(),
-                on_update: None,
-                on_progress: None,
-            },
+            ToolContext::new("tc-1", "writer"),
         )
         .await
         .expect("sub-agent should succeed");
@@ -150,13 +137,7 @@ async fn test_parallel_sub_agents_share_state() {
         .with_system_prompt("You are agent B.")
         .with_shared_state(state.clone());
 
-    let ctx = || ToolContext {
-        tool_call_id: "tc".into(),
-        tool_name: "test".into(),
-        cancel: CancellationToken::new(),
-        on_update: None,
-        on_progress: None,
-    };
+    let ctx = || ToolContext::new("tc", "test");
 
     // Run in parallel
     let (ra, rb) = tokio::join!(
@@ -186,13 +167,7 @@ async fn test_sub_agent_without_shared_state_unchanged() {
     let result = sub_agent
         .execute(
             serde_json::json!({"task": "say hi"}),
-            ToolContext {
-                tool_call_id: "tc-1".into(),
-                tool_name: "plain".into(),
-                cancel: CancellationToken::new(),
-                on_update: None,
-                on_progress: None,
-            },
+            ToolContext::new("tc-1", "plain"),
         )
         .await
         .expect("should work without shared state");
@@ -231,13 +206,7 @@ async fn test_shared_state_summary_in_system_prompt() {
     let result = sub_agent
         .execute(
             serde_json::json!({"task": "list"}),
-            ToolContext {
-                tool_call_id: "tc-1".into(),
-                tool_name: "lister".into(),
-                cancel: CancellationToken::new(),
-                on_update: None,
-                on_progress: None,
-            },
+            ToolContext::new("tc-1", "lister"),
         )
         .await
         .unwrap();

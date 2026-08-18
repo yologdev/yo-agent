@@ -88,13 +88,7 @@ const SPEC: &str = r#"{
 }"#;
 
 fn test_ctx() -> ToolContext {
-    ToolContext {
-        tool_call_id: "tc-1".into(),
-        tool_name: "test".into(),
-        cancel: tokio_util::sync::CancellationToken::new(),
-        on_update: None,
-        on_progress: None,
-    }
+    ToolContext::new("tc-1", "test")
 }
 
 // ---------------------------------------------------------------------------

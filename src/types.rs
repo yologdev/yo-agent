@@ -585,7 +585,11 @@ pub type ProgressFn = Arc<dyn Fn(String) + Send + Sync>;
 /// Context passed to tool execution. Bundles all per-invocation state.
 ///
 /// Using a struct instead of individual parameters future-proofs the trait —
-/// adding fields to `ToolContext` is non-breaking.
+/// adding fields to `ToolContext` is non-breaking, which `#[non_exhaustive]`
+/// is what actually makes true. Tools receive this rather than build it, so
+/// the attribute costs implementors nothing; it only stops a struct literal in
+/// downstream test code from breaking on every new field.
+#[non_exhaustive]
 pub struct ToolContext {
     /// The ID of this tool call (for correlation).
     pub tool_call_id: String,
@@ -597,6 +601,42 @@ pub struct ToolContext {
     pub on_update: Option<ToolUpdateFn>,
     /// Optional callback for emitting user-facing progress messages.
     pub on_progress: Option<ProgressFn>,
+}
+
+impl ToolContext {
+    /// A context for one tool invocation, with no cancellation token and no
+    /// callbacks.
+    ///
+    /// This struct is `#[non_exhaustive]`, so downstream crates build it here
+    /// rather than with a struct literal. The loop constructs the real one;
+    /// this is for tests and for callers driving a tool directly.
+    pub fn new(tool_call_id: impl Into<String>, tool_name: impl Into<String>) -> Self {
+        Self {
+            tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            on_update: None,
+            on_progress: None,
+        }
+    }
+
+    /// Use the given cancellation token instead of a fresh one.
+    pub fn with_cancel(mut self, cancel: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// Stream partial [`ToolResult`]s to this callback (UI/logging only).
+    pub fn with_on_update(mut self, on_update: ToolUpdateFn) -> Self {
+        self.on_update = Some(on_update);
+        self
+    }
+
+    /// Emit user-facing progress messages through this callback.
+    pub fn with_on_progress(mut self, on_progress: ProgressFn) -> Self {
+        self.on_progress = Some(on_progress);
+        self
+    }
 }
 
 impl Clone for ToolContext {

@@ -9,23 +9,11 @@ use yoagent::types::*;
 
 /// Helper to build a ToolContext for tests.
 fn ctx(name: &str) -> ToolContext {
-    ToolContext {
-        tool_call_id: "t1".into(),
-        tool_name: name.into(),
-        cancel: CancellationToken::new(),
-        on_update: None,
-        on_progress: None,
-    }
+    ToolContext::new("t1", name)
 }
 
 fn ctx_with_cancel(name: &str, cancel: CancellationToken) -> ToolContext {
-    ToolContext {
-        tool_call_id: "t1".into(),
-        tool_name: name.into(),
-        cancel,
-        on_update: None,
-        on_progress: None,
-    }
+    ToolContext::new("t1", name).with_cancel(cancel)
 }
 
 #[tokio::test]

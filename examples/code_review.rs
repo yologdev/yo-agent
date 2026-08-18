@@ -98,11 +98,8 @@ async fn main() {
     let make_ctx = |label: &str| -> (ToolContext, Arc<Mutex<String>>) {
         let label = label.to_string();
         let buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-        let ctx = ToolContext {
-            tool_call_id: format!("tc-{}", label),
-            tool_name: label.clone(),
-            cancel: tokio_util::sync::CancellationToken::new(),
-            on_update: Some(Arc::new({
+        let ctx =
+            ToolContext::new(format!("tc-{}", label), label.clone()).with_on_update(Arc::new({
                 let label = label.clone();
                 let buf = buf.clone();
                 move |result: ToolResult| {
@@ -125,9 +122,7 @@ async fn main() {
                         }
                     }
                 }
-            })),
-            on_progress: None,
-        };
+            }));
         (ctx, buf)
     };
 
