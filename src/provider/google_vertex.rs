@@ -4,6 +4,10 @@
 //! and a different base URL pattern with project/location.
 //!
 //! The API key in StreamConfig is expected to be an OAuth2 access token.
+//!
+//! Prompt caching behaves exactly as in [`super::google`], including the
+//! reasoning for why explicit `CachedContent` is deliberately not wired — see
+//! that module's docs rather than re-deriving it here.
 //! Callers are responsible for obtaining the token (e.g., via service account JWT).
 
 use super::model::ModelConfig;

@@ -97,7 +97,15 @@ pub enum ThinkingFormat {
 
 /// Compatibility flags for OpenAI-compatible providers.
 /// Different providers have different quirks even though they share the same base API.
+///
+/// Marked `#[non_exhaustive]`: this is the crate's most literal instance of a
+/// growing quirk list — every new provider difference adds a flag, and without
+/// the attribute each one is a downstream break. Construct from a preset
+/// ([`OpenAiCompat::openai`], [`OpenAiCompat::deepseek`], …) or
+/// [`Default::default`] and adjust fields. New flags carry `#[serde(default)]`
+/// so persisted configs keep deserializing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct OpenAiCompat {
     /// Supports the `store` parameter for conversation persistence.
     pub supports_store: bool,

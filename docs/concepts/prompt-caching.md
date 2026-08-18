@@ -11,11 +11,19 @@ In a multi-turn agent loop, each request sends the full context: system prompt +
 | Provider | Caching Type | Savings | Framework Action |
 |----------|-------------|---------|-----------------|
 | **Anthropic** | Explicit (cache breakpoints) | 90% on hits | ✅ Auto-placed `cache_control` |
-| **OpenAI** | Automatic (>1024 tokens), key-routed | 50% on hits | ✅ Sends `prompt_cache_key` |
-| **DeepSeek** | Automatic prefix cache | Varies by model | None needed |
+| **OpenAI** | Automatic (>1024 tokens), key-routed | 90% on hits | ✅ Sends `prompt_cache_key` |
+| **DeepSeek** | Automatic prefix cache | ~97% on hits | None needed |
 | **Google Gemini** | Implicit (automatic) | Varies | None needed — see below |
-| **Azure OpenAI** | Automatic (same as OpenAI) | 50% on hits | None needed |
-| **Amazon Bedrock** | None (no automatic caching) | — | Not supported |
+| **Azure OpenAI** | Automatic (same as OpenAI) | 90% on hits | Not wired |
+| **OpenAI Responses** | Automatic, key-routed | 90% on hits | Not wired |
+| **Amazon Bedrock** | Explicit (`cachePoint` blocks) | — | Not wired |
+
+Savings are the cached-read discount off base input in this crate's own price
+presets (`CostConfig`) — e.g. `gpt_5_5` prices input at $5/MTok and cache reads
+at $0.50. They are model-dependent; check `CostConfig` for the model you use.
+
+"Not wired" means the provider supports something and yoagent does not send it
+yet, as distinct from "None needed", where the provider caches on its own.
 
 Providers cache in two different shapes, and `CacheStrategy` means something
 different in each. **Explicit breakpoints** (Anthropic) let the client choose
@@ -43,25 +51,34 @@ This means on a typical multi-turn conversation, only the latest user message an
 ### OpenAI
 
 OpenAI caches prefixes of roughly 1024 tokens or more on its own, so there is
-nothing to place. What yoagent sends is `prompt_cache_key`, which routes
-requests from one conversation toward the same cache — useful when many
-sessions run concurrently and would otherwise contend.
+nothing to place. What yoagent sends is `prompt_cache_key`, which routes a
+request to a machine while the cache itself stays content-addressed.
 
 The key comes from `CacheConfig::session_key` when you set one, and is
-otherwise derived from the request's **stable head**: the system prompt plus
-the first user message. Keying on the head rather than the whole message list
-is the load-bearing part — a key that changed every turn would route each
-request to a fresh cache and defeat the feature.
+otherwise derived from the **system prompt alone**. That is the cacheable
+prefix — the thing the provider actually caches — and `StreamConfig` carries it
+in its own field, where compaction cannot reach it.
+
+An earlier version mixed in the first user message too, for session
+discrimination. It did not survive yoagent's own compaction: `compact_messages`
+can drop the head and insert a *constant* marker at index 0 (constant on
+purpose, so the cached prefix stays byte-stable). The key drifted mid-session
+**and** every session sharing a system prompt collapsed onto one value —
+failing precisely on long sessions, which are the ones caching exists for.
+Session identity is not recoverable from a per-request snapshot.
+
+**So sessions sharing a system prompt share a key by design.** That is the
+correct grouping — they share the cached prefix — but it concentrates traffic
+on one cache. Set `session_key` explicitly to spread load, which is also what
+OpenAI recommends for a hot key:
 
 ```rust,ignore
-// Explicit, when sessions must be routed apart or the head isn't distinctive.
 let agent = Agent::from_config(ModelConfig::openai("gpt-5.5", "GPT-5.5"))
-    .with_cache_config(CacheConfig::default().with_session_key(format!("tenant-{id}")));
+    .with_cache_config(CacheConfig::default().with_session_key(format!("tenant-{id}/{session_id}")));
 ```
 
-Set it explicitly when two sessions could legitimately open with identical text
-— a shared system prompt and a templated first message will otherwise derive
-the same key.
+A blank key is treated as unset rather than sent literally — an empty
+`prompt_cache_key` would route every caller who did that onto one cache.
 
 This is gated on the `supports_prompt_cache_key` compat flag, which is on only
 for native OpenAI. `prompt_cache_key` is OpenAI's field: a strict
@@ -103,29 +120,32 @@ Caching is **enabled by default** with automatic breakpoint placement. No config
 use yoagent::{CacheConfig, CacheStrategy};
 
 let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Claude Sonnet 5"))
-    .with_cache_config(CacheConfig {
-        enabled: false,
-        ..Default::default()
-    });
+    .with_cache_config(CacheConfig::disabled());
 ```
 
-This disables yoagent-managed cache hints for providers such as Anthropic. It
-does not turn off automatic server-side caching for providers such as DeepSeek
-or OpenAI.
+This suppresses every cache hint yoagent would send — Anthropic's
+`cache_control` breakpoints and OpenAI's `prompt_cache_key` alike. It does
+**not** turn off a provider's automatic server-side caching, such as DeepSeek's
+or Gemini's, which is not under client control.
 
 ### Fine-Grained Control
 
 ```rust
 let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Claude Sonnet 5"))
-    .with_cache_config(CacheConfig {
-        enabled: true,
-        strategy: CacheStrategy::Manual {
-            cache_system: true,
-            cache_tools: true,
-            cache_messages: false, // Don't cache conversation history
-        },
-    });
+    .with_cache_config(CacheConfig::new().with_strategy(CacheStrategy::Manual {
+        cache_system: true,
+        cache_tools: true,
+        cache_messages: false, // Don't cache conversation history
+    }));
 ```
+
+`CacheConfig` is `#[non_exhaustive]`, so construct it with `new()` / `disabled()`
+/ `default()` plus the `with_strategy` and `with_session_key` builders rather
+than a struct literal.
+
+Setting every `Manual` flag to `false` means "cache nothing" and is treated as
+equivalent to `Disabled` on every protocol — including key-routed ones, which
+send no key in that case.
 
 ## Monitoring Cache Usage
 

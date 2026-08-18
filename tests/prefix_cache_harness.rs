@@ -15,8 +15,11 @@
 //! 1. **History stability** — does compaction rewrite the prefix? Measured here,
 //!    strategy-agnostic, via [`measure`].
 //! 2. **Breakpoint placement** — do providers actually emit `cache_control` (or
-//!    the OpenAI / Gemini equivalents) at the stable boundary? Not measured yet;
-//!    `CacheStrategy` is currently honoured only by `anthropic.rs`.
+//!    the OpenAI / Gemini equivalents) at the stable boundary? Not measured
+//!    here. `CacheStrategy` reaches two protocols so far: `anthropic.rs` places
+//!    `cache_control`, and `openai_compat.rs` sends `prompt_cache_key` for
+//!    native OpenAI (yologdev/yoagent#123). Azure, the OpenAI Responses path
+//!    and Bedrock accept cache directives and remain unwired.
 //!
 //! Work on (2) should extend this file with provider-side assertions rather than
 //! reimplement session simulation. [`SessionShape`] and [`Report`] are the seam:
