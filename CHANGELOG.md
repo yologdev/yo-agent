@@ -90,6 +90,42 @@ adheres to [Semantic Versioning](https://semver.org/).
 - `StopReason` is documented as `#[non_exhaustive]`, which it has been since
   0.17.0 — the doc comment still claimed the opposite.
 
+- **Cache breakpoint parity: `CacheStrategy` is no longer Anthropic-only**
+  ([#123](https://github.com/yologdev/yoagent/issues/123)). The 0.16.x line
+  engineered byte-stable compaction so cached prefixes survive — and that
+  engineering paid off on one protocol out of seven, because `cache_config`
+  was read only by `anthropic.rs`.
+
+  Native OpenAI now receives `prompt_cache_key`. OpenAI caches prefixes ≥1024
+  tokens automatically, so there are no breakpoints to place; the key routes
+  requests from one conversation toward the same cache. It is derived from the
+  request's **stable head** — system prompt plus first user message — so it
+  does not move as turns accumulate; a key that changed every turn would route
+  each request to a fresh cache and defeat the point. Override with the new
+  `CacheConfig::session_key` when sessions must be routed apart, or when two
+  sessions could open with identical text.
+
+  Gated on the new `OpenAiCompat::supports_prompt_cache_key`, on only for
+  native OpenAI. The field is OpenAI's, and a strict compat server that
+  validates unknown keys would reject the request rather than ignore it.
+
+  **Gemini stays implicit-only, on purpose.** Its explicit caching is a
+  stateful `CachedContent` resource with its own handle, TTL and billing line
+  — not something `CacheStrategy` can express without misrepresenting it as a
+  per-request flag. Recorded in the `google` module docs so it isn't
+  re-litigated.
+
+  `CacheStrategy`'s rustdoc previously read *"Anthropic-specific; other
+  providers handle caching automatically regardless of this setting"* and is
+  rewritten around the two shapes — explicit-breakpoint vs key-routed vs
+  automatic — with a per-protocol table. Anthropic behaviour is unchanged.
+
+### Changed
+
+- **Breaking: `CacheConfig` is `#[non_exhaustive]`** and gained `session_key`.
+  Construct with `CacheConfig::new()` / `::disabled()` / `::default()` and the
+  `with_session_key` builder instead of a struct literal.
+
 ### Fixed
 
 - **The `gasp` method surface is now closed mechanically, not by judgement**

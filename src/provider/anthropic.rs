@@ -920,6 +920,7 @@ mod tests {
         let config = CacheConfig {
             enabled: false,
             strategy: CacheStrategy::Auto,
+            ..CacheConfig::default()
         };
         let body = build_request_body(&make_config(config), false);
 
@@ -951,6 +952,7 @@ mod tests {
                 cache_tools: false,
                 cache_messages: false,
             },
+            ..CacheConfig::default()
         };
         let body = build_request_body(&make_config(config), false);
 
@@ -1068,6 +1070,7 @@ mod tests {
             cache_config: CacheConfig {
                 enabled: false,
                 strategy: CacheStrategy::Disabled,
+                ..CacheConfig::default()
             },
             output_schema: None,
         };
@@ -1124,6 +1127,7 @@ mod tests {
             cache_config: CacheConfig {
                 enabled: false,
                 strategy: CacheStrategy::Disabled,
+                ..CacheConfig::default()
             },
             output_schema: None,
         };

@@ -119,6 +119,14 @@ pub struct OpenAiCompat {
     pub requires_assistant_after_tool_result: bool,
     /// How thinking/reasoning content is formatted in streaming.
     pub thinking_format: ThinkingFormat,
+    /// Accepts OpenAI's `prompt_cache_key` for routing cache lookups.
+    ///
+    /// Off by default: the field is OpenAI's, and a strict compat server that
+    /// validates unknown keys would reject the whole request rather than
+    /// ignore it. Providers that cache automatically (DeepSeek, Groq) lose
+    /// nothing by leaving this off — they were never reading it.
+    #[serde(default)]
+    pub supports_prompt_cache_key: bool,
 }
 
 impl Default for OpenAiCompat {
@@ -133,6 +141,7 @@ impl Default for OpenAiCompat {
             requires_tool_result_name: false,
             requires_assistant_after_tool_result: false,
             thinking_format: ThinkingFormat::OpenAi,
+            supports_prompt_cache_key: false,
         }
     }
 }
@@ -146,6 +155,7 @@ impl OpenAiCompat {
             supports_reasoning_effort: true,
             supports_usage_in_streaming: true,
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
+            supports_prompt_cache_key: true,
             ..Default::default()
         }
     }

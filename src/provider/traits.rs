@@ -115,6 +115,64 @@ impl StreamConfig {
             output_schema: None,
         }
     }
+
+    /// The cache-routing key for this request, or `None` when caching hints
+    /// are switched off.
+    ///
+    /// Returns [`CacheConfig::session_key`] when the caller set one. Otherwise
+    /// derives a key from the request's **stable head** — the system prompt
+    /// plus the first user message — which is the part of a conversation that
+    /// does not change as turns accumulate. Deriving from the whole message
+    /// list would produce a new key every turn and defeat the point.
+    ///
+    /// Only consumed by key-routed protocols; providers taking explicit
+    /// breakpoints ignore it.
+    pub fn cache_session_key(&self) -> Option<String> {
+        let cache = &self.cache_config;
+        if !cache.enabled || cache.strategy == CacheStrategy::Disabled {
+            return None;
+        }
+        if let Some(key) = &cache.session_key {
+            return Some(key.clone());
+        }
+
+        let first_user = self.messages.iter().find_map(|m| match m {
+            Message::User { content, .. } => Some(
+                content
+                    .iter()
+                    .filter_map(|c| match c {
+                        Content::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            _ => None,
+        });
+
+        // A head with neither a system prompt nor a user message has nothing
+        // distinctive to key on; sending a hash of "" would route unrelated
+        // sessions together, which is worse than sending nothing.
+        let head = match (self.system_prompt.as_str(), first_user.as_deref()) {
+            ("", None) | ("", Some("")) => return None,
+            (sys, user) => format!("{sys}\u{1f}{}", user.unwrap_or_default()),
+        };
+
+        Some(format!("yo-{:016x}", fnv1a(&head)))
+    }
+}
+
+/// FNV-1a. Chosen over `DefaultHasher` for the same reason the GASP recorder
+/// does: `DefaultHasher` is neither guaranteed stable across Rust releases nor
+/// documented as such, and a cache key that moves between compiler versions
+/// silently stops matching.
+fn fnv1a(s: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in s.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// JSON-Schema constraint for structured outputs.
@@ -480,5 +538,91 @@ mod tests {
         assert!(!is_context_overflow_message("invalid api key"));
         assert!(!is_context_overflow_message("internal server error"));
         assert!(!is_context_overflow_message(""));
+    }
+
+    fn config_with(system: &str, messages: Vec<Message>) -> StreamConfig {
+        let mut c = StreamConfig::new("m", "k");
+        c.system_prompt = system.into();
+        c.messages = messages;
+        c
+    }
+
+    #[test]
+    fn session_key_is_none_when_caching_is_off() {
+        let mut c = config_with("sys", vec![Message::user("hi")]);
+        c.cache_config = CacheConfig::disabled();
+        assert!(c.cache_session_key().is_none());
+
+        c.cache_config = CacheConfig {
+            strategy: CacheStrategy::Disabled,
+            ..CacheConfig::default()
+        };
+        assert!(c.cache_session_key().is_none());
+    }
+
+    #[test]
+    fn explicit_session_key_is_returned_verbatim() {
+        let mut c = config_with("sys", vec![Message::user("hi")]);
+        c.cache_config = CacheConfig::default().with_session_key("abc");
+        assert_eq!(c.cache_session_key().as_deref(), Some("abc"));
+    }
+
+    /// The load-bearing property: appending turns must not move the key, or
+    /// every request routes to a fresh cache.
+    #[test]
+    fn derived_key_ignores_everything_after_the_first_user_message() {
+        let a = config_with("sys", vec![Message::user("first")]);
+        let b = config_with(
+            "sys",
+            vec![
+                Message::user("first"),
+                Message::user("second"),
+                Message::user("third"),
+            ],
+        );
+        assert_eq!(a.cache_session_key(), b.cache_session_key());
+        assert!(a.cache_session_key().is_some());
+    }
+
+    #[test]
+    fn derived_key_separates_distinct_heads() {
+        let by_system = (
+            config_with("sys A", vec![Message::user("same")]),
+            config_with("sys B", vec![Message::user("same")]),
+        );
+        assert_ne!(
+            by_system.0.cache_session_key(),
+            by_system.1.cache_session_key()
+        );
+
+        let by_user = (
+            config_with("same", vec![Message::user("user A")]),
+            config_with("same", vec![Message::user("user B")]),
+        );
+        assert_ne!(by_user.0.cache_session_key(), by_user.1.cache_session_key());
+    }
+
+    /// A separator between the two halves, so that ("ab", "c") and ("a", "bc")
+    /// cannot collide into the same key.
+    #[test]
+    fn derived_key_is_not_confusable_across_the_field_boundary() {
+        let a = config_with("ab", vec![Message::user("c")]);
+        let b = config_with("a", vec![Message::user("bc")]);
+        assert_ne!(a.cache_session_key(), b.cache_session_key());
+    }
+
+    /// Nothing distinctive to key on — hashing the empty string would route
+    /// unrelated sessions together, which is worse than sending no key.
+    #[test]
+    fn empty_head_yields_no_key() {
+        assert!(config_with("", vec![]).cache_session_key().is_none());
+        assert!(config_with("", vec![Message::user("")])
+            .cache_session_key()
+            .is_none());
+    }
+
+    #[test]
+    fn a_system_prompt_alone_is_enough_to_derive_a_key() {
+        assert!(config_with("sys", vec![]).cache_session_key().is_some());
     }
 }

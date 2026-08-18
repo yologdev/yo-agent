@@ -10,12 +10,25 @@ In a multi-turn agent loop, each request sends the full context: system prompt +
 
 | Provider | Caching Type | Savings | Framework Action |
 |----------|-------------|---------|-----------------|
-| **Anthropic** | Explicit (cache breakpoints) | 90% on hits | ✅ Auto-placed |
-| **OpenAI** | Automatic (>1024 tokens) | 50% on hits | None needed |
+| **Anthropic** | Explicit (cache breakpoints) | 90% on hits | ✅ Auto-placed `cache_control` |
+| **OpenAI** | Automatic (>1024 tokens), key-routed | 50% on hits | ✅ Sends `prompt_cache_key` |
 | **DeepSeek** | Automatic prefix cache | Varies by model | None needed |
-| **Google Gemini** | Implicit (automatic) | Varies | None needed |
+| **Google Gemini** | Implicit (automatic) | Varies | None needed — see below |
 | **Azure OpenAI** | Automatic (same as OpenAI) | 50% on hits | None needed |
 | **Amazon Bedrock** | None (no automatic caching) | — | Not supported |
+
+Providers cache in two different shapes, and `CacheStrategy` means something
+different in each. **Explicit breakpoints** (Anthropic) let the client choose
+cache boundaries and charge a write premium for them — that is what `Auto` and
+`Manual` place. **Key-routed** (OpenAI) caches automatically once a prefix
+passes ~1024 tokens; there are no boundaries to choose, and `prompt_cache_key`
+only steers requests from one conversation toward the same cache. Everything
+else caches server-side with nothing to configure, and `CacheStrategy` is inert
+— including `Disabled`, which cannot switch off caching the client never
+requested.
+
+The practical consequence: **a hit rate is not comparable across protocols
+without knowing which shape produced it.** See the measured comparison below.
 
 ### What Gets Cached (Anthropic)
 
@@ -27,6 +40,35 @@ yoagent places up to 3 cache breakpoints automatically:
 
 This means on a typical multi-turn conversation, only the latest user message and the new assistant response cost full price.
 
+### OpenAI
+
+OpenAI caches prefixes of roughly 1024 tokens or more on its own, so there is
+nothing to place. What yoagent sends is `prompt_cache_key`, which routes
+requests from one conversation toward the same cache — useful when many
+sessions run concurrently and would otherwise contend.
+
+The key comes from `CacheConfig::session_key` when you set one, and is
+otherwise derived from the request's **stable head**: the system prompt plus
+the first user message. Keying on the head rather than the whole message list
+is the load-bearing part — a key that changed every turn would route each
+request to a fresh cache and defeat the feature.
+
+```rust,ignore
+// Explicit, when sessions must be routed apart or the head isn't distinctive.
+let agent = Agent::from_config(ModelConfig::openai("gpt-5.5", "GPT-5.5"))
+    .with_cache_config(CacheConfig::default().with_session_key(format!("tenant-{id}")));
+```
+
+Set it explicitly when two sessions could legitimately open with identical text
+— a shared system prompt and a templated first message will otherwise derive
+the same key.
+
+This is gated on the `supports_prompt_cache_key` compat flag, which is on only
+for native OpenAI. `prompt_cache_key` is OpenAI's field: a strict
+OpenAI-compatible server that validates unknown keys would reject the whole
+request rather than ignore it, and the providers that cache automatically were
+never reading it.
+
 ### DeepSeek
 
 DeepSeek's API manages context caching automatically. yoagent does not send
@@ -34,6 +76,22 @@ Anthropic-style `cache_control` markers for DeepSeek; instead, keep stable
 prefixes stable (system prompt, tool definitions, and earlier messages) and
 monitor DeepSeek's `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
 usage fields through `Usage.cache_read` and `Usage.input`.
+
+### Google Gemini — implicit only, deliberately
+
+yoagent sends no cache directives to Gemini and ignores `CacheStrategy` there.
+Gemini caches implicitly, and the `cachedContentTokenCount` yoagent reads back
+into `Usage.cache_read` reports that automatic behaviour — it is telemetry, not
+an acknowledgement of anything the client asked for.
+
+Gemini's *explicit* caching is a different kind of thing: you create a
+`CachedContent` object, get a handle, reference it by name on later requests,
+and manage its TTL and its own billing line. That does not fit behind
+`CacheStrategy`, which describes where to put markers inside a single request.
+Wiring it there would mean either misrepresenting a stateful server-side
+resource as a per-request flag, or silently creating objects whose lifetime the
+caller cannot see. It is worth doing as its own API, and it is not worth
+pretending the current enum can express it.
 
 ## Configuration
 

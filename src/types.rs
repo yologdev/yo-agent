@@ -336,19 +336,56 @@ impl Usage {
 // Cache configuration
 // ---------------------------------------------------------------------------
 
-/// Controls yoagent-managed prompt caching hints for providers that support
-/// explicit cache controls.
+/// Controls yoagent-managed prompt caching hints.
 ///
-/// By default, caching is enabled with automatic breakpoint placement.
-/// Providers with automatic server-side caching, such as DeepSeek, may ignore
-/// this setting.
+/// By default, caching is enabled with automatic breakpoint placement. What
+/// that produces on the wire depends on the protocol — see [`CacheStrategy`]
+/// for the per-provider table. `enabled: false` suppresses every hint yoagent
+/// would otherwise send; it cannot switch off a provider's *automatic*
+/// server-side caching, which is not under client control.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CacheConfig {
     /// Master switch — set to false to disable all caching hints.
     /// Default: true.
     pub enabled: bool,
     /// How cache breakpoints are placed.
     pub strategy: CacheStrategy,
+    /// Stable identifier for this conversation, for providers that route cache
+    /// lookups by key rather than by explicit breakpoints (OpenAI's
+    /// `prompt_cache_key`).
+    ///
+    /// Leave `None` and one is derived from the request's stable head — the
+    /// system prompt plus the first user message. That derivation is correct
+    /// for the common case and costs nothing, but two sessions opening with
+    /// identical text share a key. Set this explicitly when sessions must be
+    /// routed apart, or when the head is not distinctive.
+    ///
+    /// Ignored by protocols that take explicit breakpoints instead.
+    #[serde(default)]
+    pub session_key: Option<String>,
+}
+
+impl CacheConfig {
+    /// Caching enabled with automatic breakpoint placement — same as
+    /// [`Default`], in a form that survives new fields being added.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// All caching hints suppressed.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+
+    /// Set the session key used by key-routed providers.
+    pub fn with_session_key(mut self, key: impl Into<String>) -> Self {
+        self.session_key = Some(key.into());
+        self
+    }
 }
 
 impl Default for CacheConfig {
@@ -356,6 +393,7 @@ impl Default for CacheConfig {
         Self {
             enabled: true,
             strategy: CacheStrategy::Auto,
+            session_key: None,
         }
     }
 }
@@ -383,18 +421,62 @@ pub enum ToolExecutionStrategy {
     Batched { size: usize },
 }
 
-/// Strategy for placing cache breakpoints (Anthropic-specific; other providers
-/// handle caching automatically regardless of this setting).
+/// Strategy for prompt caching.
+///
+/// Providers expose caching in two different shapes, and this enum means
+/// something different in each:
+///
+/// | protocol | shape | what this enum controls |
+/// |---|---|---|
+/// | `Anthropic` | explicit breakpoints | where `cache_control` markers are placed |
+/// | `OpenAiCompat` (OpenAI proper) | key-routed | whether `prompt_cache_key` is sent |
+/// | `OpenAiCompat` (others), `Google`, `GoogleVertex`, `OpenAiResponses`, `AzureOpenAi`, `Bedrock` | automatic, server-side | nothing — see below |
+///
+/// **Explicit breakpoints** (Anthropic) are the model this enum was designed
+/// around: the client chooses cache boundaries and pays a write premium for
+/// them. [`Auto`](Self::Auto) and [`Manual`](Self::Manual) select which
+/// boundaries.
+///
+/// **Key-routed** (OpenAI) caches automatically on prefixes of ~1024 tokens or
+/// more; there are no breakpoints to place. `prompt_cache_key` only improves
+/// *routing* — it steers requests from one conversation toward the same cache
+/// — so the `Auto`/`Manual` distinction has nothing to act on and both send the
+/// key. Only [`Disabled`](Self::Disabled) is meaningful. The key comes from
+/// [`CacheConfig::session_key`], or is derived from the request head. Gated on
+/// [`OpenAiCompat::supports_prompt_cache_key`](crate::provider::OpenAiCompat),
+/// because the field is OpenAI's and strict compat servers reject unknown keys.
+///
+/// **Automatic, server-side** (DeepSeek, Gemini, and the rest) caches on its
+/// own with nothing to configure. DeepSeek quantises hits to 64-token blocks
+/// and charges nothing to populate; Gemini reports `cachedContentTokenCount`
+/// but its explicit cached-content API is a separate create-then-reference
+/// resource with its own TTL and billing, deliberately not driven from here.
+/// For these, this setting is inert — including `Disabled`, which cannot
+/// switch off caching the client never asked for.
+///
+/// The practical consequence: a hit rate is not comparable across protocols
+/// without knowing which shape produced it. See `docs/concepts/prompt-caching.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum CacheStrategy {
-    /// Automatic breakpoint placement (recommended).
-    /// Caches: system prompt, tool definitions, and recent conversation history.
+    /// Automatic placement (recommended).
+    ///
+    /// Anthropic: caches system prompt, tool definitions, and recent history.
+    /// OpenAI: sends `prompt_cache_key`. Elsewhere: no effect.
     #[default]
     Auto,
-    /// Disable explicit cache hints.
+    /// Send no caching hints at all.
+    ///
+    /// Does **not** disable a provider's automatic server-side caching — that
+    /// is not client-controllable. On Anthropic this means paying full input
+    /// price for every prefix, so reach for it only when a rewrite-heavy
+    /// workload makes cache writes pure loss.
     Disabled,
     /// Fine-grained control over what gets cached.
+    ///
+    /// Anthropic-only in effect: no other protocol exposes placement. Treated
+    /// as [`Auto`](Self::Auto) by key-routed providers, which have one knob
+    /// rather than three.
     Manual {
         /// Cache the system prompt.
         cache_system: bool,
