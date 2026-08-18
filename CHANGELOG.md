@@ -4,12 +4,12 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 0.17.0
 
 > The fixes below also shipped on the **0.16.x maintenance line** — the gasp
 > extension-path and MSRV fixes in [0.16.3], the gasp id types in [0.16.4], and
 > the method-surface closure in [0.16.5] — cut from `v0.16.2` so consumers could
-> take them without the breaking changes queued here for 0.17.0.
+> take them without the breaking changes released here.
 
 ### Added
 
