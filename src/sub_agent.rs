@@ -61,6 +61,7 @@ pub struct SubAgentTool {
     retry_config: crate::retry::RetryConfig,
     max_turns: usize,
     shared_state: Option<SharedState>,
+    context_config: Option<crate::context::ContextConfig>,
     turn_delay: Option<std::time::Duration>,
     model_config: Option<ModelConfig>,
     tool_middleware: Vec<Arc<dyn ToolMiddleware>>,
@@ -99,6 +100,7 @@ impl SubAgentTool {
             retry_config: crate::retry::RetryConfig::default(),
             max_turns: DEFAULT_MAX_TURNS,
             shared_state: None,
+            context_config: None,
             turn_delay: None,
             model_config: None,
             tool_middleware: Vec::new(),
@@ -243,6 +245,31 @@ impl SubAgentTool {
         self
     }
 
+    /// Give the sub-agent its own context management.
+    ///
+    /// Sub-agents ran without one, so `truncate_tool_output_on_append` never
+    /// fired for them and a sub-agent's oversized tool output entered its
+    /// context whole — and, once #133 wired a stash sink here, that sink was
+    /// unreachable because the loop gates truncation and stashing together on
+    /// this being `Some`.
+    ///
+    /// This enables the **whole** context pipeline for the child loop, not just
+    /// truncation: compaction summarizes and drops old turns once the sub-agent
+    /// exceeds `max_context_tokens`. `max_turns` remains the guard on a
+    /// sub-agent's *length*; this adds guards on any single tool result and on
+    /// total history.
+    ///
+    /// The gate is this being `Some` **and** `truncate_tool_output_on_append`,
+    /// which defaults to true — passing a config with it false still yields no
+    /// truncation and no stash. Note also that the budget is line-based, so a
+    /// single-line result (minified JSON, base64) passes through whole.
+    ///
+    /// Not inherited by nested sub-agents; each needs its own call.
+    pub fn with_context_config(mut self, config: crate::context::ContextConfig) -> Self {
+        self.context_config = Some(config);
+        self
+    }
+
     pub fn with_max_turns(mut self, max: usize) -> Self {
         self.max_turns = max;
         self
@@ -382,7 +409,7 @@ impl AgentTool for SubAgentTool {
         // Inject SharedStateTool when shared state is configured
         if let Some(ref state) = self.shared_state {
             tools.push(Box::new(SharedStateTool::new(state.clone())));
-            let summary = state.summary().await;
+            let summary = state.prompt_summary().await;
             system_prompt.push_str(&format!(
                 "\n\n## Shared State\nYou have access to a shared variable store via the `shared_state` tool.\nAvailable: {}",
                 summary
@@ -418,7 +445,7 @@ impl AgentTool for SubAgentTool {
             transform_context: None,
             get_steering_messages: None,
             get_follow_up_messages: None,
-            context_config: None,
+            context_config: self.context_config.clone(),
             compaction_strategy: None,
             execution_limits: Some(ExecutionLimits {
                 max_turns: self.max_turns,

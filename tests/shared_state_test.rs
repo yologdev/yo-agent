@@ -415,13 +415,13 @@ fn a_budget_too_small_for_a_marker_reports_no_marker() {
             tool_output_max_lines: max_lines,
             ..Default::default()
         };
-        let (msg, emitted) = yoagent::context::truncate_tool_output_keyed(
+        let (msg, marked) = yoagent::context::truncate_tool_output_keyed(
             big_tool_result("tc-1", 100),
             &config,
             Some("tool-out-tc-1-deadbeef"),
         );
         assert!(
-            !emitted,
+            marked.is_empty(),
             "max_lines={max_lines} has no room for a marker, so none was emitted"
         );
         assert!(
