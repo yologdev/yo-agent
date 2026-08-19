@@ -606,35 +606,47 @@ async fn run_loop(
                     let original: AgentMessage = result.clone().into();
                     let mut am = original.clone();
                     if let Some(ctx_config) = append_cap {
-                        am = context::truncate_tool_output(am, ctx_config);
+                        // First pass, unkeyed: tells us both what the context
+                        // will hold and whether a marker exists to name a key.
+                        let (plain, has_marker) =
+                            context::truncate_tool_output_keyed(original.clone(), ctx_config, None);
+                        am = plain;
 
                         // Stash here and nowhere else. This is the one place
-                        // the full text still exists, and it runs exactly once
-                        // per tool result — the compaction path re-runs Level 1
-                        // on settled history every turn, so stashing there
-                        // would mint a new key each pass, change the marker
-                        // bytes, and break the prefix cache that Level 1's
-                        // idempotence exists to protect.
-                        if let Some(sink) = &config.tool_output_sink {
-                            if context::was_truncated(&original, &am) {
-                                if let Message::ToolResult { tool_call_id, .. } = result {
-                                    let key = context::tool_output_key(tool_call_id);
-                                    let full = context::message_text(&original);
-                                    match sink.set(&key, full).await {
-                                        Ok(()) => {
-                                            am = context::annotate_marker_with_key(am, &key);
-                                        }
-                                        Err(e) => {
-                                            // The truncated result is still
-                                            // valid context; only retrieval is
-                                            // lost. Say so rather than leaving
-                                            // a marker pointing at nothing.
-                                            warn!(
-                                                "could not stash full output for {}: {e}; \
-                                                 the truncation marker will not offer retrieval",
-                                                tool_call_id
-                                            );
-                                        }
+                        // the full text still exists — by the time compaction
+                        // runs, the append-path truncation has already
+                        // discarded the middle, so there would be nothing left
+                        // to store.
+                        //
+                        // `has_marker` is the gate, not "did the text change":
+                        // a budget too small for a marker still truncates, and
+                        // stashing then would leave an entry no marker names
+                        // and nothing can reach.
+                        if let (Some(sink), true) = (&config.tool_output_sink, has_marker) {
+                            if let Message::ToolResult { tool_call_id, .. } = result {
+                                let full = context::message_text(&original);
+                                let key = context::tool_output_key(tool_call_id, &full);
+                                match sink.set(&key, full).await {
+                                    Ok(()) => {
+                                        // Re-truncate from the original with
+                                        // the key inline, so the marker names
+                                        // it only once the value is stored.
+                                        am = context::truncate_tool_output_keyed(
+                                            original.clone(),
+                                            ctx_config,
+                                            Some(&key),
+                                        )
+                                        .0;
+                                    }
+                                    Err(e) => {
+                                        // The unkeyed marker already in `am` is
+                                        // the pre-feature behaviour: still
+                                        // truncated, but promising nothing it
+                                        // cannot deliver.
+                                        warn!(
+                                            "could not stash full output for {tool_call_id}: {e}; \
+                                             the truncation marker will not offer retrieval"
+                                        );
                                     }
                                 }
                             }

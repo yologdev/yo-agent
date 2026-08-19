@@ -454,18 +454,9 @@ fn level1_truncate_tool_outputs(
         .collect()
 }
 
-/// Cap a single tool result's text at the tool's line budget, keeping head and
-/// tail.
-///
-/// The budget comes from [`ContextConfig::max_lines_for`], so a tool that
-/// tolerates head+tail badly can be exempted. Non-tool-result messages pass
-/// through untouched, and the operation is idempotent, so applying it when the
-/// message is first appended means compaction never has to rewrite it later —
-/// which is what keeps the provider's prefix cache intact. See
-/// [`ContextConfig::truncate_tool_output_on_append`].
 /// All text content of a message, concatenated. Used to stash the full,
 /// pre-truncation output.
-pub(crate) fn message_text(msg: &AgentMessage) -> String {
+pub fn message_text(msg: &AgentMessage) -> String {
     match msg {
         AgentMessage::Llm(Message::ToolResult { content, .. }) => content
             .iter()
@@ -479,65 +470,48 @@ pub(crate) fn message_text(msg: &AgentMessage) -> String {
     }
 }
 
-/// The key a truncated tool result is stashed under, derived from the tool
-/// call id.
+/// The key a truncated tool result is stashed under.
 ///
-/// Deterministic on purpose: a counter would need mutable state and would
-/// produce different keys on replay, and the key is embedded in marker text
-/// that later compaction passes re-read. Byte-stability of that marker is the
-/// property #99/#100/#102 exist to protect.
-pub fn tool_output_key(tool_call_id: &str) -> String {
-    format!("tool-out-{tool_call_id}")
-}
-
-/// Did truncation actually elide anything from this message?
+/// Combines the tool call id with a hash of the full output. The id alone is
+/// not enough: `google.rs` and `google_vertex.rs` synthesize ids as a
+/// *per-response index* (`google-fc-0`), which restarts every turn — so turn 1
+/// and turn 5 would collide, and turn 1's frozen marker would resolve to turn
+/// 5's content. Both files already treat those ids as throwaway, stripping them
+/// before sending back to the API.
 ///
-/// Compares the pair rather than re-deriving, so the caller stashes only when
-/// there is something to retrieve.
-pub(crate) fn was_truncated(before: &AgentMessage, after: &AgentMessage) -> bool {
-    before != after
-}
-
-/// Rewrite a truncation marker to name where the full output was stashed.
-///
-/// Public because a caller implementing their own stash sink needs the same
-/// marker format the loop produces.
-///
-/// Line count is unchanged, so [`TRUNCATION_MARKER_LINES`] still holds and the
-/// result stays within the same budget the plain marker was sized for.
-pub fn annotate_marker_with_key(msg: AgentMessage, key: &str) -> AgentMessage {
-    match msg {
-        AgentMessage::Llm(Message::ToolResult {
-            tool_call_id,
-            tool_name,
-            content,
-            is_error,
-            timestamp,
-        }) => AgentMessage::Llm(Message::ToolResult {
-            tool_call_id,
-            tool_name,
-            content: content
-                .into_iter()
-                .map(|c| match c {
-                    Content::Text { text } => Content::Text {
-                        text: text.replace(
-                            " lines truncated ...]",
-                            &format!(
-                                " lines truncated — full output: shared_state get \"{key}\" ...]"
-                            ),
-                        ),
-                    },
-                    other => other,
-                })
-                .collect(),
-            is_error,
-            timestamp,
-        }),
-        other => other,
+/// Hashing the content keeps the key deterministic on replay while making a
+/// collision mean the contents were identical anyway.
+pub fn tool_output_key(tool_call_id: &str, full_output: &str) -> String {
+    // FNV-1a, for the same reason the GASP recorder uses it: `DefaultHasher`
+    // is documented as unstable across releases, and a key that moves between
+    // compiler versions silently stops resolving.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in full_output.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
+    format!("tool-out-{tool_call_id}-{hash:016x}")
 }
 
-pub fn truncate_tool_output(msg: AgentMessage, config: &ContextConfig) -> AgentMessage {
+/// Truncate, optionally naming a stash key inside the marker.
+///
+/// Public so a caller implementing their own stash sink can reproduce exactly
+/// what the loop does: truncate with `None` to learn whether a marker exists,
+/// stash, then truncate again with `Some(key)`.
+///
+/// Returns the message and whether a marker naming `key` was actually emitted.
+///
+/// The key is threaded into marker *generation* rather than substituted
+/// afterwards. Rewriting the rendered text would hit every occurrence of the
+/// marker's shape — including one that came from the tool's own output, which
+/// is ordinary for a coding agent reading a log or a session transcript — and
+/// would silently do nothing in the case below where truncation emits no marker
+/// at all. Generating it means the key is present exactly when a marker is.
+pub fn truncate_tool_output_keyed(
+    msg: AgentMessage,
+    config: &ContextConfig,
+    key: Option<&str>,
+) -> (AgentMessage, bool) {
     match msg {
         AgentMessage::Llm(Message::ToolResult {
             tool_call_id,
@@ -547,26 +521,45 @@ pub fn truncate_tool_output(msg: AgentMessage, config: &ContextConfig) -> AgentM
             timestamp,
         }) => {
             let max_lines = config.max_lines_for(&tool_name);
+            let mut emitted = false;
             let truncated_content: Vec<Content> = content
                 .into_iter()
                 .map(|c| match c {
-                    Content::Text { text } => Content::Text {
-                        text: truncate_text_head_tail(&text, max_lines),
-                    },
+                    Content::Text { text } => {
+                        let (out, marked) = truncate_text_head_tail(&text, max_lines, key);
+                        emitted |= marked;
+                        Content::Text { text: out }
+                    }
                     other => other,
                 })
                 .collect();
 
-            AgentMessage::Llm(Message::ToolResult {
-                tool_call_id,
-                tool_name,
-                content: truncated_content,
-                is_error,
-                timestamp,
-            })
+            (
+                AgentMessage::Llm(Message::ToolResult {
+                    tool_call_id,
+                    tool_name,
+                    content: truncated_content,
+                    is_error,
+                    timestamp,
+                }),
+                emitted,
+            )
         }
-        other => other,
+        other => (other, false),
     }
+}
+
+/// Cap a single tool result's text at the tool's line budget, keeping head and
+/// tail.
+///
+/// The budget comes from [`ContextConfig::max_lines_for`], so a tool that
+/// tolerates head+tail badly can be exempted. Non-tool-result messages pass
+/// through untouched, and the operation is idempotent, so applying it when the
+/// message is first appended means compaction never has to rewrite it later —
+/// which is what keeps the provider's prefix cache intact. See
+/// [`ContextConfig::truncate_tool_output_on_append`].
+pub fn truncate_tool_output(msg: AgentMessage, config: &ContextConfig) -> AgentMessage {
+    truncate_tool_output_keyed(msg, config, None).0
 }
 
 /// Lines the truncation marker occupies: a blank line, the marker, a blank line.
@@ -580,16 +573,18 @@ const TRUNCATION_MARKER_LINES: usize = 3;
 /// over budget, and a marker that shrank on each pass (`950 lines truncated`
 /// → `3 lines truncated`) both misreported the loss and rewrote settled
 /// history, discarding the provider's prefix cache a second time.
-fn truncate_text_head_tail(text: &str, max_lines: usize) -> String {
+fn truncate_text_head_tail(text: &str, max_lines: usize, key: Option<&str>) -> (String, bool) {
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() <= max_lines {
-        return text.to_string();
+        return (text.to_string(), false);
     }
 
     // Not enough room for head + marker + tail — keep the head and skip the
-    // marker rather than emitting something that re-truncates forever.
+    // marker rather than emitting something that re-truncates forever. No
+    // marker means no place to name a stash key, which is why the caller is
+    // told `false` and must not stash: the entry would be unreachable.
     if max_lines <= TRUNCATION_MARKER_LINES + 1 {
-        return lines[..max_lines].join("\n");
+        return (lines[..max_lines].join("\n"), false);
     }
 
     let keep = max_lines - TRUNCATION_MARKER_LINES;
@@ -597,10 +592,20 @@ fn truncate_text_head_tail(text: &str, max_lines: usize) -> String {
     let tail = keep - head;
     let omitted = lines.len() - head - tail;
 
+    let marker = match key {
+        Some(k) => {
+            format!("[... {omitted} lines truncated — full output: shared_state get \"{k}\" ...]")
+        }
+        None => format!("[... {omitted} lines truncated ...]"),
+    };
+
     let mut result = lines[..head].join("\n");
-    result.push_str(&format!("\n\n[... {} lines truncated ...]\n\n", omitted));
+    result.push_str(&format!("\n\n{marker}\n\n"));
     result.push_str(&lines[lines.len() - tail..].join("\n"));
-    result
+    // True means "a marker was emitted", not "the marker names a key" — the
+    // caller runs an unkeyed pass first precisely to learn whether there is
+    // somewhere to put one.
+    (result, true)
 }
 
 /// Level 2: Summarize old assistant turns.
@@ -972,7 +977,7 @@ mod tests {
             .map(|i| format!("line {}", i))
             .collect::<Vec<_>>()
             .join("\n");
-        let result = truncate_text_head_tail(&text, 10);
+        let result = truncate_text_head_tail(&text, 10, None).0;
         assert!(result.contains("line 1")); // head
         assert!(result.contains("line 100")); // tail
         assert!(result.contains("truncated"));
@@ -981,7 +986,7 @@ mod tests {
         // The marker is charged against the line budget, so the result fits
         // exactly and a second pass leaves it alone.
         assert_eq!(result.lines().count(), 10);
-        assert_eq!(truncate_text_head_tail(&result, 10), result);
+        assert_eq!(truncate_text_head_tail(&result, 10, None).0, result);
     }
 
     #[test]
@@ -991,15 +996,15 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let once = truncate_text_head_tail(&text, 50);
+        let once = truncate_text_head_tail(&text, 50, None).0;
         assert!(once.contains("[... 953 lines truncated ...]"));
         assert_eq!(once.lines().count(), 50);
 
         // Re-truncating must not shrink the content further or restate the
         // omitted count — that churn rewrote settled history on every pass.
-        let twice = truncate_text_head_tail(&once, 50);
+        let twice = truncate_text_head_tail(&once, 50, None).0;
         assert_eq!(twice, once);
-        assert_eq!(truncate_text_head_tail(&twice, 50), once);
+        assert_eq!(truncate_text_head_tail(&twice, 50, None).0, once);
     }
 
     #[test]
@@ -1010,9 +1015,9 @@ mod tests {
             .join("\n");
         // Too small for head + marker + tail: keep the head, stay idempotent.
         for max_lines in [1usize, 2, 3, 4] {
-            let result = truncate_text_head_tail(&text, max_lines);
+            let result = truncate_text_head_tail(&text, max_lines, None).0;
             assert_eq!(result.lines().count(), max_lines);
-            assert_eq!(truncate_text_head_tail(&result, max_lines), result);
+            assert_eq!(truncate_text_head_tail(&result, max_lines, None).0, result);
         }
     }
 

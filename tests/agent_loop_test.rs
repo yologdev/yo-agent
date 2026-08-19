@@ -3123,3 +3123,118 @@ async fn output_that_fits_is_not_stashed() {
         "nothing elided, nothing stashed"
     );
 }
+
+/// A sink that always fails, to exercise the `Err` arm — previously uncovered.
+struct FailingBackend;
+
+#[async_trait::async_trait]
+impl yoagent::shared_state::SharedStateBackend for FailingBackend {
+    async fn get(
+        &self,
+        _k: &str,
+    ) -> Result<Option<String>, yoagent::shared_state::SharedStateError> {
+        Ok(None)
+    }
+    async fn set(
+        &self,
+        _k: &str,
+        _v: String,
+    ) -> Result<(), yoagent::shared_state::SharedStateError> {
+        Err(yoagent::shared_state::SharedStateError::Io(
+            std::io::Error::other("disk on fire"),
+        ))
+    }
+    async fn remove(&self, _k: &str) -> Result<bool, yoagent::shared_state::SharedStateError> {
+        Ok(false)
+    }
+    async fn keys(&self) -> Result<Vec<String>, yoagent::shared_state::SharedStateError> {
+        Ok(vec![])
+    }
+    async fn summary(&self) -> Result<String, yoagent::shared_state::SharedStateError> {
+        Ok(String::new())
+    }
+}
+
+/// When the stash fails, the marker must fall back to the plain form rather
+/// than promising a retrieval that cannot happen.
+#[tokio::test]
+async fn a_failed_stash_leaves_an_unkeyed_marker() {
+    let sink = yoagent::shared_state::SharedState::with_backend(FailingBackend);
+    let text = tool_result_text(&run_with_sink(Some(sink)).await);
+
+    assert!(text.contains("lines truncated"), "still truncated");
+    assert!(
+        !text.contains("shared_state get"),
+        "a failed stash must not advertise retrieval: {text}"
+    );
+}
+
+/// Parallel tool execution is the default, so one turn can produce several
+/// truncated results. Each needs its own key, and each key must resolve.
+#[tokio::test]
+async fn parallel_truncated_results_each_get_a_resolvable_key() {
+    let state = yoagent::shared_state::SharedState::new();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut context = AgentContext {
+        messages: vec![],
+        tools: vec![Box::new(StashBigTool)],
+        system_prompt: String::new(),
+    };
+    let mut config = make_config(MockProvider::new(vec![
+        MockResponse::ToolCalls(vec![
+            MockToolCall {
+                provider_metadata: None,
+                name: "big_output".into(),
+                arguments: serde_json::json!({}),
+            },
+            MockToolCall {
+                provider_metadata: None,
+                name: "big_output".into(),
+                arguments: serde_json::json!({}),
+            },
+        ]),
+        MockResponse::Text("done".into()),
+    ]));
+    config.context_config = Some(yoagent::context::ContextConfig {
+        tool_output_max_lines: 20,
+        ..Default::default()
+    });
+    config.tool_output_sink = Some(state.clone());
+
+    let messages = agent_loop(
+        vec![AgentMessage::Llm(Message::user("go"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    // Both tool results carry a marker, and every key named resolves.
+    let named: Vec<String> = messages
+        .iter()
+        .filter_map(|m| match m {
+            AgentMessage::Llm(Message::ToolResult { content, .. }) => {
+                content.iter().find_map(|c| match c {
+                    Content::Text { text } => text
+                        .split_once("shared_state get \"")
+                        .and_then(|(_, rest)| rest.split_once('"').map(|(k, _)| k.to_string())),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        named.len(),
+        2,
+        "both results must name a key, got {named:?}"
+    );
+    for key in &named {
+        assert!(
+            state.get(key).await.is_some(),
+            "key {key} named in a marker must resolve"
+        );
+    }
+}

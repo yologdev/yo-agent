@@ -348,42 +348,123 @@ fn text_of(msg: &AgentMessage) -> String {
     }
 }
 
-/// The key must come from the tool call id, not a counter: a counter needs
-/// mutable state and yields different keys on replay, and the key ends up
-/// inside marker text that later compaction passes re-read.
+/// The key must survive replay and must not collide. The tool call id alone
+/// does not: `google.rs`/`google_vertex.rs` synthesize ids as a per-response
+/// index that restarts each turn, so turn 1 and turn 5 both produce
+/// `google-fc-0` — and turn 1's frozen marker would then resolve to turn 5's
+/// content. Hashing the output disambiguates.
 #[test]
-fn stash_key_is_derived_from_the_tool_call_id() {
-    assert_eq!(tool_output_key("abc123"), "tool-out-abc123");
-    assert_eq!(tool_output_key("abc123"), tool_output_key("abc123"));
-    assert_ne!(tool_output_key("abc123"), tool_output_key("def456"));
+fn stash_key_is_stable_and_collision_resistant() {
+    assert_eq!(
+        tool_output_key("tc-1", "output"),
+        tool_output_key("tc-1", "output"),
+        "same call, same content — replay must give the same key"
+    );
+    assert_ne!(
+        tool_output_key("google-fc-0", "turn one output"),
+        tool_output_key("google-fc-0", "turn five output"),
+        "a reused provider id must not alias two different outputs"
+    );
+    assert_ne!(
+        tool_output_key("tc-1", "same"),
+        tool_output_key("tc-2", "same"),
+        "different calls stay distinct"
+    );
 }
 
 /// The load-bearing property. Level 1 runs on settled history every turn, so a
 /// marker whose bytes move on a later pass breaks the provider's prefix cache —
 /// the exact thing Level-1 idempotence exists to protect.
 #[test]
-fn an_annotated_marker_survives_re_truncation_byte_for_byte() {
+fn a_keyed_marker_survives_re_truncation_byte_for_byte() {
     let config = ContextConfig {
         tool_output_max_lines: 20,
         ..Default::default()
     };
 
-    let truncated = truncate_tool_output(big_tool_result("tc-1", 500), &config);
-    // Simulate what the loop does after stashing.
-    let annotated = yoagent::context::annotate_marker_with_key(truncated, "tool-out-tc-1");
-    let before = text_of(&annotated);
+    let keyed = yoagent::context::truncate_tool_output_keyed(
+        big_tool_result("tc-1", 500),
+        &config,
+        Some("tool-out-tc-1-deadbeef"),
+    )
+    .0;
+    let before = text_of(&keyed);
+    assert!(
+        before.contains("tool-out-tc-1-deadbeef"),
+        "marker must name the key"
+    );
 
-    // Three further compaction passes must not move a byte.
-    let mut msg = annotated;
+    let mut msg = keyed;
     for pass in 1..=3 {
         msg = truncate_tool_output(msg, &config);
         assert_eq!(
             text_of(&msg),
             before,
-            "pass {pass} rewrote the marker; the prefix cache would break"
+            "Level-1 pass {pass} rewrote the marker; the prefix cache would break"
         );
     }
-    assert!(before.contains("tool-out-tc-1"), "marker must name the key");
+}
+
+/// A budget too small for a marker truncates but emits nothing to name a key.
+/// Stashing then would leave an entry no marker points at — unreachable
+/// forever, and consuming cap quota that evicts reachable entries.
+#[test]
+fn a_budget_too_small_for_a_marker_reports_no_marker() {
+    for max_lines in 1..=4 {
+        let config = ContextConfig {
+            tool_output_max_lines: max_lines,
+            ..Default::default()
+        };
+        let (msg, emitted) = yoagent::context::truncate_tool_output_keyed(
+            big_tool_result("tc-1", 100),
+            &config,
+            Some("tool-out-tc-1-deadbeef"),
+        );
+        assert!(
+            !emitted,
+            "max_lines={max_lines} has no room for a marker, so none was emitted"
+        );
+        assert!(
+            !text_of(&msg).contains("tool-out-tc-1"),
+            "max_lines={max_lines} must not name a key it did not emit"
+        );
+    }
+}
+
+/// Tool output that itself contains a marker — a coding agent reading a log or
+/// a session transcript — must not have its content rewritten into a false
+/// retrieval instruction.
+#[test]
+fn a_marker_inside_the_tools_own_output_is_left_alone() {
+    let config = ContextConfig {
+        tool_output_max_lines: 20,
+        ..Default::default()
+    };
+    let mut lines: Vec<String> = (0..100).map(|i| format!("line {i}")).collect();
+    lines[1] = "[... 42 lines truncated ...]".into(); // in the retained head
+    let msg = AgentMessage::Llm(Message::ToolResult {
+        tool_call_id: "tc-1".into(),
+        tool_name: "bash".into(),
+        content: vec![Content::Text {
+            text: lines.join("\n"),
+        }],
+        is_error: false,
+        timestamp: 0,
+    });
+
+    let out =
+        yoagent::context::truncate_tool_output_keyed(msg, &config, Some("tool-out-tc-1-deadbeef"))
+            .0;
+    let text = text_of(&out);
+    assert_eq!(
+        text.matches("tool-out-tc-1-deadbeef").count(),
+        1,
+        "exactly one retrieval instruction — the one truncation emitted: {text}"
+    );
+    assert!(
+        text.contains("[... 42 lines truncated ...]"),
+        "the tool's own marker must survive verbatim: {text}"
+    );
 }
 
 #[tokio::test]
@@ -400,10 +481,10 @@ async fn file_backend_evicts_oldest_to_stay_under_its_cap() {
     }
 
     let keys = state.keys().await;
-    assert!(
-        keys.len() <= 3,
-        "cap must bound the directory, got {} keys: {keys:?}",
-        keys.len()
+    assert_eq!(
+        keys.len(),
+        3,
+        "cap must bound the directory without emptying it, got {keys:?}"
     );
     assert!(
         keys.contains(&"k5".to_string()),
