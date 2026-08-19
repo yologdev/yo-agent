@@ -46,6 +46,33 @@ adheres to [Semantic Versioning](https://semver.org/).
   restarts every turn — id alone would let turn 1's frozen marker resolve to
   turn 5's content.
 
+- **`tests/price_audit.rs` — a drift alarm for the crate's hardcoded prices**
+  ([#132](https://github.com/yologdev/yoagent/issues/132)). `ModelConfig`'s
+  priced presets are `f64` literals compiled into the crate; when a vendor
+  reprices they keep billing at the old numbers until someone edits the source.
+  `claude_sonnet_5` shipped Sonnet 4.6's rates through the whole 0.16.x line —
+  50% high on every `cost_usd` — and nothing detected it.
+
+  ```text
+  cargo test --test price_audit -- --ignored --nocapture
+  ```
+
+  Diffs all four cost fields of every priced preset against
+  [models.dev](https://github.com/anomalyco/models.dev), which unlike most price
+  aggregators carries `cache_read`/`cache_write` — the fields this crate needs.
+  28/28 clean at time of writing, including `ModelConfig::meta`, whose rates had
+  never been checked against any source (they match Muse Spark 1.1/1.2).
+
+  A failure is an **alarm, not an instruction**: models.dev is
+  community-maintained and not authoritative, so the test names the vendor's own
+  page and the constructor to edit, and never updates a constant itself. A model
+  absent from the database is reported rather than failed.
+
+  Presets now carry the source URL and verification date, and `CostConfig`'s
+  docs state plainly that they are a snapshot — with the override path, since
+  `cost` is a public field and `CostConfig` is `Deserialize`, so nobody has to
+  wait for a release for a negotiated rate.
+
 ### Changed
 
 - **`FileBackend` is capped at 10MB** — the same limit as `MemoryBackend`,
