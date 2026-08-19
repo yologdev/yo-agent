@@ -881,6 +881,15 @@ pub struct ExecutionLimits {
     pub max_total_tokens: usize,
     /// Maximum wall-clock time
     pub max_duration: std::time::Duration,
+    /// Consecutive identical tool calls tolerated before intervening.
+    ///
+    /// The cheapest catastrophic failure mode is a model calling one tool with
+    /// the same arguments forever. The other three limits all fire eventually,
+    /// but only after burning the full turn, token and wall-clock budget — so
+    /// the run costs its maximum to discover it achieved nothing.
+    ///
+    /// `None` disables the check. Default `Some(3)`.
+    pub max_identical_tool_calls: Option<usize>,
 }
 
 impl Default for ExecutionLimits {
@@ -889,8 +898,28 @@ impl Default for ExecutionLimits {
             max_turns: 50,
             max_total_tokens: 1_000_000,
             max_duration: std::time::Duration::from_secs(600),
+            max_identical_tool_calls: Some(3),
         }
     }
+}
+
+/// What the loop should do about a repeated tool call.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoopVerdict {
+    /// Nothing repetitive, or below the threshold.
+    Continue,
+    /// First trip: steer and keep going. A model that is stuck usually
+    /// recovers when told so, and aborting here would regress the legitimate
+    /// case of retrying a tool that failed transiently.
+    Steer {
+        tool_name: String,
+        repetitions: usize,
+    },
+    /// The same signature tripped again after being steered about. Stop.
+    Abort {
+        tool_name: String,
+        repetitions: usize,
+    },
 }
 
 /// Tracks execution state against limits
@@ -899,6 +928,17 @@ pub struct ExecutionTracker {
     pub turns: usize,
     pub tokens_used: usize,
     pub started_at: std::time::Instant,
+    /// The tool signature seen most recently, and how many times in a row.
+    ///
+    /// A signature is `(name, arguments)` compared as `serde_json::Value`, not
+    /// as serialized text — two calls that differ only in key order are the
+    /// same call, and string comparison would miss the loop.
+    last_signature: Option<(String, serde_json::Value)>,
+    consecutive: usize,
+    /// Signatures already steered about. A second trip on one of these aborts
+    /// rather than steering again, so a model that ignores the nudge does not
+    /// loop forever between nudges.
+    steered: Vec<(String, serde_json::Value)>,
 }
 
 impl ExecutionTracker {
@@ -908,7 +948,58 @@ impl ExecutionTracker {
             turns: 0,
             tokens_used: 0,
             started_at: std::time::Instant::now(),
+            last_signature: None,
+            consecutive: 0,
+            steered: Vec::new(),
         }
+    }
+
+    /// Fold one turn's tool calls into the repetition counter.
+    ///
+    /// Counts within a batch as well as across turns: `ToolExecutionStrategy`
+    /// defaults to `Parallel`, so a model can emit the same call three times in
+    /// one message and never take a second turn.
+    pub fn record_tool_calls(&mut self, calls: &[(String, serde_json::Value)]) -> LoopVerdict {
+        let Some(threshold) = self.limits.max_identical_tool_calls else {
+            return LoopVerdict::Continue;
+        };
+        if threshold == 0 {
+            return LoopVerdict::Continue;
+        }
+
+        let mut verdict = LoopVerdict::Continue;
+        for (name, args) in calls {
+            let sig = (name.clone(), args.clone());
+            match &self.last_signature {
+                Some(prev) if *prev == sig => self.consecutive += 1,
+                _ => {
+                    // Any different call breaks the streak — a model working
+                    // through distinct steps is not looping.
+                    self.last_signature = Some(sig.clone());
+                    self.consecutive = 1;
+                }
+            }
+
+            if self.consecutive >= threshold && verdict == LoopVerdict::Continue {
+                let repetitions = self.consecutive;
+                if self.steered.contains(&sig) {
+                    verdict = LoopVerdict::Abort {
+                        tool_name: name.clone(),
+                        repetitions,
+                    };
+                } else {
+                    self.steered.push(sig);
+                    // Reset so the abort needs another full run of repeats,
+                    // rather than firing on the very next call.
+                    self.consecutive = 0;
+                    verdict = LoopVerdict::Steer {
+                        tool_name: name.clone(),
+                        repetitions,
+                    };
+                }
+            }
+        }
+        verdict
     }
 
     pub fn record_turn(&mut self, tokens: usize) {
@@ -1478,6 +1569,7 @@ mod tests {
             max_turns: 3,
             max_total_tokens: 1000,
             max_duration: std::time::Duration::from_secs(60),
+            ..Default::default()
         };
 
         let mut tracker = ExecutionTracker::new(limits);

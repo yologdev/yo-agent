@@ -577,6 +577,87 @@ async fn run_loop(
                 _ => vec![],
             };
 
+            // Repetition check runs *before* execution, so a stuck model does
+            // not also pay for the tool run it was never going to learn from.
+            if has_tool_calls_early(&tool_calls) {
+                if let Some(ref mut tracker) = tracker {
+                    let sigs: Vec<(String, serde_json::Value)> = tool_calls
+                        .iter()
+                        .map(|(_, name, args)| (name.clone(), args.clone()))
+                        .collect();
+                    match tracker.record_tool_calls(&sigs) {
+                        context::LoopVerdict::Continue => {}
+                        context::LoopVerdict::Steer {
+                            tool_name,
+                            repetitions,
+                        } => {
+                            warn!(
+                                "loop detection: {tool_name} called {repetitions}x with                                  identical arguments; steering"
+                            );
+                            tx.send(AgentEvent::LoopDetected {
+                                tool_name: tool_name.clone(),
+                                repetitions,
+                                aborted: false,
+                            })
+                            .ok();
+                            // A nudge, not a stop: a model repeating a call is
+                            // often retrying something transient, and it
+                            // usually recovers once told the result will not
+                            // change.
+                            let nudge = AgentMessage::Llm(Message::User {
+                                content: vec![Content::Text {
+                                    text: format!(
+                                        "[You have called {tool_name} {repetitions} times with                                          identical arguments. The result will not change —                                          change approach, or say why the repetition is needed.]"
+                                    ),
+                                }],
+                                timestamp: now_ms(),
+                            });
+                            tx.send(AgentEvent::MessageStart {
+                                message: nudge.clone(),
+                            })
+                            .ok();
+                            tx.send(AgentEvent::MessageEnd {
+                                message: nudge.clone(),
+                            })
+                            .ok();
+                            context.messages.push(nudge.clone());
+                            new_messages.push(nudge);
+                        }
+                        context::LoopVerdict::Abort {
+                            tool_name,
+                            repetitions,
+                        } => {
+                            warn!("loop detection: {tool_name} repeated after steering; stopping");
+                            tx.send(AgentEvent::LoopDetected {
+                                tool_name: tool_name.clone(),
+                                repetitions,
+                                aborted: true,
+                            })
+                            .ok();
+                            let stop = AgentMessage::Llm(Message::User {
+                                content: vec![Content::Text {
+                                    text: format!(
+                                        "[Agent stopped: {tool_name} was called repeatedly with                                          identical arguments after being asked to change                                          approach.]"
+                                    ),
+                                }],
+                                timestamp: now_ms(),
+                            });
+                            tx.send(AgentEvent::MessageStart {
+                                message: stop.clone(),
+                            })
+                            .ok();
+                            tx.send(AgentEvent::MessageEnd {
+                                message: stop.clone(),
+                            })
+                            .ok();
+                            context.messages.push(stop.clone());
+                            new_messages.push(stop);
+                            return stats;
+                        }
+                    }
+                }
+            }
+
             let has_tool_calls = !tool_calls.is_empty();
             let mut tool_results: Vec<Message> = Vec::new();
 
@@ -723,6 +804,11 @@ async fn run_loop(
     }
 
     stats
+}
+
+/// Whether this turn produced any tool call at all.
+fn has_tool_calls_early(calls: &[(String, String, serde_json::Value)]) -> bool {
+    !calls.is_empty()
 }
 
 /// Stream an assistant response from the LLM.

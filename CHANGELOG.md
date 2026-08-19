@@ -46,6 +46,41 @@ adheres to [Semantic Versioning](https://semver.org/).
   restarts every turn — id alone would let turn 1's frozen marker resolve to
   turn 5's content.
 
+- **Loop detection in `ExecutionLimits`**
+  ([#126](https://github.com/yologdev/yoagent/issues/126)). The cheapest
+  catastrophic failure mode — a model calling one tool with the same arguments
+  forever — tripped none of the three existing limits early. They all fire
+  eventually, but only after burning the full turn, token and wall-clock budget,
+  so the run costs its maximum to discover it achieved nothing.
+
+  `max_identical_tool_calls: Option<usize>`, default `Some(3)`, `None` to
+  disable. Two escalations, mirroring the house pattern of steering before
+  aborting:
+
+  1. **First trip** injects a steering message and continues. A model repeating
+     a call is often retrying something transient, and aborting immediately
+     would regress that legitimate case.
+  2. **A later trip on the same signature** stops the run.
+
+  Both emit the new `AgentEvent::LoopDetected { tool_name, repetitions, aborted }`,
+  so a UI can show the intervention and GASP can record why a run ended — an
+  audit wants loop aborts distinguishable from turn-limit stops.
+
+  Signatures compare `serde_json::Value`, not serialized text: two calls
+  differing only in key order are the same call, and string comparison would
+  miss the loop. Counting covers duplicates *within* one batch as well as across
+  turns, because `ToolExecutionStrategy` defaults to `Parallel` and a model can
+  emit the same call three times in a single message. Any different call resets
+  the streak.
+
+  The check runs **before** tool execution, so a stuck model does not also pay
+  for the tool run it was never going to learn from.
+
+- **Breaking: `ExecutionLimits` gained `max_identical_tool_calls`.** The struct
+  is not `#[non_exhaustive]`, so downstream struct-literal construction needs
+  the new field or `..Default::default()`. Behaviour changes only for
+  pathological sessions, but it *is* on by default.
+
 - **`tests/price_audit.rs` — a drift alarm for the crate's hardcoded prices**
   ([#132](https://github.com/yologdev/yoagent/issues/132)). `ModelConfig`'s
   priced presets are `f64` literals compiled into the crate; when a vendor
