@@ -312,3 +312,105 @@ async fn unscoped_behaviour_is_unchanged() {
     assert!(state.scope().is_none());
     assert!(state.summary().await.contains("k"));
 }
+
+// ---------------------------------------------------------------------------
+// Truncation → retrieval (issue #125)
+// ---------------------------------------------------------------------------
+
+use yoagent::context::{tool_output_key, truncate_tool_output, ContextConfig};
+
+fn big_tool_result(id: &str, lines: usize) -> AgentMessage {
+    AgentMessage::Llm(Message::ToolResult {
+        tool_call_id: id.into(),
+        tool_name: "bash".into(),
+        content: vec![Content::Text {
+            text: (0..lines)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }],
+        is_error: false,
+        timestamp: 0,
+    })
+}
+
+fn text_of(msg: &AgentMessage) -> String {
+    match msg {
+        AgentMessage::Llm(Message::ToolResult { content, .. }) => content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// The key must come from the tool call id, not a counter: a counter needs
+/// mutable state and yields different keys on replay, and the key ends up
+/// inside marker text that later compaction passes re-read.
+#[test]
+fn stash_key_is_derived_from_the_tool_call_id() {
+    assert_eq!(tool_output_key("abc123"), "tool-out-abc123");
+    assert_eq!(tool_output_key("abc123"), tool_output_key("abc123"));
+    assert_ne!(tool_output_key("abc123"), tool_output_key("def456"));
+}
+
+/// The load-bearing property. Level 1 runs on settled history every turn, so a
+/// marker whose bytes move on a later pass breaks the provider's prefix cache —
+/// the exact thing Level-1 idempotence exists to protect.
+#[test]
+fn an_annotated_marker_survives_re_truncation_byte_for_byte() {
+    let config = ContextConfig {
+        tool_output_max_lines: 20,
+        ..Default::default()
+    };
+
+    let truncated = truncate_tool_output(big_tool_result("tc-1", 500), &config);
+    // Simulate what the loop does after stashing.
+    let annotated = yoagent::context::annotate_marker_with_key(truncated, "tool-out-tc-1");
+    let before = text_of(&annotated);
+
+    // Three further compaction passes must not move a byte.
+    let mut msg = annotated;
+    for pass in 1..=3 {
+        msg = truncate_tool_output(msg, &config);
+        assert_eq!(
+            text_of(&msg),
+            before,
+            "pass {pass} rewrote the marker; the prefix cache would break"
+        );
+    }
+    assert!(before.contains("tool-out-tc-1"), "marker must name the key");
+}
+
+#[tokio::test]
+async fn file_backend_evicts_oldest_to_stay_under_its_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    // Cap at 300 bytes; each value is 100.
+    let state = SharedState::with_backend(yoagent::shared_state::FileBackend::with_max_bytes(
+        dir.path(),
+        300,
+    ));
+
+    for i in 0..6 {
+        state.set(&format!("k{i}"), "x".repeat(100)).await.unwrap();
+    }
+
+    let keys = state.keys().await;
+    assert!(
+        keys.len() <= 3,
+        "cap must bound the directory, got {} keys: {keys:?}",
+        keys.len()
+    );
+    assert!(
+        keys.contains(&"k5".to_string()),
+        "the most recent write must never be the one evicted, got {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"k0".to_string()),
+        "the oldest must go first, got {keys:?}"
+    );
+}

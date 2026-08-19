@@ -52,6 +52,9 @@ pub struct Agent {
     context_management_disabled: bool,
     pub execution_limits: Option<ExecutionLimits>,
     pub cache_config: CacheConfig,
+    /// Shared key-value store. When set, the `shared_state` tool is registered
+    /// automatically and truncated tool outputs are stashed here for retrieval.
+    pub shared_state: Option<crate::shared_state::SharedState>,
     pub tool_execution: ToolExecutionStrategy,
     pub retry_config: crate::retry::RetryConfig,
 
@@ -260,6 +263,7 @@ impl Agent {
             context_management_disabled: false,
             execution_limits: Some(ExecutionLimits::default()),
             cache_config: CacheConfig::default(),
+            shared_state: None,
             tool_execution: ToolExecutionStrategy::default(),
             retry_config: crate::retry::RetryConfig::default(),
             before_turn: None,
@@ -331,6 +335,23 @@ impl Agent {
 
     pub fn with_context_config(mut self, config: ContextConfig) -> Self {
         self.context_config = Some(config);
+        self
+    }
+
+    /// Attach a shared key-value store.
+    ///
+    /// Two things follow. The `shared_state` tool is registered, so the model
+    /// can read and write the store — `SharedState` was always described as a
+    /// parent↔sub-agent medium, but until now only `SubAgentTool` wired it, so
+    /// a parent could populate it and never read it back.
+    ///
+    /// And truncated tool output is stashed here: head-tail truncation
+    /// currently discards the middle irrecoverably, and with a store attached
+    /// the marker names a key the model can fetch instead.
+    pub fn with_shared_state(mut self, state: crate::shared_state::SharedState) -> Self {
+        self.tools
+            .push(Box::new(crate::tools::SharedStateTool::new(state.clone())));
+        self.shared_state = Some(state);
         self
     }
 
@@ -1109,6 +1130,7 @@ impl Agent {
             compaction_strategy: self.compaction_strategy.clone(),
             execution_limits: self.execution_limits.clone(),
             cache_config: self.cache_config.clone(),
+            tool_output_sink: self.shared_state.clone(),
             tool_execution: self.tool_execution.clone(),
             retry_config: self.retry_config.clone(),
             get_follow_up_messages: Some(Box::new(move || {

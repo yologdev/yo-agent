@@ -427,6 +427,7 @@ impl AgentTool for SubAgentTool {
                 max_duration: std::time::Duration::from_secs(300),
             }),
             cache_config: self.cache_config.clone(),
+            tool_output_sink: self.shared_state.clone(),
             tool_execution: self.tool_execution.clone(),
             retry_config: self.retry_config.clone(),
             before_turn: None,

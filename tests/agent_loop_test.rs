@@ -25,6 +25,7 @@ fn make_config(provider: MockProvider) -> AgentLoopConfig {
         compaction_strategy: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),
+        tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
         retry_config: yoagent::RetryConfig::default(),
@@ -772,6 +773,7 @@ async fn test_execution_limit_counts_cached_tokens() {
             max_duration: std::time::Duration::from_secs(60),
         }),
         cache_config: CacheConfig::default(),
+        tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
         retry_config: yoagent::RetryConfig::default(),
@@ -870,6 +872,7 @@ async fn test_retry_on_rate_limit_succeeds() {
         compaction_strategy: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),
+        tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
         retry_config: yoagent::RetryConfig {
@@ -940,6 +943,7 @@ async fn test_retry_exhausted_returns_error() {
         compaction_strategy: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),
+        tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
         retry_config: yoagent::RetryConfig {
@@ -1017,6 +1021,7 @@ async fn test_no_retry_on_auth_error() {
         compaction_strategy: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),
+        tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
         retry_config: yoagent::RetryConfig::default(), // 3 retries, but auth is not retryable
@@ -1077,6 +1082,7 @@ async fn test_retry_none_disables_retries() {
         compaction_strategy: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),
+        tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
         retry_config: yoagent::RetryConfig::none(), // disabled
@@ -1313,6 +1319,7 @@ async fn test_on_error_fires_on_provider_error() {
         compaction_strategy: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),
+        tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
         retry_config: yoagent::RetryConfig::none(),
@@ -2023,6 +2030,7 @@ async fn test_custom_compaction_strategy_is_called() {
         compaction_strategy: Some(std::sync::Arc::new(MarkerCompaction)),
         execution_limits: None,
         cache_config: CacheConfig::default(),
+        tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
         retry_config: yoagent::RetryConfig::none(),
@@ -2102,6 +2110,7 @@ async fn test_none_compaction_strategy_uses_default() {
         compaction_strategy: None, // Should fall back to DefaultCompaction
         execution_limits: None,
         cache_config: CacheConfig::default(),
+        tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
         retry_config: yoagent::RetryConfig::none(),
@@ -2285,6 +2294,7 @@ fn calibration_config(
             max_duration: std::time::Duration::from_secs(60),
         }),
         cache_config: CacheConfig::default(),
+        tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
         retry_config: yoagent::RetryConfig::none(),
@@ -2913,5 +2923,203 @@ async fn an_in_place_rewrite_is_counted_despite_an_unchanged_message_count() {
         agent_end_stats(&collect_events(rx)).compactions,
         1,
         "token total moved while the count did not — the || clause must catch it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Truncation → retrieval (issue #125)
+// ---------------------------------------------------------------------------
+
+struct StashBigTool;
+
+#[async_trait::async_trait]
+impl AgentTool for StashBigTool {
+    fn name(&self) -> &str {
+        "big_output"
+    }
+    fn label(&self) -> &str {
+        "Big"
+    }
+    fn description(&self) -> &str {
+        "emits many lines"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(
+        &self,
+        _params: serde_json::Value,
+        _ctx: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        Ok(ToolResult {
+            content: vec![Content::Text {
+                text: (0..500)
+                    .map(|i| format!("line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            }],
+            details: serde_json::Value::Null,
+        })
+    }
+}
+
+async fn run_with_sink(sink: Option<yoagent::shared_state::SharedState>) -> Vec<AgentMessage> {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut context = AgentContext {
+        messages: vec![],
+        tools: vec![Box::new(StashBigTool)],
+        system_prompt: String::new(),
+    };
+    let mut config = make_config(MockProvider::new(vec![
+        MockResponse::ToolCalls(vec![MockToolCall {
+            provider_metadata: None,
+            name: "big_output".into(),
+            arguments: serde_json::json!({}),
+        }]),
+        MockResponse::Text("done".into()),
+    ]));
+    config.context_config = Some(yoagent::context::ContextConfig {
+        tool_output_max_lines: 20,
+        ..Default::default()
+    });
+    config.tool_output_sink = sink;
+
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user("go"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+fn tool_result_text(messages: &[AgentMessage]) -> String {
+    messages
+        .iter()
+        .find_map(|m| match m {
+            AgentMessage::Llm(Message::ToolResult { content, .. }) => Some(
+                content
+                    .iter()
+                    .filter_map(|c| match c {
+                        Content::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => None,
+        })
+        .expect("a tool result must be in history")
+}
+
+/// Opt-in: with no sink the behaviour is exactly what it was before, and the
+/// marker must not advertise a retrieval that does not exist.
+#[tokio::test]
+async fn without_a_sink_truncation_is_unchanged() {
+    let text = tool_result_text(&run_with_sink(None).await);
+    assert!(text.contains("lines truncated"), "still truncated");
+    assert!(
+        !text.contains("shared_state"),
+        "no sink means the marker must not name one: {text}"
+    );
+}
+
+/// The whole point: what head-tail truncation elided is retrievable.
+#[tokio::test]
+async fn a_truncated_output_is_stashed_and_the_marker_names_the_key() {
+    let state = yoagent::shared_state::SharedState::new();
+    let messages = run_with_sink(Some(state.clone())).await;
+    let text = tool_result_text(&messages);
+
+    assert!(
+        text.contains("lines truncated"),
+        "context is still truncated"
+    );
+    assert!(
+        text.contains("shared_state get"),
+        "marker must tell the model how to retrieve: {text}"
+    );
+
+    // The key in the marker must actually resolve, and to the *full* output.
+    let keys = state.keys().await;
+    assert_eq!(keys.len(), 1, "exactly one stash, got {keys:?}");
+    assert!(
+        text.contains(&keys[0]),
+        "marker names {:?} but the store holds {keys:?}",
+        text
+    );
+    let full = state.get(&keys[0]).await.expect("key must resolve");
+    assert!(full.contains("line 250"), "the elided middle must be there");
+    assert!(
+        full.lines().count() >= 500,
+        "the whole output, not the truncation"
+    );
+}
+
+/// Small outputs are not stashed — nothing was lost, so there is nothing to
+/// retrieve, and a key per tool call would fill the store with noise.
+#[tokio::test]
+async fn output_that_fits_is_not_stashed() {
+    struct SmallTool;
+    #[async_trait::async_trait]
+    impl AgentTool for SmallTool {
+        fn name(&self) -> &str {
+            "small"
+        }
+        fn label(&self) -> &str {
+            "Small"
+        }
+        fn description(&self) -> &str {
+            "short"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _p: serde_json::Value,
+            _c: ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult {
+                content: vec![Content::Text { text: "ok".into() }],
+                details: serde_json::Value::Null,
+            })
+        }
+    }
+
+    let state = yoagent::shared_state::SharedState::new();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut context = AgentContext {
+        messages: vec![],
+        tools: vec![Box::new(SmallTool)],
+        system_prompt: String::new(),
+    };
+    let mut config = make_config(MockProvider::new(vec![
+        MockResponse::ToolCalls(vec![MockToolCall {
+            provider_metadata: None,
+            name: "small".into(),
+            arguments: serde_json::json!({}),
+        }]),
+        MockResponse::Text("done".into()),
+    ]));
+    config.context_config = Some(yoagent::context::ContextConfig {
+        tool_output_max_lines: 20,
+        ..Default::default()
+    });
+    config.tool_output_sink = Some(state.clone());
+
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user("go"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert!(
+        state.keys().await.is_empty(),
+        "nothing elided, nothing stashed"
     );
 }

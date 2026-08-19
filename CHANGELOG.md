@@ -4,6 +4,47 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- **Truncated tool output is retrievable instead of lost**
+  ([#125](https://github.com/yologdev/yoagent/issues/125)). `truncate_tool_output`
+  head-tail-truncates on append and the middle was gone irrecoverably — the full
+  text survived only in the event stream, which the *agent* cannot read.
+
+  `Agent::with_shared_state(state)` now stashes the full output under a key and
+  rewrites the marker to name it:
+
+  ```
+  [... 1,847 lines truncated — full output: shared_state get "tool-out-tc_01abc" ...]
+  ```
+
+  It also registers the `shared_state` tool, so the model can act on that
+  marker. `SharedState` was always described as a parent↔sub-agent medium, but
+  only `SubAgentTool` wired it, so a parent could populate the store and never
+  read it back; this closes that loop.
+
+  **Opt-in.** Without a store attached, truncation behaves exactly as before and
+  the marker advertises no retrieval it cannot honour.
+
+  Two constraints shaped the design. The stash happens **only on the append
+  path**, never during compaction: Level 1 re-runs on settled history every
+  turn, so stashing there would mint a new key each pass, change the marker
+  bytes, and break the prefix cache that Level-1 idempotence exists to protect.
+  And the key derives from the **tool call id** rather than a counter — a
+  counter needs mutable state and yields different keys on replay. A test
+  asserts the annotated marker survives three further compaction passes
+  byte-for-byte.
+
+### Changed
+
+- **`FileBackend` is capped at 10MB**, matching `MemoryBackend`, evicting
+  oldest-first. Without a bound, an agent stashing truncated output would grow
+  the directory until the disk filled. `FileBackend::with_max_bytes` overrides
+  it. A stale key simply fails to read, which a model handles as an ordinary
+  tool error.
+
 ## 0.17.0
 
 > The fixes below also shipped on the **0.16.x maintenance line** — the gasp

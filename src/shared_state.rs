@@ -206,14 +206,72 @@ impl SharedStateBackend for MemoryBackend {
 /// ```
 pub struct FileBackend {
     dir: PathBuf,
+    max_bytes: usize,
 }
 
 impl FileBackend {
     /// Create a new filesystem backend. The directory is created lazily on first write.
+    ///
+    /// Capped at [`DEFAULT_MAX_BYTES`], matching [`MemoryBackend`]. Without a
+    /// cap an agent that stashes truncated tool output would grow the directory
+    /// without bound; with one, the oldest entries are evicted and a stale key
+    /// simply fails to read, which a model handles as an ordinary tool error.
     pub fn new(dir: impl AsRef<Path>) -> Self {
         Self {
             dir: dir.as_ref().to_path_buf(),
+            max_bytes: DEFAULT_MAX_BYTES,
         }
+    }
+
+    /// Create a backend with a custom byte cap.
+    pub fn with_max_bytes(dir: impl AsRef<Path>, max_bytes: usize) -> Self {
+        Self {
+            dir: dir.as_ref().to_path_buf(),
+            max_bytes,
+        }
+    }
+
+    /// Evict oldest-first until the directory fits within `max_bytes`.
+    ///
+    /// Ordering is by modification time. Ties (same-second writes, which are
+    /// ordinary on a coarse-grained filesystem) fall back to filename so
+    /// eviction is deterministic rather than filesystem-order-dependent.
+    async fn evict_to_fit(&self) -> Result<(), SharedStateError> {
+        let mut entries: Vec<(std::time::SystemTime, String, PathBuf, u64)> = Vec::new();
+        let mut total: u64 = 0;
+
+        let mut dir = match tokio::fs::read_dir(&self.dir).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        while let Some(entry) = dir.next_entry().await? {
+            let meta = match entry.metadata().await {
+                Ok(m) if m.is_file() => m,
+                _ => continue,
+            };
+            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            let name = entry.file_name().to_string_lossy().into_owned();
+            total += meta.len();
+            entries.push((modified, name, entry.path(), meta.len()));
+        }
+
+        if total as usize <= self.max_bytes {
+            return Ok(());
+        }
+
+        entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, _, path, len) in entries {
+            if total as usize <= self.max_bytes {
+                break;
+            }
+            // A failed unlink must not fail the write that triggered eviction;
+            // the cap is a bound, not a guarantee.
+            if tokio::fs::remove_file(&path).await.is_ok() {
+                total = total.saturating_sub(len);
+            }
+        }
+        Ok(())
     }
 
     /// Encode a key into a safe, reversible filename.
@@ -272,6 +330,8 @@ impl SharedStateBackend for FileBackend {
         tokio::fs::create_dir_all(&self.dir).await?;
         let path = self.key_to_path(key);
         tokio::fs::write(&path, &value).await?;
+        // After the write, so the just-written value is never the one evicted.
+        self.evict_to_fit().await?;
         Ok(())
     }
 

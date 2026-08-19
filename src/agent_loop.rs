@@ -69,6 +69,13 @@ pub struct AgentLoopConfig {
 
     /// Prompt caching configuration.
     pub cache_config: CacheConfig,
+    /// Where to stash the full text of a truncated tool result, so the model
+    /// can retrieve what head-tail truncation elided.
+    ///
+    /// `None` (default) means truncation behaves exactly as before: the middle
+    /// is gone and only the event stream, which the agent cannot read, still
+    /// has it. Set it and the marker names a `shared_state` key instead.
+    pub tool_output_sink: Option<crate::shared_state::SharedState>,
 
     /// Tool execution strategy (sequential, parallel, or batched).
     pub tool_execution: ToolExecutionStrategy,
@@ -596,9 +603,42 @@ async fn run_loop(
                     .filter(|c| c.truncate_tool_output_on_append);
 
                 for result in &tool_results {
-                    let mut am: AgentMessage = result.clone().into();
+                    let original: AgentMessage = result.clone().into();
+                    let mut am = original.clone();
                     if let Some(ctx_config) = append_cap {
                         am = context::truncate_tool_output(am, ctx_config);
+
+                        // Stash here and nowhere else. This is the one place
+                        // the full text still exists, and it runs exactly once
+                        // per tool result — the compaction path re-runs Level 1
+                        // on settled history every turn, so stashing there
+                        // would mint a new key each pass, change the marker
+                        // bytes, and break the prefix cache that Level 1's
+                        // idempotence exists to protect.
+                        if let Some(sink) = &config.tool_output_sink {
+                            if context::was_truncated(&original, &am) {
+                                if let Message::ToolResult { tool_call_id, .. } = result {
+                                    let key = context::tool_output_key(tool_call_id);
+                                    let full = context::message_text(&original);
+                                    match sink.set(&key, full).await {
+                                        Ok(()) => {
+                                            am = context::annotate_marker_with_key(am, &key);
+                                        }
+                                        Err(e) => {
+                                            // The truncated result is still
+                                            // valid context; only retrieval is
+                                            // lost. Say so rather than leaving
+                                            // a marker pointing at nothing.
+                                            warn!(
+                                                "could not stash full output for {}: {e}; \
+                                                 the truncation marker will not offer retrieval",
+                                                tool_call_id
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     context.messages.push(am.clone());
                     new_messages.push(am);

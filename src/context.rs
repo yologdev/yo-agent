@@ -463,6 +463,80 @@ fn level1_truncate_tool_outputs(
 /// message is first appended means compaction never has to rewrite it later —
 /// which is what keeps the provider's prefix cache intact. See
 /// [`ContextConfig::truncate_tool_output_on_append`].
+/// All text content of a message, concatenated. Used to stash the full,
+/// pre-truncation output.
+pub(crate) fn message_text(msg: &AgentMessage) -> String {
+    match msg {
+        AgentMessage::Llm(Message::ToolResult { content, .. }) => content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// The key a truncated tool result is stashed under, derived from the tool
+/// call id.
+///
+/// Deterministic on purpose: a counter would need mutable state and would
+/// produce different keys on replay, and the key is embedded in marker text
+/// that later compaction passes re-read. Byte-stability of that marker is the
+/// property #99/#100/#102 exist to protect.
+pub fn tool_output_key(tool_call_id: &str) -> String {
+    format!("tool-out-{tool_call_id}")
+}
+
+/// Did truncation actually elide anything from this message?
+///
+/// Compares the pair rather than re-deriving, so the caller stashes only when
+/// there is something to retrieve.
+pub(crate) fn was_truncated(before: &AgentMessage, after: &AgentMessage) -> bool {
+    before != after
+}
+
+/// Rewrite a truncation marker to name where the full output was stashed.
+///
+/// Public because a caller implementing their own stash sink needs the same
+/// marker format the loop produces.
+///
+/// Line count is unchanged, so [`TRUNCATION_MARKER_LINES`] still holds and the
+/// result stays within the same budget the plain marker was sized for.
+pub fn annotate_marker_with_key(msg: AgentMessage, key: &str) -> AgentMessage {
+    match msg {
+        AgentMessage::Llm(Message::ToolResult {
+            tool_call_id,
+            tool_name,
+            content,
+            is_error,
+            timestamp,
+        }) => AgentMessage::Llm(Message::ToolResult {
+            tool_call_id,
+            tool_name,
+            content: content
+                .into_iter()
+                .map(|c| match c {
+                    Content::Text { text } => Content::Text {
+                        text: text.replace(
+                            " lines truncated ...]",
+                            &format!(
+                                " lines truncated — full output: shared_state get \"{key}\" ...]"
+                            ),
+                        ),
+                    },
+                    other => other,
+                })
+                .collect(),
+            is_error,
+            timestamp,
+        }),
+        other => other,
+    }
+}
+
 pub fn truncate_tool_output(msg: AgentMessage, config: &ContextConfig) -> AgentMessage {
     match msg {
         AgentMessage::Llm(Message::ToolResult {
