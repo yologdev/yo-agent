@@ -888,3 +888,218 @@ async fn test_sub_agent_tool_middleware_denies() {
     };
     assert!(text.contains("finished"));
 }
+
+// ---------------------------------------------------------------------------
+// Scoped stash: the sink and the tool must agree on scope (issue #134)
+// ---------------------------------------------------------------------------
+
+struct BigOutputTool;
+
+#[async_trait::async_trait]
+impl AgentTool for BigOutputTool {
+    fn name(&self) -> &str {
+        "big_output"
+    }
+    fn label(&self) -> &str {
+        "Big"
+    }
+    fn description(&self) -> &str {
+        "emits many lines"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(
+        &self,
+        _p: serde_json::Value,
+        _c: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        Ok(ToolResult {
+            content: vec![Content::Text {
+                text: (0..400)
+                    .map(|i| format!("line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            }],
+            details: serde_json::Value::Null,
+        })
+    }
+}
+
+/// A scoped sub-agent stashes under `scope␟key` while its marker names the bare
+/// key. That resolves only because the `shared_state` tool it is given carries
+/// the *same* scoped handle — an agreement that currently holds by construction
+/// and was asserted nowhere. A change to either side would break retrieval
+/// silently.
+#[tokio::test]
+async fn a_scoped_sub_agent_stash_resolves_through_its_own_scoped_tool() {
+    let parent_view = SharedState::new();
+
+    let sub_provider = MockProvider::new(vec![
+        MockResponse::ToolCalls(vec![MockToolCall {
+            provider_metadata: None,
+            name: "big_output".into(),
+            arguments: serde_json::json!({}),
+        }]),
+        MockResponse::Text("done".into()),
+    ]);
+
+    let sub_agent = SubAgentTool::from_provider(
+        "worker",
+        std::sync::Arc::new(sub_provider),
+        ModelConfig::mock(),
+    )
+    .with_tools(vec![std::sync::Arc::new(BigOutputTool)])
+    .with_scoped_shared_state(parent_view.clone(), "worker-1")
+    .with_context_config(yoagent::context::ContextConfig {
+        tool_output_max_lines: 20,
+        ..Default::default()
+    });
+
+    sub_agent
+        .execute(
+            serde_json::json!({"task": "produce output"}),
+            ToolContext::new("tc-1", "worker"),
+        )
+        .await
+        .expect("sub-agent should succeed");
+
+    // The parent's unscoped view sees the entry under the scope prefix, so the
+    // stash really did go through the scoped handle.
+    let parent_keys = parent_view.keys().await;
+    assert_eq!(
+        parent_keys.len(),
+        1,
+        "the sub-agent's truncated output must be stashed, got {parent_keys:?}"
+    );
+    assert!(
+        parent_keys[0].contains("worker-1"),
+        "the entry must carry the sub-agent's scope, got {parent_keys:?}"
+    );
+
+    // And the sub-agent's own scoped view resolves it by the bare key the
+    // marker names — which is the invariant that was never pinned.
+    let scoped = parent_view.scoped("worker-1");
+    let scoped_keys = scoped.keys().await;
+    assert_eq!(
+        scoped_keys.len(),
+        1,
+        "the scoped view must see exactly its own entry, got {scoped_keys:?}"
+    );
+    let full = scoped
+        .get(&scoped_keys[0])
+        .await
+        .expect("the scoped key the marker names must resolve");
+    assert!(
+        full.contains("line 200"),
+        "retrieval must return the elided middle"
+    );
+}
+
+/// A provider that records the system prompt it was handed.
+struct PromptRecorder {
+    prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    inner: MockProvider,
+}
+
+#[async_trait::async_trait]
+impl yoagent::provider::StreamProvider for PromptRecorder {
+    async fn stream(
+        &self,
+        config: yoagent::provider::StreamConfig,
+        tx: tokio::sync::mpsc::UnboundedSender<yoagent::provider::StreamEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Message, yoagent::provider::ProviderError> {
+        self.prompts
+            .lock()
+            .unwrap()
+            .push(config.system_prompt.clone());
+        self.inner.stream(config, tx, cancel).await
+    }
+}
+
+/// Stashed tool output must not leak into the sub-agent's system prompt.
+///
+/// This asserts on the prompt the provider actually receives. An earlier
+/// version called `prompt_summary()` directly and never inspected a prompt —
+/// reverting `sub_agent.rs` to the leaking `summary()` left it green, so the
+/// test named for the regression could not see it.
+///
+/// The prompt embeds a `SharedState` summary computed once per invocation, so
+/// a second run would otherwise carry the first run's machine-generated
+/// `tool-out-*` keys — a different system prompt per delegation, meaning no
+/// sub-agent call can reuse the previous one's cached prefix.
+#[tokio::test]
+async fn stashed_output_does_not_leak_into_the_sub_agent_system_prompt() {
+    let store = SharedState::new();
+    let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let run = |label: &'static str| {
+        let store = store.clone();
+        let prompts = prompts.clone();
+        async move {
+            SubAgentTool::from_provider(
+                "worker",
+                std::sync::Arc::new(PromptRecorder {
+                    prompts,
+                    inner: MockProvider::new(vec![
+                        MockResponse::ToolCalls(vec![MockToolCall {
+                            provider_metadata: None,
+                            name: "big_output".into(),
+                            arguments: serde_json::json!({}),
+                        }]),
+                        MockResponse::Text("done".into()),
+                    ]),
+                }),
+                ModelConfig::mock(),
+            )
+            .with_tools(vec![std::sync::Arc::new(BigOutputTool)])
+            .with_system_prompt("You are a worker.")
+            .with_shared_state(store)
+            .with_context_config(yoagent::context::ContextConfig {
+                tool_output_max_lines: 20,
+                ..Default::default()
+            })
+            .execute(
+                serde_json::json!({ "task": label }),
+                ToolContext::new("tc-1", "worker"),
+            )
+            .await
+            .expect("run")
+        }
+    };
+
+    run("first").await;
+    assert!(
+        !store.keys().await.is_empty(),
+        "precondition: the first run must have stashed something"
+    );
+    run("second").await;
+
+    let seen = prompts.lock().unwrap().clone();
+    assert!(
+        seen.len() >= 2,
+        "both invocations must have reached the provider"
+    );
+    for (i, prompt) in seen.iter().enumerate() {
+        assert!(
+            !prompt.contains("tool-out-"),
+            "prompt {i} carries a stash key: {prompt}"
+        );
+    }
+
+    // The load-bearing property: the prompt is byte-identical across
+    // invocations, so a delegation can reuse the previous one's cached prefix.
+    let first_of_run_one = &seen[0];
+    let first_of_run_two = seen.last().unwrap();
+    assert_eq!(
+        first_of_run_one, first_of_run_two,
+        "the system prompt must not change between invocations"
+    );
+
+    // A user-set variable still belongs in the prompt summary, and stashes are
+    // still discoverable at runtime through the tool's own listing.
+    store.set("findings", "user data".into()).await.unwrap();
+    assert!(store.prompt_summary().await.contains("findings"));
+    assert!(store.summary().await.contains("tool-out-"));
+}

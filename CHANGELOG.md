@@ -46,6 +46,36 @@ adheres to [Semantic Versioning](https://semver.org/).
   restarts every turn — id alone would let turn 1's frozen marker resolve to
   turn 5's content.
 
+- **Truncation stash: one key per content block, and `SubAgentTool` can now
+  reach it at all** ([#134](https://github.com/yologdev/yoagent/issues/134)).
+
+  A tool result carrying several text blocks got one marker per block, all
+  naming the **same** key, while the stash held the blocks joined by `\n` with
+  any image between them silently dropped. So a fetch returned every block
+  concatenated — never the block whose marker the model had just followed — and
+  the value called "full output" was missing content the transcript still
+  showed. Keys are now block-qualified and each marker names exactly the block it sits
+  in — the suffix is the block's position in the content vector, so
+  text/image/text yields `…-b0` and `…-b2`, not `-b0`/`-b1`.
+
+  Making that path reachable exposed a second problem it had been hiding: the
+  sub-agent's system prompt embeds a `SharedState` summary, so a second
+  invocation would have seen the first run's `tool-out-*` keys — a *different*
+  system prompt each time, breaking prefix caching on every sub-agent turn and
+  filling the most cache-sensitive text in the request with pointers to
+  kilobyte-sized blobs nobody asked about. The cost is a cold prefix on the
+  first turn of every subsequent delegation, not on every turn — the prompt is
+  built once per invocation. `SharedState::prompt_summary` excludes them; the
+  `shared_state` tool's `list` still shows them, so they stay discoverable at
+  runtime where changing text costs nothing.
+
+  Separately, the sink wired into `SubAgentTool` in #133 was **dead code**.
+  Sub-agents set `context_config: None`, and the loop gates truncation and
+  stashing together on that being `Some` — so sub-agents never truncated tool
+  output and therefore never stashed. `SubAgentTool::with_context_config` makes
+  both reachable. `max_turns` remains the guard on a sub-agent's *length*; this
+  is about the size of any single tool result it takes in.
+
 - **Recorded why `LlmCompaction` summarizes standalone rather than in-session**
   ([#127](https://github.com/yologdev/yoagent/issues/127)). Appending the
   summarization instruction to the live session makes the history a prefix-cache

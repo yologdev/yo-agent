@@ -454,23 +454,31 @@ fn level1_truncate_tool_outputs(
         .collect()
 }
 
-/// All text content of a message, concatenated. Used to stash the full,
-/// pre-truncation output.
+/// All `Content::Text` of a message, joined with newlines.
+///
+/// The hash input for [`tool_output_key`] — not a stored value. Per-block
+/// stashing means no single entry holds this string.
 pub fn message_text(msg: &AgentMessage) -> String {
-    match msg {
-        AgentMessage::Llm(Message::ToolResult { content, .. }) => content
-            .iter()
-            .filter_map(|c| match c {
-                Content::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
+    block_texts(msg)
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-/// The key a truncated tool result is stashed under.
+/// Prefix marking a key as machine-generated truncation stash rather than a
+/// variable a caller or model chose to store.
+///
+/// Used to keep these out of the system-prompt summary: that text is
+/// prefix-cached, and an entry appearing there on every stash would change the
+/// prompt each turn.
+pub const TOOL_OUTPUT_KEY_PREFIX: &str = "tool-out-";
+
+/// The **base** key for a truncated tool result.
+///
+/// Nothing is stored under this key: per-block keys derive from it via
+/// [`block_key`]. The hash input is every text block joined, so the base is
+/// stable for the whole result while each block gets its own entry.
 ///
 /// Combines the tool call id with a hash of the full output. The id alone is
 /// not enough: `google.rs` and `google_vertex.rs` synthesize ids as a
@@ -490,28 +498,67 @@ pub fn tool_output_key(tool_call_id: &str, full_output: &str) -> String {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!("tool-out-{tool_call_id}-{hash:016x}")
+    format!("{TOOL_OUTPUT_KEY_PREFIX}{tool_call_id}-{hash:016x}")
 }
 
-/// Truncate, optionally naming a stash key inside the marker.
+/// The stash key for one content block of a tool result.
 ///
-/// Public so a caller implementing their own stash sink can reproduce exactly
-/// what the loop does: truncate with `None` to learn whether a marker exists,
-/// stash, then truncate again with `Some(key)`.
+/// Block-qualified because a result can carry several text blocks, each
+/// truncated independently and each getting its own marker. Sharing one key
+/// across them made every marker resolve to all the blocks concatenated —
+/// never the one the model had just been told to fetch.
+pub fn block_key(base: &str, block: usize) -> String {
+    format!("{base}-b{block}")
+}
+
+/// The text of each `Content::Text` block, with its index.
 ///
-/// Returns the message and whether a marker naming `key` was actually emitted.
+/// Indices are positions in the **full content vector** — the same enumeration
+/// [`truncate_tool_output_keyed`] uses — so the indices it reports in `marked`
+/// address these entries directly.
+///
+/// They are deliberately *not* a count of text blocks. A text-only ordinal
+/// would read more naturally and would silently disagree with the marker keys
+/// whenever non-text content sits between two text blocks: `[Text, Image,
+/// Text]` yields indices 0 and 2 here and must yield `-b0` and `-b2` there.
+pub fn block_texts(msg: &AgentMessage) -> Vec<(usize, String)> {
+    match msg {
+        AgentMessage::Llm(Message::ToolResult { content, .. }) => content
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| match c {
+                Content::Text { text } => Some((i, text.clone())),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Truncate, optionally naming a per-block stash key inside each marker.
+///
+/// Returns the message and the indices of blocks that actually got a marker.
 ///
 /// The key is threaded into marker *generation* rather than substituted
 /// afterwards. Rewriting the rendered text would hit every occurrence of the
 /// marker's shape — including one that came from the tool's own output, which
 /// is ordinary for a coding agent reading a log or a session transcript — and
-/// would silently do nothing in the case below where truncation emits no marker
-/// at all. Generating it means the key is present exactly when a marker is.
+/// would silently do nothing in the case where truncation emits no marker at
+/// all. Generating it means the key is present exactly when a marker is.
+///
+/// Each marker names *its own block's* key, so what the model fetches is the
+/// block whose marker it followed — not the whole result flattened, which is
+/// what a single shared key produced and which silently dropped any non-text
+/// content sitting between the blocks.
+///
+/// Public so a caller implementing their own stash sink can reproduce exactly
+/// what the loop does: truncate with `None` to learn which blocks carry a
+/// marker, stash those, then truncate again with the base key.
 pub fn truncate_tool_output_keyed(
     msg: AgentMessage,
     config: &ContextConfig,
-    key: Option<&str>,
-) -> (AgentMessage, bool) {
+    base_key: Option<&str>,
+) -> (AgentMessage, Vec<usize>) {
     match msg {
         AgentMessage::Llm(Message::ToolResult {
             tool_call_id,
@@ -521,13 +568,18 @@ pub fn truncate_tool_output_keyed(
             timestamp,
         }) => {
             let max_lines = config.max_lines_for(&tool_name);
-            let mut emitted = false;
+            let mut marked = Vec::new();
             let truncated_content: Vec<Content> = content
                 .into_iter()
-                .map(|c| match c {
+                .enumerate()
+                .map(|(i, c)| match c {
                     Content::Text { text } => {
-                        let (out, marked) = truncate_text_head_tail(&text, max_lines, key);
-                        emitted |= marked;
+                        let key = base_key.map(|b| block_key(b, i));
+                        let (out, emitted) =
+                            truncate_text_head_tail(&text, max_lines, key.as_deref());
+                        if emitted {
+                            marked.push(i);
+                        }
                         Content::Text { text: out }
                     }
                     other => other,
@@ -542,10 +594,10 @@ pub fn truncate_tool_output_keyed(
                     is_error,
                     timestamp,
                 }),
-                emitted,
+                marked,
             )
         }
-        other => (other, false),
+        other => (other, Vec::new()),
     }
 }
 

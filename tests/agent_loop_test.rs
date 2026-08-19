@@ -3481,3 +3481,303 @@ async fn detection_can_be_switched_off() {
         "None must disable detection"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Multimodal + scoped stash (issue #134)
+// ---------------------------------------------------------------------------
+
+/// A tool result carrying text, an image, and more text.
+struct MultimodalTool;
+
+#[async_trait::async_trait]
+impl AgentTool for MultimodalTool {
+    fn name(&self) -> &str {
+        "multimodal"
+    }
+    fn label(&self) -> &str {
+        "Multimodal"
+    }
+    fn description(&self) -> &str {
+        "emits text, an image, and more text"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(
+        &self,
+        _p: serde_json::Value,
+        _c: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let long = |tag: &str| {
+            (0..300)
+                .map(|i| format!("{tag} {i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        Ok(ToolResult {
+            content: vec![
+                Content::Text {
+                    text: long("alpha"),
+                },
+                Content::Image {
+                    data: "AAAA".into(),
+                    mime_type: "image/png".into(),
+                },
+                Content::Text {
+                    text: long("omega"),
+                },
+            ],
+            details: serde_json::Value::Null,
+        })
+    }
+}
+
+fn markers_in(messages: &[AgentMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .flat_map(|m| match m {
+            AgentMessage::Llm(Message::ToolResult { content, .. }) => content
+                .iter()
+                .filter_map(|c| match c {
+                    Content::Text { text } => text
+                        .split_once("shared_state get \"")
+                        .and_then(|(_, r)| r.split_once('"').map(|(k, _)| k.to_string())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            _ => vec![],
+        })
+        .collect()
+}
+
+/// Each marker must resolve to *its own* block. Sharing one key across blocks
+/// made every fetch return all blocks concatenated, with the image between
+/// them silently dropped — so what the model got back was never the block whose
+/// marker it followed.
+#[tokio::test]
+async fn each_text_block_gets_its_own_key_and_resolves_to_itself() {
+    let state = yoagent::shared_state::SharedState::new();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut context = AgentContext {
+        messages: vec![],
+        tools: vec![Box::new(MultimodalTool)],
+        system_prompt: String::new(),
+    };
+    let mut config = make_config(MockProvider::new(vec![
+        MockResponse::ToolCalls(vec![MockToolCall {
+            provider_metadata: None,
+            name: "multimodal".into(),
+            arguments: serde_json::json!({}),
+        }]),
+        MockResponse::Text("done".into()),
+    ]));
+    config.context_config = Some(yoagent::context::ContextConfig {
+        tool_output_max_lines: 20,
+        ..Default::default()
+    });
+    config.tool_output_sink = Some(state.clone());
+
+    let messages = agent_loop(
+        vec![AgentMessage::Llm(Message::user("go"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let keys = markers_in(&messages);
+    assert_eq!(
+        keys.len(),
+        2,
+        "one marker per truncated text block: {keys:?}"
+    );
+    assert_ne!(keys[0], keys[1], "blocks must not share a key: {keys:?}");
+
+    // Each key resolves to exactly the block whose marker named it.
+    let first = state.get(&keys[0]).await.expect("first key resolves");
+    let second = state.get(&keys[1]).await.expect("second key resolves");
+    assert!(
+        first.contains("alpha 150") && !first.contains("omega"),
+        "the first marker's key must return only the first block"
+    );
+    assert!(
+        second.contains("omega 150") && !second.contains("alpha"),
+        "the second marker's key must return only the second block"
+    );
+
+    // The image survives in the transcript untouched — truncation never
+    // rewrote it, and the stash never claimed to hold it.
+    let has_image = messages.iter().any(|m| match m {
+        AgentMessage::Llm(Message::ToolResult { content, .. }) => {
+            content.iter().any(|c| matches!(c, Content::Image { .. }))
+        }
+        _ => false,
+    });
+    assert!(has_image, "non-text content must pass through untouched");
+}
+
+/// Only the second text block is long enough to truncate, so `marked` is
+/// `[2]` while `blocks` holds entries at 0 and 2. Every other multi-block test
+/// truncates *all* blocks, which makes `marked`'s values and `blocks`'
+/// positions coincide — hiding the natural refactor
+/// (`marked.iter().enumerate()` indexing `blocks[n]`) that would store one
+/// block's text under another block's key.
+#[tokio::test]
+async fn a_partially_truncated_result_keys_the_right_block() {
+    struct ShortThenLong;
+    #[async_trait::async_trait]
+    impl AgentTool for ShortThenLong {
+        fn name(&self) -> &str {
+            "short_then_long"
+        }
+        fn label(&self) -> &str {
+            "Mixed"
+        }
+        fn description(&self) -> &str {
+            "a short block, an image, then a long one"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _p: serde_json::Value,
+            _c: ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult {
+                content: vec![
+                    Content::Text {
+                        text: "short and safe".into(),
+                    },
+                    Content::Image {
+                        data: "AAAA".into(),
+                        mime_type: "image/png".into(),
+                    },
+                    Content::Text {
+                        text: (0..300)
+                            .map(|i| format!("omega {i}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    },
+                ],
+                details: serde_json::Value::Null,
+            })
+        }
+    }
+
+    let state = yoagent::shared_state::SharedState::new();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut context = AgentContext {
+        messages: vec![],
+        tools: vec![Box::new(ShortThenLong)],
+        system_prompt: String::new(),
+    };
+    let mut config = make_config(MockProvider::new(vec![
+        MockResponse::ToolCalls(vec![MockToolCall {
+            provider_metadata: None,
+            name: "short_then_long".into(),
+            arguments: serde_json::json!({}),
+        }]),
+        MockResponse::Text("done".into()),
+    ]));
+    config.context_config = Some(yoagent::context::ContextConfig {
+        tool_output_max_lines: 20,
+        ..Default::default()
+    });
+    config.tool_output_sink = Some(state.clone());
+
+    let messages = agent_loop(
+        vec![AgentMessage::Llm(Message::user("go"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let keys = markers_in(&messages);
+    assert_eq!(keys.len(), 1, "only the long block truncates: {keys:?}");
+    assert!(
+        keys[0].ends_with("-b2"),
+        "the key must name the long block's own position (2), not its ordinal \
+         among text blocks (1): {}",
+        keys[0]
+    );
+    let full = state.get(&keys[0]).await.expect("the key resolves");
+    assert!(
+        full.contains("omega 150") && !full.contains("short and safe"),
+        "the key must return the block whose marker named it"
+    );
+}
+
+/// Image-only results are correctly benign: nothing truncates, so nothing is
+/// stashed and no marker appears. Pinned so a future change to the stash gate
+/// cannot regress it into storing an empty string under a live key.
+#[tokio::test]
+async fn an_image_only_result_stashes_nothing() {
+    struct ImageOnly;
+    #[async_trait::async_trait]
+    impl AgentTool for ImageOnly {
+        fn name(&self) -> &str {
+            "image_only"
+        }
+        fn label(&self) -> &str {
+            "Image"
+        }
+        fn description(&self) -> &str {
+            "an image and nothing else"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _p: serde_json::Value,
+            _c: ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult {
+                content: vec![Content::Image {
+                    data: "AAAA".into(),
+                    mime_type: "image/png".into(),
+                }],
+                details: serde_json::Value::Null,
+            })
+        }
+    }
+
+    let state = yoagent::shared_state::SharedState::new();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut context = AgentContext {
+        messages: vec![],
+        tools: vec![Box::new(ImageOnly)],
+        system_prompt: String::new(),
+    };
+    let mut config = make_config(MockProvider::new(vec![
+        MockResponse::ToolCalls(vec![MockToolCall {
+            provider_metadata: None,
+            name: "image_only".into(),
+            arguments: serde_json::json!({}),
+        }]),
+        MockResponse::Text("done".into()),
+    ]));
+    config.context_config = Some(yoagent::context::ContextConfig {
+        tool_output_max_lines: 20,
+        ..Default::default()
+    });
+    config.tool_output_sink = Some(state.clone());
+
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user("go"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert!(
+        state.keys().await.is_empty(),
+        "nothing was elided, so nothing may be stored"
+    );
+}

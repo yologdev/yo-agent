@@ -573,6 +573,33 @@ impl SharedState {
         }
     }
 
+    /// Summary for a system prompt: like [`summary`](Self::summary) but
+    /// excluding machine-generated truncation stashes.
+    ///
+    /// The system prompt is the most prefix-cache-sensitive text in a request.
+    /// A stash entry appearing here would change the prompt on every
+    /// truncation, breaking the cache on every subsequent turn and filling it
+    /// with kilobyte-sized keys nobody asked about. The model can still
+    /// discover them at runtime via the `shared_state` tool's `list`, which
+    /// uses the complete [`summary`](Self::summary).
+    pub async fn prompt_summary(&self) -> String {
+        let mut entries: Vec<(String, usize)> = Vec::new();
+        for key in self.keys().await {
+            // A scoped write lands as `scope␟tool-out-…`, so a prefix test on
+            // the whole key misses every stash a scoped sub-agent made — and it
+            // is the *unscoped* parent whose prompt would then carry them.
+            // Compare the part after the last scope separator.
+            let bare = key.rsplit(SCOPE_SEP).next().unwrap_or(&key);
+            if bare.starts_with(crate::context::TOOL_OUTPUT_KEY_PREFIX) {
+                continue;
+            }
+            let len = self.get(&key).await.map(|v| v.len()).unwrap_or(0);
+            entries.push((key, len));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        format_summary(entries.iter().map(|(k, n)| (k.as_str(), *n)))
+    }
+
     /// Human-readable summary of stored variables (key names + byte sizes).
     /// Suitable for injecting into a system prompt.
     ///

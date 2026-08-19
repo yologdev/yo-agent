@@ -691,9 +691,9 @@ async fn run_loop(
                     let original: AgentMessage = result.clone().into();
                     let mut am = original.clone();
                     if let Some(ctx_config) = append_cap {
-                        // First pass, unkeyed: tells us both what the context
-                        // will hold and whether a marker exists to name a key.
-                        let (plain, has_marker) =
+                        // First pass, unkeyed: tells us what the context will
+                        // hold and which blocks carry a marker to name a key.
+                        let (plain, marked) =
                             context::truncate_tool_output_keyed(original.clone(), ctx_config, None);
                         am = plain;
 
@@ -703,36 +703,107 @@ async fn run_loop(
                         // discarded the middle, so there would be nothing left
                         // to store.
                         //
-                        // `has_marker` is the gate, not "did the text change":
-                        // a budget too small for a marker still truncates, and
+                        // `marked` is the gate, not "did the text change": a
+                        // budget too small for a marker still truncates, and
                         // stashing then would leave an entry no marker names
                         // and nothing can reach.
-                        if let (Some(sink), true) = (&config.tool_output_sink, has_marker) {
+                        if let (Some(sink), false) = (&config.tool_output_sink, marked.is_empty()) {
                             if let Message::ToolResult { tool_call_id, .. } = result {
-                                let full = context::message_text(&original);
-                                let key = context::tool_output_key(tool_call_id, &full);
-                                match sink.set(&key, full).await {
-                                    Ok(()) => {
-                                        // Re-truncate from the original with
-                                        // the key inline, so the marker names
-                                        // it only once the value is stored.
-                                        am = context::truncate_tool_output_keyed(
-                                            original.clone(),
-                                            ctx_config,
-                                            Some(&key),
-                                        )
-                                        .0;
-                                    }
-                                    Err(e) => {
-                                        // The unkeyed marker already in `am` is
-                                        // the pre-feature behaviour: still
-                                        // truncated, but promising nothing it
-                                        // cannot deliver.
-                                        warn!(
-                                            "could not stash full output for {tool_call_id}: {e}; \
-                                             the truncation marker will not offer retrieval"
+                                let blocks = context::block_texts(&original);
+                                // One key per marked block. A single shared key
+                                // made every marker resolve to all blocks
+                                // concatenated, silently dropping any image
+                                // between them, so what the model fetched was
+                                // never the block whose marker it followed.
+                                // Via the shared helper, so the hash input
+                                // cannot drift from what `message_text`
+                                // documents and silently move every key.
+                                let base = context::tool_output_key(
+                                    tool_call_id,
+                                    &context::message_text(&original),
+                                );
+                                let mut all_stored = true;
+                                let mut written: Vec<String> = Vec::new();
+                                for idx in &marked {
+                                    let Some((_, text)) = blocks.iter().find(|(i, _)| i == idx)
+                                    else {
+                                        // Unreachable — `marked` and `blocks`
+                                        // both enumerate the same `original`.
+                                        // Fail closed regardless: continuing
+                                        // leaves `all_stored` true and emits a
+                                        // marker for a block never stored,
+                                        // which is the defect this feature
+                                        // exists to prevent.
+                                        debug_assert!(
+                                            false,
+                                            "marked block {idx} absent from block_texts"
                                         );
+                                        all_stored = false;
+                                        break;
+                                    };
+                                    let key = context::block_key(&base, *idx);
+                                    match sink.set(&key, text.clone()).await {
+                                        Ok(()) => written.push(key),
+                                        Err(e) => {
+                                            all_stored = false;
+                                            warn!(
+                                                tool_call_id = %tool_call_id,
+                                                block = idx,
+                                                bytes = text.len(),
+                                                "could not stash tool output: {e}; no marker in \
+                                                 this result will offer retrieval"
+                                            );
+                                            break;
+                                        }
                                     }
+                                }
+
+                                // `Ok(())` per write is not proof the set
+                                // survived. `FileBackend` evicts to fit and
+                                // exempts only the key it just wrote, so a
+                                // later sibling can evict an earlier one —
+                                // and its (mtime, filename) ordering makes
+                                // `-b0` lose to `-b2` deterministically. Naming
+                                // a key that was deleted microseconds ago is
+                                // exactly the marker-points-at-nothing failure
+                                // the backend's own guard was added to stop.
+                                if all_stored {
+                                    for key in &written {
+                                        if sink.get(key).await.is_none() {
+                                            all_stored = false;
+                                            warn!(
+                                                tool_call_id = %tool_call_id,
+                                                key = %key,
+                                                stored = written.len(),
+                                                "a stashed block did not survive storing its \
+                                                 siblings — the backend cap cannot hold this \
+                                                 result; no marker will offer retrieval"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                // Roll back whatever is left, keyed or not.
+                                // Half a result in the store is unreachable
+                                // bytes that still count against the cap, and
+                                // on `FileBackend` they evict the caller's own
+                                // artifacts to make room for debris.
+                                if !all_stored {
+                                    for key in &written {
+                                        sink.remove(key).await;
+                                    }
+                                }
+                                if all_stored {
+                                    // Re-truncate from the original with the
+                                    // base key, so each marker names its own
+                                    // block only once every block is stored.
+                                    am = context::truncate_tool_output_keyed(
+                                        original.clone(),
+                                        ctx_config,
+                                        Some(&base),
+                                    )
+                                    .0;
                                 }
                             }
                         }
