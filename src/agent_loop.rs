@@ -69,6 +69,17 @@ pub struct AgentLoopConfig {
 
     /// Prompt caching configuration.
     pub cache_config: CacheConfig,
+    /// Where to stash the full text of a truncated tool result, so the model
+    /// can retrieve what head-tail truncation elided.
+    ///
+    /// `None` (default) means truncation behaves exactly as before: the middle
+    /// is gone and only the event stream, which the agent cannot read, still
+    /// has it. Set it and the marker names a `shared_state` key instead.
+    ///
+    /// The pointer lives in the transcript, so it is lost when lossy compaction
+    /// drops that turn — the stash entry outlives it and keeps consuming the
+    /// backend's cap. Retrieval is best-effort by construction.
+    pub tool_output_sink: Option<crate::shared_state::SharedState>,
 
     /// Tool execution strategy (sequential, parallel, or batched).
     pub tool_execution: ToolExecutionStrategy,
@@ -596,9 +607,54 @@ async fn run_loop(
                     .filter(|c| c.truncate_tool_output_on_append);
 
                 for result in &tool_results {
-                    let mut am: AgentMessage = result.clone().into();
+                    let original: AgentMessage = result.clone().into();
+                    let mut am = original.clone();
                     if let Some(ctx_config) = append_cap {
-                        am = context::truncate_tool_output(am, ctx_config);
+                        // First pass, unkeyed: tells us both what the context
+                        // will hold and whether a marker exists to name a key.
+                        let (plain, has_marker) =
+                            context::truncate_tool_output_keyed(original.clone(), ctx_config, None);
+                        am = plain;
+
+                        // Stash here and nowhere else. This is the one place
+                        // the full text still exists — by the time compaction
+                        // runs, the append-path truncation has already
+                        // discarded the middle, so there would be nothing left
+                        // to store.
+                        //
+                        // `has_marker` is the gate, not "did the text change":
+                        // a budget too small for a marker still truncates, and
+                        // stashing then would leave an entry no marker names
+                        // and nothing can reach.
+                        if let (Some(sink), true) = (&config.tool_output_sink, has_marker) {
+                            if let Message::ToolResult { tool_call_id, .. } = result {
+                                let full = context::message_text(&original);
+                                let key = context::tool_output_key(tool_call_id, &full);
+                                match sink.set(&key, full).await {
+                                    Ok(()) => {
+                                        // Re-truncate from the original with
+                                        // the key inline, so the marker names
+                                        // it only once the value is stored.
+                                        am = context::truncate_tool_output_keyed(
+                                            original.clone(),
+                                            ctx_config,
+                                            Some(&key),
+                                        )
+                                        .0;
+                                    }
+                                    Err(e) => {
+                                        // The unkeyed marker already in `am` is
+                                        // the pre-feature behaviour: still
+                                        // truncated, but promising nothing it
+                                        // cannot deliver.
+                                        warn!(
+                                            "could not stash full output for {tool_call_id}: {e}; \
+                                             the truncation marker will not offer retrieval"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                     context.messages.push(am.clone());
                     new_messages.push(am);

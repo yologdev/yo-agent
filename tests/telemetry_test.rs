@@ -78,6 +78,7 @@ fn loop_config(provider: MockProvider) -> yoagent::agent_loop::AgentLoopConfig {
         compaction_strategy: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),
+        tool_output_sink: None,
         tool_execution: ToolExecutionStrategy::default(),
         tool_middleware: vec![],
         output_schema: None,

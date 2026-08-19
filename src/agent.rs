@@ -52,6 +52,13 @@ pub struct Agent {
     context_management_disabled: bool,
     pub execution_limits: Option<ExecutionLimits>,
     pub cache_config: CacheConfig,
+    /// Shared key-value store. Truncated tool output is stashed here, and the
+    /// `shared_state` tool is registered for the run so the model can fetch it.
+    ///
+    /// Prefer [`with_shared_state`](Self::with_shared_state); registration
+    /// happens when the run's tool list is assembled, so setting this field
+    /// directly works too.
+    pub shared_state: Option<crate::shared_state::SharedState>,
     pub tool_execution: ToolExecutionStrategy,
     pub retry_config: crate::retry::RetryConfig,
 
@@ -260,6 +267,7 @@ impl Agent {
             context_management_disabled: false,
             execution_limits: Some(ExecutionLimits::default()),
             cache_config: CacheConfig::default(),
+            shared_state: None,
             tool_execution: ToolExecutionStrategy::default(),
             retry_config: crate::retry::RetryConfig::default(),
             before_turn: None,
@@ -331,6 +339,45 @@ impl Agent {
 
     pub fn with_context_config(mut self, config: ContextConfig) -> Self {
         self.context_config = Some(config);
+        self
+    }
+
+    /// Attach a shared key-value store.
+    ///
+    /// Two things follow. The `shared_state` tool is registered, so the model
+    /// can read and write the store — `SharedState` was always described as a
+    /// parent↔sub-agent medium, but until now only `SubAgentTool` wired it, so
+    /// a parent could populate it and never read it back.
+    ///
+    /// And truncated tool output is stashed here: head-tail truncation
+    /// currently discards the middle irrecoverably, and with a store attached
+    /// the marker names a key the model can fetch instead.
+    /// Take the tool list for a run, injecting `shared_state` when a store is
+    /// configured.
+    ///
+    /// Injection happens here rather than in `with_shared_state` so that
+    /// neither a repeat call (duplicate tool names are a provider 400) nor a
+    /// later `with_tools` (which replaces the vector) can desynchronise the
+    /// tool from the sink. A marker naming a tool the model cannot see is the
+    /// failure this ordering prevents.
+    fn take_tools(&mut self) -> Vec<Box<dyn AgentTool>> {
+        let mut tools = std::mem::take(&mut self.tools);
+        if let Some(state) = &self.shared_state {
+            if !tools.iter().any(|t| t.name() == "shared_state") {
+                tools.push(Box::new(crate::tools::SharedStateTool::new(state.clone())));
+            }
+        }
+        tools
+    }
+
+    pub fn with_shared_state(mut self, state: crate::shared_state::SharedState) -> Self {
+        // Only the field. The tool is injected where the tool list is
+        // assembled, mirroring `SubAgentTool` — pushing here would double a
+        // second call (providers reject duplicate tool names with a 400), and
+        // a later `with_tools` would replace the vector, silently dropping the
+        // tool while leaving the sink set. That combination is the worst one:
+        // markers would name a tool the model cannot see.
+        self.shared_state = Some(state);
         self
     }
 
@@ -814,7 +861,7 @@ impl Agent {
         let mut context = AgentContext {
             system_prompt: self.system_prompt.clone(),
             messages: self.messages.clone(),
-            tools: std::mem::take(&mut self.tools),
+            tools: self.take_tools(),
         };
 
         let mut config = self.build_config();
@@ -897,7 +944,7 @@ impl Agent {
         let mut context = AgentContext {
             system_prompt: self.system_prompt.clone(),
             messages: self.messages.clone(),
-            tools: std::mem::take(&mut self.tools),
+            tools: self.take_tools(),
         };
 
         let config = self.build_config();
@@ -936,7 +983,7 @@ impl Agent {
         let mut context = AgentContext {
             system_prompt: self.system_prompt.clone(),
             messages: self.messages.clone(),
-            tools: std::mem::take(&mut self.tools),
+            tools: self.take_tools(),
         };
 
         let config = self.build_config();
@@ -973,7 +1020,7 @@ impl Agent {
         let mut context = AgentContext {
             system_prompt: self.system_prompt.clone(),
             messages: self.messages.clone(),
-            tools: std::mem::take(&mut self.tools),
+            tools: self.take_tools(),
         };
 
         let config = self.build_config();
@@ -1109,6 +1156,7 @@ impl Agent {
             compaction_strategy: self.compaction_strategy.clone(),
             execution_limits: self.execution_limits.clone(),
             cache_config: self.cache_config.clone(),
+            tool_output_sink: self.shared_state.clone(),
             tool_execution: self.tool_execution.clone(),
             retry_config: self.retry_config.clone(),
             get_follow_up_messages: Some(Box::new(move || {

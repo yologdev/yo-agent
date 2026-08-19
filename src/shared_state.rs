@@ -23,6 +23,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::warn;
 
 /// Default capacity for the memory backend: 10 MB.
 const DEFAULT_MAX_BYTES: usize = 10 * 1024 * 1024;
@@ -206,14 +207,95 @@ impl SharedStateBackend for MemoryBackend {
 /// ```
 pub struct FileBackend {
     dir: PathBuf,
+    max_bytes: usize,
 }
 
 impl FileBackend {
     /// Create a new filesystem backend. The directory is created lazily on first write.
+    ///
+    /// **The directory is owned exclusively by this backend.** Eviction unlinks
+    /// regular files it finds there, so pointing this at a directory holding
+    /// anything else will lose those files.
+    ///
+    /// Capped at [`DEFAULT_MAX_BYTES`], matching [`MemoryBackend`]. Without a
+    /// cap an agent that stashes truncated tool output would grow the directory
+    /// without bound; with one, the oldest entries are evicted and a stale key
+    /// simply fails to read, which a model handles as an ordinary tool error.
     pub fn new(dir: impl AsRef<Path>) -> Self {
         Self {
             dir: dir.as_ref().to_path_buf(),
+            max_bytes: DEFAULT_MAX_BYTES,
         }
+    }
+
+    /// Create a backend with a custom byte cap.
+    pub fn with_max_bytes(dir: impl AsRef<Path>, max_bytes: usize) -> Self {
+        Self {
+            dir: dir.as_ref().to_path_buf(),
+            max_bytes,
+        }
+    }
+
+    /// Evict oldest-first until the directory fits within `max_bytes`.
+    ///
+    /// Ordering is by modification time. Ties (same-second writes, which are
+    /// ordinary on a coarse-grained filesystem) fall back to filename so
+    /// eviction is deterministic rather than filesystem-order-dependent.
+    async fn evict_to_fit(&self, keep: Option<&str>) -> Result<(), SharedStateError> {
+        let keep_name = keep.map(|k| {
+            self.key_to_path(k)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+        let mut entries: Vec<(std::time::SystemTime, String, PathBuf, u64)> = Vec::new();
+        let mut total: u64 = 0;
+
+        let mut dir = match tokio::fs::read_dir(&self.dir).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        while let Some(entry) = dir.next_entry().await? {
+            let meta = match entry.metadata().await {
+                Ok(m) if m.is_file() => m,
+                _ => continue,
+            };
+            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            let name = entry.file_name().to_string_lossy().into_owned();
+            total += meta.len();
+            entries.push((modified, name, entry.path(), meta.len()));
+        }
+
+        if total as usize <= self.max_bytes {
+            return Ok(());
+        }
+
+        entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, name, path, len) in entries {
+            if total as usize <= self.max_bytes {
+                break;
+            }
+            // Never evict the write that triggered this pass.
+            if keep_name.as_deref() == Some(name.as_str()) {
+                continue;
+            }
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => total = total.saturating_sub(len),
+                // A failed unlink must not fail the write that triggered
+                // eviction — the cap is a bound, not a guarantee — but it must
+                // not be silent either, or the directory grows without bound
+                // while every `set` reports success.
+                Err(e) => warn!("shared state: could not evict {}: {e}", path.display()),
+            }
+        }
+        if total as usize > self.max_bytes {
+            warn!(
+                "shared state: {} bytes still over the {} byte cap after eviction",
+                total, self.max_bytes
+            );
+        }
+        Ok(())
     }
 
     /// Encode a key into a safe, reversible filename.
@@ -269,9 +351,25 @@ impl SharedStateBackend for FileBackend {
     }
 
     async fn set(&self, key: &str, value: String) -> Result<(), SharedStateError> {
+        // Reject an oversized value rather than writing it and then evicting
+        // it on the next line. `MemoryBackend` rejects here too, so the two
+        // backends agree that over-cap is an error the caller must see — a
+        // silent `Ok(())` for a value that is already gone would let the loop
+        // annotate a truncation marker with a key that never existed.
+        if value.len() > self.max_bytes {
+            return Err(SharedStateError::Capacity(CapacityError {
+                key: key.to_string(),
+                value_bytes: value.len(),
+                current_bytes: 0,
+                max_bytes: self.max_bytes,
+            }));
+        }
         tokio::fs::create_dir_all(&self.dir).await?;
         let path = self.key_to_path(key);
         tokio::fs::write(&path, &value).await?;
+        // Eviction runs after the write and skips this key, so the value that
+        // triggered it is never the one removed.
+        self.evict_to_fit(Some(key)).await?;
         Ok(())
     }
 
@@ -436,7 +534,7 @@ impl SharedState {
         match self.backend.get(&self.full_key(key)).await {
             Ok(val) => val,
             Err(e) => {
-                eprintln!("[SharedState] get({:?}) error: {}", key, e);
+                warn!("shared state: get({:?}) error: {}", key, e);
                 None
             }
         }
@@ -452,7 +550,7 @@ impl SharedState {
         match self.backend.remove(&self.full_key(key)).await {
             Ok(existed) => existed,
             Err(e) => {
-                eprintln!("[SharedState] remove({:?}) error: {}", key, e);
+                warn!("shared state: remove({:?}) error: {}", key, e);
                 false
             }
         }
@@ -469,7 +567,7 @@ impl SharedState {
                 None => keys,
             },
             Err(e) => {
-                eprintln!("[SharedState] keys() error: {}", e);
+                warn!("shared state: keys() error: {}", e);
                 Vec::new()
             }
         }
@@ -486,7 +584,7 @@ impl SharedState {
             return match self.backend.summary().await {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("[SharedState] summary() error: {}", e);
+                    warn!("shared state: summary() error: {}", e);
                     "(error reading state)".to_string()
                 }
             };

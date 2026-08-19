@@ -100,7 +100,13 @@ Behind the `gasp` Cargo feature (dep: `yoagent-state`, the GASP reference runtim
 - Custom backends implement the `SharedStateBackend` trait
 - Opt-in via `SubAgentTool::with_shared_state(state)` — injects a `shared_state` tool and appends a state summary to the sub-agent's system prompt automatically
 - Actions: `get`, `set`, `list`, `remove`
-- Does **not** touch the core agent loop — wired entirely through `SubAgentTool`
+- Opt in on a parent via `Agent::with_shared_state(state)`, which also registers
+  the `shared_state` tool for that run
+- The loop reads it at one point only: `AgentLoopConfig::tool_output_sink`, used
+  on the **append path** to stash the full text of a truncated tool result so the
+  marker can name a retrievable key. Never on the compaction path — by then the
+  middle is already gone, and re-deriving there would move marker bytes that the
+  prefix cache depends on
 
 ### Construction API
 

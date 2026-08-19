@@ -33,6 +33,7 @@ fn make_config(
         compaction_strategy: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),
+        tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
         retry_config: yoagent::RetryConfig::default(),

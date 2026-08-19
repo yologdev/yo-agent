@@ -4,6 +4,68 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- **Truncated tool output is retrievable instead of lost**
+  ([#125](https://github.com/yologdev/yoagent/issues/125)). `truncate_tool_output`
+  head-tail-truncates on append and the middle was gone irrecoverably — the full
+  text survived only in the event stream, which the *agent* cannot read.
+
+  `Agent::with_shared_state(state)` now stashes the full output and the marker
+  names where it went:
+
+  ```
+  [... 1847 lines truncated — full output: shared_state get "tool-out-tc_01abc-9f2a..." ...]
+  ```
+
+  The `shared_state` tool is registered for the run so the model can act on it.
+  `SharedState` was always a parent↔sub-agent medium in Rust, but only
+  `SubAgentTool` registered the tool — so the parent's *model* could not reach a
+  store its Rust caller could read and write freely.
+
+  **Opt-in.** Without a store attached, truncation behaves exactly as before and
+  the marker advertises no retrieval it cannot honour.
+
+  **Known limitation:** the pointer survives Level 1 byte-for-byte, but the
+  lossy levels drop whole turns and take the marker with them, while the stash
+  entry lives on and keeps consuming cap quota. Pinned by
+  `lossy_compaction_drops_the_marker_while_the_stash_survives` so a change to
+  that behaviour is a decision rather than a surprise.
+
+  Three constraints shaped it. The stash happens **only on the append path** —
+  by the time compaction runs, append-path truncation has already discarded the
+  middle, so there is nothing left to store. The key is threaded into marker
+  **generation** rather than substituted afterwards: rewriting the rendered text
+  would hit every occurrence of the marker's shape, including one that came from
+  the tool's own output (ordinary for an agent reading a log or transcript), and
+  would silently do nothing when the budget is too small for a marker at all.
+  And the key combines the tool call id with a **hash of the output**, because
+  `google.rs`/`google_vertex.rs` synthesize ids as a per-response index that
+  restarts every turn — id alone would let turn 1's frozen marker resolve to
+  turn 5's content.
+
+### Changed
+
+- **`FileBackend` is capped at 10MB** — the same limit as `MemoryBackend`,
+  though this backend evicts oldest-first where `MemoryBackend` rejects the
+  write. Without a bound, an agent stashing truncated output would grow the
+  directory until the disk filled. `FileBackend::with_max_bytes` overrides it.
+
+  A value larger than the cap is **rejected** rather than written and then
+  evicted: returning `Ok(())` for a value already deleted would let the loop
+  annotate a marker naming a key that never existed. Eviction skips the write
+  that triggered it, logs every failed unlink, and warns if it finishes still
+  over the cap. **The directory is owned exclusively by the backend** — eviction
+  unlinks regular files it finds there.
+
+  A stale key fails to read, which a model handles as an ordinary tool error.
+
+- **Breaking: `AgentLoopConfig` gained `tool_output_sink`.** The struct is not
+  `#[non_exhaustive]`, so downstream struct-literal construction needs the new
+  field.
+
 ## 0.17.0
 
 > The fixes below also shipped on the **0.16.x maintenance line** — the gasp
