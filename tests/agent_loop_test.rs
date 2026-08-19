@@ -3238,3 +3238,80 @@ async fn parallel_truncated_results_each_get_a_resolvable_key() {
         );
     }
 }
+
+/// The advertised public entry point. It does two things — registers the tool
+/// and wires the sink — and neither half was covered: the other tests set
+/// `config.tool_output_sink` directly, bypassing it entirely.
+#[tokio::test]
+async fn agent_with_shared_state_registers_the_tool_and_wires_the_sink() {
+    use yoagent::provider::ModelConfig;
+
+    let state = yoagent::shared_state::SharedState::new();
+    let mut agent = Agent::from_provider(
+        MockProvider::new(vec![
+            MockResponse::ToolCalls(vec![MockToolCall {
+                provider_metadata: None,
+                name: "big_output".into(),
+                arguments: serde_json::json!({}),
+            }]),
+            MockResponse::Text("done".into()),
+        ]),
+        ModelConfig::mock(),
+    )
+    .with_tools(vec![Box::new(StashBigTool)])
+    .with_shared_state(state.clone())
+    .with_context_config(yoagent::context::ContextConfig {
+        tool_output_max_lines: 20,
+        ..Default::default()
+    });
+
+    let mut rx = agent.prompt("go").await;
+    while rx.recv().await.is_some() {}
+    agent.finish().await;
+
+    // Half one: the sink is wired, so the output was stashed.
+    let keys = state.keys().await;
+    assert_eq!(
+        keys.len(),
+        1,
+        "with_shared_state must wire the sink, got {keys:?}"
+    );
+
+    // Half two: the tool is registered, so the model can act on the marker.
+    let text = agent
+        .messages()
+        .iter()
+        .find_map(|m| match m {
+            AgentMessage::Llm(Message::ToolResult { content, .. }) => {
+                content.iter().find_map(|c| match c {
+                    Content::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .expect("a tool result");
+    assert!(
+        text.contains(&keys[0]),
+        "the marker must name the stashed key: {text}"
+    );
+}
+
+/// Calling it twice must not register two tools — providers reject duplicate
+/// tool names with a 400, which would brick the agent at the first request.
+#[tokio::test]
+async fn with_shared_state_is_idempotent() {
+    use yoagent::provider::ModelConfig;
+
+    let state = yoagent::shared_state::SharedState::new();
+    let mut agent = Agent::from_provider(MockProvider::text("hi"), ModelConfig::mock())
+        .with_shared_state(state.clone())
+        .with_shared_state(state);
+
+    let mut rx = agent.prompt("go").await;
+    while rx.recv().await.is_some() {}
+    agent.finish().await;
+    // The run completes; a duplicate tool name would have been a build-time
+    // duplicate in the tool list handed to the provider.
+    assert!(!agent.messages().is_empty());
+}

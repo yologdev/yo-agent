@@ -28,6 +28,12 @@ adheres to [Semantic Versioning](https://semver.org/).
   **Opt-in.** Without a store attached, truncation behaves exactly as before and
   the marker advertises no retrieval it cannot honour.
 
+  **Known limitation:** the pointer survives Level 1 byte-for-byte, but the
+  lossy levels drop whole turns and take the marker with them, while the stash
+  entry lives on and keeps consuming cap quota. Pinned by
+  `lossy_compaction_drops_the_marker_while_the_stash_survives` so a change to
+  that behaviour is a decision rather than a surprise.
+
   Three constraints shaped it. The stash happens **only on the append path** —
   by the time compaction runs, append-path truncation has already discarded the
   middle, so there is nothing left to store. The key is threaded into marker

@@ -470,14 +470,17 @@ fn a_marker_inside_the_tools_own_output_is_left_alone() {
 #[tokio::test]
 async fn file_backend_evicts_oldest_to_stay_under_its_cap() {
     let dir = tempfile::tempdir().unwrap();
-    // Cap at 300 bytes; each value is 100.
     let state = SharedState::with_backend(yoagent::shared_state::FileBackend::with_max_bytes(
         dir.path(),
         300,
     ));
 
-    for i in 0..6 {
-        state.set(&format!("k{i}"), "x".repeat(100)).await.unwrap();
+    // Deliberately non-monotonic names: written z,y,x,w,v,a but sorting
+    // lexically a,v,w,x,y,z. With names that sort in write order the filename
+    // tiebreak agrees with mtime, so the test would pass whether or not the
+    // age ordering worked at all.
+    for name in ["z", "y", "x", "w", "v", "a"] {
+        state.set(name, "q".repeat(100)).await.unwrap();
     }
 
     let keys = state.keys().await;
@@ -487,11 +490,83 @@ async fn file_backend_evicts_oldest_to_stay_under_its_cap() {
         "cap must bound the directory without emptying it, got {keys:?}"
     );
     assert!(
-        keys.contains(&"k5".to_string()),
-        "the most recent write must never be the one evicted, got {keys:?}"
+        keys.contains(&"a".to_string()),
+        "the newest write is 'a', which sorts first — it must survive anyway: {keys:?}"
     );
     assert!(
-        !keys.contains(&"k0".to_string()),
-        "the oldest must go first, got {keys:?}"
+        !keys.contains(&"z".to_string()),
+        "the oldest write is 'z', which sorts last — it must go first anyway: {keys:?}"
+    );
+}
+
+/// A value larger than the cap is rejected, not written-then-evicted. Returning
+/// `Ok(())` for a value already deleted would let the loop annotate a marker
+/// naming a key that never existed — and would take unrelated keys with it.
+#[tokio::test]
+async fn an_over_cap_value_is_rejected_and_leaves_the_store_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = SharedState::with_backend(yoagent::shared_state::FileBackend::with_max_bytes(
+        dir.path(),
+        300,
+    ));
+    state.set("keepme", "small".into()).await.unwrap();
+
+    let err = state.set("huge", "x".repeat(5000)).await;
+    assert!(
+        err.is_err(),
+        "an over-cap value must be refused, not silently dropped"
+    );
+    assert_eq!(
+        state.get("keepme").await.as_deref(),
+        Some("small"),
+        "a refused write must not take existing keys with it"
+    );
+}
+
+/// What real compaction does to a retrieval pointer.
+///
+/// Level 1 preserves it — that is the byte-stability property above. But the
+/// lossy levels drop whole turns, taking the marker with them while the stash
+/// entry lives on, consuming cap quota that can evict entries whose markers
+/// *are* still live. Asserting it here so the behaviour is a recorded decision
+/// rather than a surprise.
+#[test]
+fn lossy_compaction_drops_the_marker_while_the_stash_survives() {
+    use yoagent::context::compact_messages;
+
+    let config = ContextConfig {
+        tool_output_max_lines: 20,
+        max_context_tokens: 400,
+        system_prompt_tokens: 0,
+        ..Default::default()
+    };
+
+    let keyed = yoagent::context::truncate_tool_output_keyed(
+        big_tool_result("tc-1", 500),
+        &config,
+        Some("tool-out-tc-1-deadbeef"),
+    )
+    .0;
+    assert!(text_of(&keyed).contains("tool-out-tc-1-deadbeef"));
+
+    // Bury it under enough history that the lossy levels engage.
+    let mut history = vec![keyed];
+    for i in 0..40 {
+        history.push(AgentMessage::Llm(Message::user(format!(
+            "turn {i} {}",
+            "filler ".repeat(30)
+        ))));
+    }
+
+    let compacted = compact_messages(history, &config);
+    let survives = compacted
+        .iter()
+        .any(|m| text_of(m).contains("tool-out-tc-1-deadbeef"));
+
+    assert!(
+        !survives,
+        "documented behaviour: lossy compaction discards the pointer. If this \
+         now passes, the stash's lifetime story changed and the cap policy \
+         should be revisited"
     );
 }

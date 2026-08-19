@@ -75,6 +75,10 @@ pub struct AgentLoopConfig {
     /// `None` (default) means truncation behaves exactly as before: the middle
     /// is gone and only the event stream, which the agent cannot read, still
     /// has it. Set it and the marker names a `shared_state` key instead.
+    ///
+    /// The pointer lives in the transcript, so it is lost when lossy compaction
+    /// drops that turn — the stash entry outlives it and keeps consuming the
+    /// backend's cap. Retrieval is best-effort by construction.
     pub tool_output_sink: Option<crate::shared_state::SharedState>,
 
     /// Tool execution strategy (sequential, parallel, or batched).
