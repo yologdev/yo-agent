@@ -50,8 +50,9 @@ adheres to [Semantic Versioning](https://semver.org/).
   ([#132](https://github.com/yologdev/yoagent/issues/132)). `ModelConfig`'s
   priced presets are `f64` literals compiled into the crate; when a vendor
   reprices they keep billing at the old numbers until someone edits the source.
-  `claude_sonnet_5` shipped Sonnet 4.6's rates through the whole 0.16.x line —
-  50% high on every `cost_usd` — and nothing detected it.
+  `claude_sonnet_5` shipped Sonnet 4.6's rates across 18 releases, v0.9.0
+  through v0.16.5 — 50% high on every `cost_usd` — and nothing detected it. It
+  remains uncorrected on the `release/0.16.x` maintenance line.
 
   ```text
   cargo test --test price_audit -- --ignored --nocapture
@@ -60,8 +61,19 @@ adheres to [Semantic Versioning](https://semver.org/).
   Diffs all four cost fields of every priced preset against
   [models.dev](https://github.com/anomalyco/models.dev), which unlike most price
   aggregators carries `cache_read`/`cache_write` — the fields this crate needs.
-  28/28 clean at time of writing, including `ModelConfig::meta`, whose rates had
-  never been checked against any source (they match Muse Spark 1.1/1.2).
+  26 fields compared clean at time of writing, with 2 (`cache_write` on
+  `gpt-5.5` and `muse-spark-1.2`) not listed upstream and reported as `—`
+  rather than silently compared against 0. Includes `ModelConfig::meta`, whose
+  rates had never been checked against any source (they match Muse Spark
+  1.1/1.2).
+
+  The audit refuses to go quiet: it fails if a preset vanishes from the database
+  (a rename would otherwise drop it out of coverage silently), if fewer fields
+  are accounted for than expected (a schema change would otherwise yield a green
+  run that compared nothing), or if models.dev carries cost structure the flat
+  `CostConfig` cannot express. That last one fires on `gpt_5_5` today —
+  models.dev lists a context tier above 272K at double the input rate — recorded
+  as a known gap rather than silently certified.
 
   A failure is an **alarm, not an instruction**: models.dev is
   community-maintained and not authoritative, so the test names the vendor's own

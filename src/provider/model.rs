@@ -38,8 +38,8 @@ impl std::fmt::Display for ApiProtocol {
 /// The built-in presets carry rates verified against the vendor's published
 /// pricing on the date noted at each constructor. Vendors reprice, and a
 /// compiled-in number cannot notice — `claude_sonnet_5` shipped Sonnet 4.6's
-/// rates through the whole 0.16.x line, overstating every `cost_usd` for that
-/// model by 50%, and nothing detected it.
+/// rates across 18 releases, v0.9.0 through v0.16.5, overstating every
+/// `cost_usd` for that model by 50%, and nothing detected it.
 ///
 /// `tests/price_audit.rs` now diffs every preset against models.dev; run it
 /// before a release:
@@ -602,6 +602,12 @@ impl ModelConfig {
     ///
     /// Rates verified against <https://developers.openai.com/api/docs/pricing>
     /// on 2026-08-19. See [`CostConfig`] — they are a snapshot, not an authority.
+    ///
+    /// **Flat rate, tiered upstream.** OpenAI charges roughly double above a
+    /// ~272K context tier ($10/$45/$1), and this preset declares a 1M window —
+    /// so `cost_usd` understates long-context calls by up to 2x. `CostConfig`
+    /// has no tier concept; override `cost` for long-context workloads.
+    /// `tests/price_audit.rs` records this as a known gap.
     pub fn gpt_5_5() -> Self {
         Self {
             reasoning: true,
@@ -819,9 +825,10 @@ impl ModelConfig {
     /// applies — not "no reasoning".
     ///
     /// Rates are Muse Spark 1.1/1.2, verified 2026-08-19. This constructor is
-    /// generic over the model id, so a different tier — the contributor tier is
-    /// priced an order of magnitude lower — needs `config.cost` overridden. See
-    /// [`CostConfig`].
+    /// generic over the model id, so a different tier needs `config.cost`
+    /// overridden: the contributor tier runs 12x lower on input, 21x on output
+    /// and 75x on cache reads, so `ModelConfig::meta("muse-spark-1.2-contributor", ..)`
+    /// overstates cost badly. See [`CostConfig`].
     pub fn meta(id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             id: id.into(),
