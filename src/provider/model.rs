@@ -32,6 +32,31 @@ impl std::fmt::Display for ApiProtocol {
 }
 
 /// Cost per million tokens (input/output).
+///
+/// # These are a snapshot, not an authority
+///
+/// The built-in presets carry rates verified against the vendor's published
+/// pricing on the date noted at each constructor. Vendors reprice, and a
+/// compiled-in number cannot notice — `claude_sonnet_5` shipped Sonnet 4.6's
+/// rates across 18 releases, v0.9.0 through v0.16.5, overstating every
+/// `cost_usd` for that model by 50%, and nothing detected it.
+///
+/// `tests/price_audit.rs` now diffs every preset against models.dev; run it
+/// before a release:
+///
+/// ```text
+/// cargo test --test price_audit -- --ignored --nocapture
+/// ```
+///
+/// `ModelConfig::cost` is a public field and `CostConfig` is `Deserialize`, so
+/// a caller never has to wait for a release — override it for a negotiated
+/// rate, or load rates from configuration:
+///
+/// ```
+/// # use yoagent::provider::ModelConfig;
+/// let mut config = ModelConfig::claude_sonnet_5();
+/// config.cost.input_per_million = 1.80; // your negotiated rate
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostConfig {
     pub input_per_million: f64,
@@ -477,6 +502,9 @@ impl ModelConfig {
 
     /// Claude Fable 5 — Anthropic's most capable model.
     /// 1M context; defaults to 64K of the model's 128K max output.
+    ///
+    /// Rates verified against <https://platform.claude.com/docs/en/about-claude/pricing>
+    /// on 2026-08-19. See [`CostConfig`] — they are a snapshot, not an authority.
     pub fn claude_fable_5() -> Self {
         Self {
             context_window: 1_000_000,
@@ -498,6 +526,9 @@ impl ModelConfig {
     /// sending `{"type": "disabled"}`, and those tokens still count against
     /// `max_tokens`. Any other level takes the adaptive path that
     /// `AnthropicCompat::default()` selects, which Opus 5 accepts unchanged.
+    ///
+    /// Rates verified against <https://platform.claude.com/docs/en/about-claude/pricing>
+    /// on 2026-08-19. See [`CostConfig`] — they are a snapshot, not an authority.
     pub fn claude_opus_5() -> Self {
         Self {
             context_window: 1_000_000,
@@ -513,6 +544,9 @@ impl ModelConfig {
     }
 
     /// Claude Opus 4.8. 1M context; defaults to 64K of the model's 128K max output.
+    ///
+    /// Rates verified against <https://platform.claude.com/docs/en/about-claude/pricing>
+    /// on 2026-08-19. See [`CostConfig`] — they are a snapshot, not an authority.
     pub fn claude_opus_4_8() -> Self {
         Self {
             context_window: 1_000_000,
@@ -528,6 +562,9 @@ impl ModelConfig {
     }
 
     /// Claude Sonnet 5. 1M context; defaults to 64K of the model's 128K max output.
+    ///
+    /// Rates verified against <https://platform.claude.com/docs/en/about-claude/pricing>
+    /// on 2026-08-19. See [`CostConfig`] — they are a snapshot, not an authority.
     pub fn claude_sonnet_5() -> Self {
         Self {
             context_window: 1_000_000,
@@ -543,6 +580,9 @@ impl ModelConfig {
     }
 
     /// Claude Haiku 4.5. 200K context; defaults to 32K of the model's 64K max output.
+    ///
+    /// Rates verified against <https://platform.claude.com/docs/en/about-claude/pricing>
+    /// on 2026-08-19. See [`CostConfig`] — they are a snapshot, not an authority.
     pub fn claude_haiku_4_5() -> Self {
         Self {
             context_window: 200_000,
@@ -559,6 +599,15 @@ impl ModelConfig {
 
     /// GPT-5.5. ~1M context; defaults to 64K of the model's 128K max output.
     /// Uses the Chat Completions API.
+    ///
+    /// Rates verified against <https://developers.openai.com/api/docs/pricing>
+    /// on 2026-08-19. See [`CostConfig`] — they are a snapshot, not an authority.
+    ///
+    /// **Flat rate, tiered upstream.** OpenAI charges roughly double above a
+    /// ~272K context tier ($10/$45/$1), and this preset declares a 1M window —
+    /// so `cost_usd` understates long-context calls by up to 2x. `CostConfig`
+    /// has no tier concept; override `cost` for long-context workloads.
+    /// `tests/price_audit.rs` records this as a known gap.
     pub fn gpt_5_5() -> Self {
         Self {
             reasoning: true,
@@ -774,6 +823,12 @@ impl ModelConfig {
     /// server-side. Set a [`ThinkingLevel`](crate::types::ThinkingLevel) to
     /// tune it; `Off` omits the field, which means Meta's default (medium)
     /// applies — not "no reasoning".
+    ///
+    /// Rates are Muse Spark 1.1/1.2, verified 2026-08-19. This constructor is
+    /// generic over the model id, so a different tier needs `config.cost`
+    /// overridden: the contributor tier runs 12x lower on input, 21x on output
+    /// and 75x on cache reads, so `ModelConfig::meta("muse-spark-1.2-contributor", ..)`
+    /// overstates cost badly. See [`CostConfig`].
     pub fn meta(id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             id: id.into(),
