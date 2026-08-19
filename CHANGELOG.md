@@ -46,6 +46,21 @@ adheres to [Semantic Versioning](https://semver.org/).
   restarts every turn — id alone would let turn 1's frozen marker resolve to
   turn 5's content.
 
+- **Recorded why `LlmCompaction` summarizes standalone rather than in-session**
+  ([#127](https://github.com/yologdev/yoagent/issues/127)). Appending the
+  summarization instruction to the live session makes the history a prefix-cache
+  hit — an obvious-looking saving that measures badly, because the briefing is
+  then billed at the *loop* model's output rate. Per compaction: Sonnet 5 gains
+  3%, Opus 5 loses 2.4x, Fable 5 loses 4.8x. The idea was motivated by reusing
+  the expensive model's cache and the expensive model is where it loses.
+
+  It wins only when the loop model *is* the summarizer (DeepSeek in-session runs
+  3.2x cheaper than DeepSeek standalone), which is the configuration cheap-model
+  routing exists to avoid. And a background request racing the loop's own turn
+  can miss the cache entirely, paying full input on the whole history — 2.6x the
+  standalone cost on Sonnet. Best case a few percent, failure case a 2.6x
+  overrun. Documented as a no-go in the `llm_compaction` module docs.
+
 - **Loop detection in `ExecutionLimits`**
   ([#126](https://github.com/yologdev/yoagent/issues/126)). The cheapest
   catastrophic failure mode — a model calling one tool with the same arguments
