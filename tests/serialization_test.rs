@@ -169,6 +169,7 @@ fn test_execution_limits_roundtrip() {
         max_turns: 25,
         max_total_tokens: 500_000,
         max_duration: std::time::Duration::from_secs(300),
+        ..Default::default()
     };
     let json = serde_json::to_string(&limits).expect("serialize");
     let back: ExecutionLimits = serde_json::from_str(&json).expect("deserialize");
@@ -365,6 +366,7 @@ fn all_agent_events() -> Vec<AgentEvent> {
                 Some(0.0451),
             )),
         },
+        AgentEvent::loop_detected("bash", 3, false),
     ]
 }
 
@@ -450,6 +452,7 @@ fn expected_event_tag(event: &AgentEvent) -> &'static str {
         AgentEvent::ProgressMessage { .. } => "progressMessage",
         AgentEvent::InputRejected { .. } => "inputRejected",
         AgentEvent::ContextCompacted { .. } => "contextCompacted",
+        AgentEvent::LoopDetected { .. } => "loopDetected",
         _ => "unknown",
     }
 }
@@ -465,7 +468,7 @@ fn expected_delta_tag(delta: &StreamDelta) -> &'static str {
 }
 
 /// Number of arms in `expected_event_tag` — bump together with the match.
-const EVENT_VARIANT_COUNT: usize = 13;
+const EVENT_VARIANT_COUNT: usize = 14;
 
 #[test]
 fn test_agent_event_type_tags_are_frozen() {

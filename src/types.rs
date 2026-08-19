@@ -799,6 +799,18 @@ pub enum AgentEvent {
     /// tell which one ran and what it cost. The built-in
     /// [`DefaultCompaction`](crate::context::DefaultCompaction) does not emit
     /// this; it has no event channel and never issues a request.
+    /// A tool was called repeatedly with identical arguments.
+    ///
+    /// Emitted on both escalations: the first trip steers the model and
+    /// continues, a later trip on the same signature stops the run. `aborted`
+    /// distinguishes them, so a caller can tell a nudge from a stop and an
+    /// audit can record why a run ended.
+    #[non_exhaustive]
+    LoopDetected {
+        tool_name: String,
+        repetitions: usize,
+        aborted: bool,
+    },
     ContextCompacted {
         /// Which compaction path produced this result.
         method: CompactionMethod,
@@ -823,6 +835,18 @@ impl AgentEvent {
     /// crates (and tests) build it here rather than with a struct literal.
     pub fn agent_end(messages: Vec<AgentMessage>, stats: SessionStats) -> Self {
         Self::AgentEnd { messages, stats }
+    }
+
+    /// Construct an [`AgentEvent::LoopDetected`].
+    ///
+    /// `aborted` separates the two escalations: `false` is a steer the model
+    /// can recover from, `true` means the run stopped.
+    pub fn loop_detected(tool_name: impl Into<String>, repetitions: usize, aborted: bool) -> Self {
+        Self::LoopDetected {
+            tool_name: tool_name.into(),
+            repetitions,
+            aborted,
+        }
     }
 }
 
@@ -1176,6 +1200,7 @@ mod wire_tag_freeze {
             AgentEvent::ToolExecutionEnd { .. } => "toolExecutionEnd",
             AgentEvent::ProgressMessage { .. } => "progressMessage",
             AgentEvent::InputRejected { .. } => "inputRejected",
+            AgentEvent::LoopDetected { .. } => "loopDetected",
             AgentEvent::ContextCompacted { .. } => "contextCompacted",
         }
     }

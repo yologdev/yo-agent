@@ -771,6 +771,7 @@ async fn test_execution_limit_counts_cached_tokens() {
             max_turns: 50,
             max_total_tokens: 100,
             max_duration: std::time::Duration::from_secs(60),
+            ..Default::default()
         }),
         cache_config: CacheConfig::default(),
         tool_output_sink: None,
@@ -2292,6 +2293,7 @@ fn calibration_config(
             max_turns: 2,
             max_total_tokens: 1_000_000,
             max_duration: std::time::Duration::from_secs(60),
+            ..Default::default()
         }),
         cache_config: CacheConfig::default(),
         tool_output_sink: None,
@@ -3314,4 +3316,168 @@ async fn with_shared_state_is_idempotent() {
     // The run completes; a duplicate tool name would have been a build-time
     // duplicate in the tool list handed to the provider.
     assert!(!agent.messages().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Loop detection (issue #126)
+// ---------------------------------------------------------------------------
+
+fn loop_events(events: &[AgentEvent]) -> Vec<(String, usize, bool)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::LoopDetected {
+                tool_name,
+                repetitions,
+                aborted,
+                ..
+            } => Some((tool_name.clone(), *repetitions, *aborted)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn repeat_call(n: usize, args: serde_json::Value) -> Vec<MockResponse> {
+    (0..n)
+        .map(|_| {
+            MockResponse::ToolCalls(vec![MockToolCall {
+                provider_metadata: None,
+                name: "silent_tool".into(),
+                arguments: args.clone(),
+            }])
+        })
+        .collect()
+}
+
+async fn run_with_limits(
+    responses: Vec<MockResponse>,
+    limits: yoagent::context::ExecutionLimits,
+) -> Vec<AgentEvent> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut context = AgentContext {
+        messages: vec![],
+        tools: vec![Box::new(SilentTool)],
+        system_prompt: String::new(),
+    };
+    let mut config = make_config(MockProvider::new(responses));
+    config.execution_limits = Some(limits);
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user("go"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+    collect_events(rx)
+}
+
+/// Three identical calls steer; continued repetition aborts. The steer comes
+/// first on purpose — a model repeating a call is often retrying something
+/// transient, and aborting immediately would regress that.
+#[tokio::test]
+async fn repeated_identical_calls_steer_then_abort() {
+    let events = run_with_limits(
+        repeat_call(12, serde_json::json!({"q": "same"})),
+        yoagent::context::ExecutionLimits {
+            max_identical_tool_calls: Some(3),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let detected = loop_events(&events);
+    assert!(
+        detected.iter().any(|(_, _, aborted)| !aborted),
+        "the first trip must steer, got {detected:?}"
+    );
+    assert!(
+        detected.iter().any(|(_, _, aborted)| *aborted),
+        "continued repetition must abort, got {detected:?}"
+    );
+
+    // Steer strictly precedes abort.
+    let first_abort = detected.iter().position(|(_, _, a)| *a).unwrap();
+    let first_steer = detected.iter().position(|(_, _, a)| !*a).unwrap();
+    assert!(
+        first_steer < first_abort,
+        "steer must come first: {detected:?}"
+    );
+}
+
+/// Distinct arguments are not a loop. This is the false positive that would
+/// make the feature worse than useless — an agent working through a list of
+/// files calls one tool repeatedly and legitimately.
+#[tokio::test]
+async fn distinct_arguments_never_trip() {
+    let responses: Vec<MockResponse> = (0..12)
+        .map(|i| {
+            MockResponse::ToolCalls(vec![MockToolCall {
+                provider_metadata: None,
+                name: "silent_tool".into(),
+                arguments: serde_json::json!({ "file": format!("f{i}.rs") }),
+            }])
+        })
+        .collect();
+
+    let events = run_with_limits(
+        responses,
+        yoagent::context::ExecutionLimits {
+            max_identical_tool_calls: Some(3),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        loop_events(&events).is_empty(),
+        "distinct arguments are progress, not repetition"
+    );
+}
+
+/// A different call between repeats breaks the streak.
+#[tokio::test]
+async fn an_interleaved_different_call_resets_the_counter() {
+    let mut responses = Vec::new();
+    for i in 0..12 {
+        responses.push(MockResponse::ToolCalls(vec![MockToolCall {
+            provider_metadata: None,
+            name: "silent_tool".into(),
+            // same, same, different, repeating — never 3 in a row
+            arguments: if i % 3 == 2 {
+                serde_json::json!({"q": "other"})
+            } else {
+                serde_json::json!({"q": "same"})
+            },
+        }]));
+    }
+
+    let events = run_with_limits(
+        responses,
+        yoagent::context::ExecutionLimits {
+            max_identical_tool_calls: Some(3),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        loop_events(&events).is_empty(),
+        "a streak broken before the threshold is not a loop"
+    );
+}
+
+/// `None` disables the check entirely.
+#[tokio::test]
+async fn detection_can_be_switched_off() {
+    let events = run_with_limits(
+        repeat_call(12, serde_json::json!({"q": "same"})),
+        yoagent::context::ExecutionLimits {
+            max_identical_tool_calls: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        loop_events(&events).is_empty(),
+        "None must disable detection"
+    );
 }
