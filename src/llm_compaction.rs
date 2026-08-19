@@ -32,6 +32,43 @@
 //! [`AgentEvent::ContextCompacted`], which reports the request's own usage next
 //! to the tokens it saved.
 //!
+//! # Why the request is standalone, not appended to the live session
+//!
+//! An obvious-looking optimisation is to append the summarization instruction
+//! to the *live* session instead: the history is then a prefix-cache hit, so
+//! the span costs cached-input rates rather than fresh input. Measured against
+//! real pricing, it is a bad trade almost everywhere, and the reason is
+//! counterintuitive enough to be worth recording (yologdev/yoagent#127).
+//!
+//! In-session forces the briefing to be billed at the **loop model's** output
+//! rate. Output runs 5-10x input, so the cache saving on the span is swamped
+//! by the output penalty — and the more expensive the loop model, the worse it
+//! gets. Per compaction, at a ~12K history / ~8K span / ~1K briefing:
+//!
+//! | loop model | standalone on Haiku | appended in-session |
+//! |---|---|---|
+//! | Sonnet 5 | $0.0130 | $0.0126 |
+//! | Opus 5 | $0.0130 | $0.0315 |
+//! | Fable 5 | $0.0130 | $0.0630 |
+//!
+//! So the idea is backwards: it was motivated by "reuse the expensive model's
+//! cache", and the expensive model is exactly where it loses. It only wins when
+//! the loop model *is* the summarizer — DeepSeek in-session runs 3.2x cheaper
+//! than DeepSeek standalone — which is the configuration this strategy already
+//! steers away from, since routing summarization at a cheap model is the
+//! documented shape.
+//!
+//! The downside is worse than the upside. A background request that races the
+//! loop's own turn can arrive before the cache write lands and miss entirely,
+//! paying full input on the *whole history* rather than fresh input on the
+//! span: 2.6x the standalone cost on Sonnet. The best case is a few percent,
+//! the failure case is a 2.6x overrun, and the race is not something this
+//! crate controls.
+//!
+//! Recorded as **no-go**. Revisit if a provider appears whose output rates are
+//! flat across model tiers, or if a same-model summarizer becomes the common
+//! configuration rather than the fallback.
+//!
 //! **Does not buy: fewer prefix-cache breaks.** Both strategies rewrite history
 //! only when the budget is crossed, and neither rewrites in between, so the
 //! number of rewrites over a session is a wash: **6 vs 6** over 120 turns at a
