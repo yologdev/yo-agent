@@ -42,6 +42,35 @@ jobs:
       - name: Build
         run: cargo build --all-features
 
+  # Every job above builds `--all-features`, but `openapi` and `gasp` are both
+  # off by default — so the feature set a `cargo add yoagent` user actually gets
+  # was never compiled here. A `#[cfg(feature = ...)]` mistake that leaves an
+  # import or a type reachable only with a feature on would pass all-features CI
+  # and break on crates.io. One OS is enough: feature gating is not OS-specific.
+  feature-combos:
+    name: Features (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            flags: ""
+          - name: openapi
+            flags: "--features openapi"
+          - name: gasp
+            flags: "--features gasp"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets ${{ matrix.flags }}
+      - name: Test
+        run: cargo test ${{ matrix.flags }}
+
   # Built-in tools shell out to unix commands, so Windows only checks compilation.
   windows-check:
     name: Check (windows)
