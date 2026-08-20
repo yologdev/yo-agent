@@ -131,11 +131,12 @@ fn presets() -> Vec<Preset> {
             cost: ModelConfig::gpt_5_5().cost,
             absent_upstream: None,
             flat_rate_gap: Some(
-                "models.dev lists a context tier above 272K at $10/$45/$1 — double \
-                 input, 1.5x output. `CostConfig` is a single flat rate, so \
-                 `gpt_5_5` understates long-context calls by up to 2x while \
-                 declaring a 1M window. Tracked as a known gap rather than \
-                 silently certified.",
+                "models.dev lists a context tier above 272K at $10/$45/$1. \
+                 OpenAI's pricing page shows only `<272K` rows and no >272K \
+                 row, so the tier is plausible but uncorroborated and its rates \
+                 unverified. `CostConfig` is a single flat rate; the preset \
+                 stays flat rather than encode rates no vendor page confirms. \
+                 See yologdev/yoagent#138.",
             ),
         },
         Preset {

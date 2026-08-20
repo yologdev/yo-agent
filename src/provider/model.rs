@@ -41,6 +41,14 @@ impl std::fmt::Display for ApiProtocol {
 /// rates across 18 releases, v0.9.0 through v0.16.5, overstating every
 /// `cost_usd` for that model by 50%, and nothing detected it.
 ///
+/// # Rates are flat; tiers are not modelled
+///
+/// `cost_usd` applies one rate per token category regardless of request size.
+/// Some vendors price long-context requests higher. Of the presets here, six of
+/// seven are flat per models.dev *and* the vendor's own page; the seventh
+/// (`gpt_5_5`) has an unverified tier claim recorded at its constructor. If you
+/// run long-context workloads where the bill matters, set `cost` yourself.
+///
 /// `tests/price_audit.rs` now diffs every preset against models.dev; run it
 /// before a release:
 ///
@@ -603,11 +611,19 @@ impl ModelConfig {
     /// Rates verified against <https://developers.openai.com/api/docs/pricing>
     /// on 2026-08-19. See [`CostConfig`] — they are a snapshot, not an authority.
     ///
-    /// **Flat rate, tiered upstream.** OpenAI charges roughly double above a
-    /// ~272K context tier ($10/$45/$1), and this preset declares a 1M window —
-    /// so `cost_usd` understates long-context calls by up to 2x. `CostConfig`
-    /// has no tier concept; override `cost` for long-context workloads.
-    /// `tests/price_audit.rs` records this as a known gap.
+    /// **Flat rate; a long-context tier may exist and is unverified.**
+    ///
+    /// models.dev lists a context tier above 272K at $10/$45/$1 — double input,
+    /// 1.5x output. OpenAI's own pricing page shows only rows annotated
+    /// "<272K context length" at $5/$30, with no >272K row: consistent with a
+    /// tier existing (why annotate otherwise?) but not confirming one, and
+    /// giving no rates.
+    ///
+    /// So this preset stays flat rather than encoding rates no vendor page
+    /// corroborates. If a tier does apply, `cost_usd` understates calls above
+    /// ~272K; override `cost` for long-context workloads where the bill
+    /// matters. `CostConfig` has no tier concept — see its docs and
+    /// yologdev/yoagent#138 for what would change that.
     pub fn gpt_5_5() -> Self {
         Self {
             reasoning: true,

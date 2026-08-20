@@ -46,6 +46,24 @@ adheres to [Semantic Versioning](https://semver.org/).
   restarts every turn — id alone would let turn 1's frozen marker resolve to
   turn 5's content.
 
+- **`CostConfig`'s flat-rate limitation is documented where it bites**
+  ([#138](https://github.com/yologdev/yoagent/issues/138)). `cost_usd` applies
+  one rate per token category regardless of request size, while some vendors
+  price long-context requests higher.
+
+  Checking every priced preset: six of seven are flat on both models.dev and the
+  vendor's own page. The seventh, `gpt_5_5`, is claimed tiered by models.dev
+  (above 272K at $10/$45/$1) — but OpenAI's pricing page lists it only in rows
+  annotated `<272K context length`, with no >272K row anywhere. The tier is
+  plausible, since the annotation implies *something* changes at that boundary,
+  but it is uncorroborated and its rates are models.dev's alone.
+
+  So the preset stays flat rather than encoding rates no vendor page confirms —
+  which is what #132's own doctrine requires: models.dev is a drift alarm, never
+  a source of truth. The claim, its source, and its unverified status are now on
+  the constructor; `CostConfig`'s docs say tiers are not modelled and point
+  callers running long-context workloads at setting `cost` themselves.
+
 - **Truncation stash: one key per content block, and `SubAgentTool` can now
   reach it at all** ([#134](https://github.com/yologdev/yoagent/issues/134)).
 
