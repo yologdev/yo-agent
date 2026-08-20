@@ -387,7 +387,11 @@ fn deterministic_compaction_event() -> AgentEvent {
 
 #[test]
 fn test_context_compacted_wire_shape_is_frozen() {
-    let v = serde_json::to_value(&all_agent_events()[12]).expect("serialize");
+    let compacted = all_agent_events()
+        .into_iter()
+        .find(|e| matches!(e, AgentEvent::ContextCompacted { .. }))
+        .expect("all_agent_events must carry a ContextCompacted sample");
+    let v = serde_json::to_value(&compacted).expect("serialize");
     assert_eq!(v["type"], "contextCompacted");
     assert_eq!(v["method"], "summarized");
     // camelCase, including the acronym casing a TS client hardcodes.
@@ -434,8 +438,11 @@ fn test_stream_delta_every_variant_roundtrips() {
 /// `#[non_exhaustive]` — an integration test can no longer match them
 /// exhaustively, so the "adding a variant fails to compile" guarantee only
 /// holds inside the defining crate. What remains here is the round-trip and
-/// payload-shape coverage, plus [`EVENT_VARIANT_COUNT`], which still fails
-/// until a new variant gets a sample in `all_agent_events`.
+/// payload-shape coverage **for the variants sampled below** — nothing here
+/// notices a variant that has no sample, because `all_agent_events` and the
+/// match arms are both hand-written and a new variant is in neither. That
+/// coverage guarantee lives in `wire_tag_freeze`, where the compiler enforces
+/// it; see #137.
 /// A tag change is a breaking change for wire clients — do not edit casually.
 fn expected_event_tag(event: &AgentEvent) -> &'static str {
     match event {
@@ -467,19 +474,9 @@ fn expected_delta_tag(delta: &StreamDelta) -> &'static str {
     }
 }
 
-/// Number of arms in `expected_event_tag` — bump together with the match.
-const EVENT_VARIANT_COUNT: usize = 14;
-
 #[test]
 fn test_agent_event_type_tags_are_frozen() {
-    let events = all_agent_events();
-    assert_eq!(
-        events.len(),
-        EVENT_VARIANT_COUNT,
-        "a variant was added to expected_event_tag without a sample in all_agent_events — \
-         the new variant's tag and round-trip are untested until one is added"
-    );
-    for event in events {
+    for event in all_agent_events() {
         let v: serde_json::Value = serde_json::to_value(&event).expect("serialize");
         assert_eq!(
             v["type"],

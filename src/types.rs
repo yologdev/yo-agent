@@ -1170,62 +1170,219 @@ impl fmt::Display for StopReason {
     }
 }
 
-/// Wire-tag freeze for [`AgentEvent`] and [`StreamDelta`].
+/// Freezes the serde wire contract for `AgentEvent` and `StreamDelta`.
 ///
-/// These matches deliberately have **no wildcard arm**: adding a variant must
-/// fail to compile here until its serde tag is pinned. That guarantee is the
-/// reason they live in this crate rather than in `tests/` — both enums are
+/// Both enums are documented as a stable wire format for websocket fanout
+/// servers, TypeScript clients and JSONL pipes, so a changed tag, a changed
+/// payload shape, or a variant that quietly serializes however serde happens
+/// to derive it are all breaking changes for consumers who never rebuild
+/// against this crate.
+///
+/// This lives in the defining crate on purpose. Both enums are
 /// `#[non_exhaustive]`, so an integration test *cannot* match them
-/// exhaustively and the compile-time freeze would silently degrade to a
-/// wildcard. Inside the defining crate, exhaustiveness still applies.
-///
-/// A tag change is a breaking change for wire clients — do not edit casually.
-/// `tests/serialization_test.rs` covers the round-trips and payload shapes;
-/// this covers only "no variant escapes without a pinned tag".
+/// exhaustively — its match needs a `_` arm, and a wildcard turns "adding a
+/// variant fails to compile" into "adding a variant is silently untested".
+/// Inside this crate exhaustiveness still applies.
 #[cfg(test)]
 mod wire_tag_freeze {
     use super::*;
+    use std::collections::BTreeSet;
 
-    fn expected_event_tag(event: &AgentEvent) -> &'static str {
-        match event {
-            AgentEvent::AgentStart => "agentStart",
-            AgentEvent::AgentEnd { .. } => "agentEnd",
-            AgentEvent::TurnStart => "turnStart",
-            AgentEvent::TurnEnd { .. } => "turnEnd",
-            AgentEvent::MessageStart { .. } => "messageStart",
-            AgentEvent::MessageUpdate { .. } => "messageUpdate",
-            AgentEvent::MessageEnd { .. } => "messageEnd",
-            AgentEvent::ToolExecutionStart { .. } => "toolExecutionStart",
-            AgentEvent::ToolExecutionUpdate { .. } => "toolExecutionUpdate",
-            AgentEvent::ToolExecutionEnd { .. } => "toolExecutionEnd",
-            AgentEvent::ProgressMessage { .. } => "progressMessage",
-            AgentEvent::InputRejected { .. } => "inputRejected",
-            AgentEvent::LoopDetected { .. } => "loopDetected",
-            AgentEvent::ContextCompacted { .. } => "contextCompacted",
+    /// Declares the frozen tag **and** a sample value for every variant of a
+    /// `#[serde(tag = "type")]` enum, from a single list.
+    ///
+    /// This is the fix for the class of bug that made the old guard useless: a
+    /// hand-written sample list and a hand-written variant count could never
+    /// notice a *new* variant, because a new variant appears in neither. Here
+    /// the generated match has no wildcard, so adding a variant fails to
+    /// compile — and the only way to fix that is to add a line below, which
+    /// supplies the sample in the same breath. The two lists cannot drift
+    /// because they are one list.
+    ///
+    /// Three further mistakes are caught by the compiler rather than by luck:
+    /// a duplicated pattern makes the later arm `unreachable_pattern` (an
+    /// error under CI's `-Dwarnings`), a sample of the wrong type does not
+    /// compile, and a missing arm is a non-exhaustive match.
+    ///
+    /// What the *tests* below add, which no macro can: that the declared tag
+    /// is the one serde actually emits, that each sample survives a
+    /// round-trip, and that a sample on the wrong line is caught (via the
+    /// distinctness check).
+    macro_rules! wire_freeze {
+        ($ty:ty, $tag_of:ident, $samples:ident, $($pat:pat => $tag:literal = $sample:expr),+ $(,)?) => {
+            /// The frozen `"type"` tag per variant. Changing one breaks every
+            /// deployed wire client — do not edit casually.
+            fn $tag_of(v: &$ty) -> &'static str {
+                match v { $($pat => $tag,)+ }
+            }
+
+            /// One sample per variant, positionally paired with the tags above.
+            fn $samples() -> Vec<$ty> { vec![$($sample,)+] }
+        };
+    }
+
+    fn msg() -> AgentMessage {
+        AgentMessage::Llm(Message::Assistant {
+            content: vec![Content::Text { text: "hi".into() }],
+            stop_reason: StopReason::Stop,
+            model: "mock".into(),
+            provider: "mock".into(),
+            usage: Usage::default(),
+            timestamp: 7,
+            error_message: None,
+        })
+    }
+
+    fn tool_result() -> ToolResult {
+        ToolResult {
+            content: vec![Content::Text { text: "ok".into() }],
+            details: serde_json::Value::Null,
         }
     }
 
-    fn expected_delta_tag(delta: &StreamDelta) -> &'static str {
-        match delta {
-            StreamDelta::Text { .. } => "text",
-            StreamDelta::Thinking { .. } => "thinking",
-            StreamDelta::ToolCallDelta { .. } => "toolCallDelta",
+    wire_freeze! {
+        AgentEvent, expected_event_tag, event_samples,
+        AgentEvent::AgentStart => "agentStart" = AgentEvent::AgentStart,
+        AgentEvent::AgentEnd { .. } => "agentEnd"
+            = AgentEvent::agent_end(vec![msg()], SessionStats::default()),
+        AgentEvent::TurnStart => "turnStart" = AgentEvent::TurnStart,
+        AgentEvent::TurnEnd { .. } => "turnEnd" = AgentEvent::TurnEnd {
+            message: msg(),
+            tool_results: vec![],
+        },
+        AgentEvent::MessageStart { .. } => "messageStart"
+            = AgentEvent::MessageStart { message: msg() },
+        AgentEvent::MessageUpdate { .. } => "messageUpdate" = AgentEvent::MessageUpdate {
+            message: msg(),
+            delta: StreamDelta::Text { delta: "hi".into() },
+        },
+        AgentEvent::MessageEnd { .. } => "messageEnd"
+            = AgentEvent::MessageEnd { message: msg() },
+        AgentEvent::ToolExecutionStart { .. } => "toolExecutionStart"
+            = AgentEvent::ToolExecutionStart {
+                tool_call_id: "tc-1".into(),
+                tool_name: "bash".into(),
+                args: serde_json::json!({"command": "ls"}),
+            },
+        AgentEvent::ToolExecutionUpdate { .. } => "toolExecutionUpdate"
+            = AgentEvent::ToolExecutionUpdate {
+                tool_call_id: "tc-1".into(),
+                tool_name: "bash".into(),
+                partial_result: tool_result(),
+            },
+        AgentEvent::ToolExecutionEnd { .. } => "toolExecutionEnd"
+            = AgentEvent::ToolExecutionEnd {
+                tool_call_id: "tc-1".into(),
+                tool_name: "bash".into(),
+                result: tool_result(),
+                is_error: false,
+            },
+        AgentEvent::ProgressMessage { .. } => "progressMessage"
+            = AgentEvent::ProgressMessage {
+                tool_call_id: "tc-1".into(),
+                tool_name: "bash".into(),
+                text: "50% done".into(),
+            },
+        AgentEvent::InputRejected { .. } => "inputRejected"
+            = AgentEvent::InputRejected { reason: "injection detected".into() },
+        AgentEvent::LoopDetected { .. } => "loopDetected"
+            = AgentEvent::loop_detected("bash", 3, false),
+        AgentEvent::ContextCompacted { .. } => "contextCompacted"
+            = AgentEvent::ContextCompacted {
+                method: CompactionMethod::Summarized,
+                messages_before: 40,
+                messages_after: 13,
+                tokens_before: 96_500,
+                tokens_after: 41_200,
+                summary: None,
+            },
+    }
+
+    wire_freeze! {
+        StreamDelta, expected_delta_tag, delta_samples,
+        StreamDelta::Text { .. } => "text" = StreamDelta::Text { delta: "hi".into() },
+        StreamDelta::Thinking { .. } => "thinking"
+            = StreamDelta::Thinking { delta: "hmm".into() },
+        StreamDelta::ToolCallDelta { .. } => "toolCallDelta"
+            = StreamDelta::ToolCallDelta { delta: "{}".into() },
+    }
+
+    /// Asserts the frozen contract for one sample: declared tag == emitted tag,
+    /// payload keys are camelCase, and the value survives a round-trip.
+    ///
+    /// `seen` collects tags so a sample paired with the wrong pattern is caught
+    /// — that is the one error the macro cannot catch, since both lines
+    /// compile fine and the mismatch only shows as a repeated tag.
+    fn assert_frozen<T>(
+        sample: &T,
+        declared: &str,
+        seen: &mut BTreeSet<&'static str>,
+        declared_static: &'static str,
+    ) where
+        T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug + PartialEq,
+    {
+        let v = serde_json::to_value(sample).expect("serialize");
+
+        assert_eq!(
+            v["type"], declared,
+            "wire tag drifted: {sample:?} serializes as {} but wire_freeze! declares {declared}. \
+             Changing a tag breaks every deployed client — if this is intentional it is a \
+             breaking change, not a test fix",
+            v["type"]
+        );
+
+        for key in v
+            .as_object()
+            .expect("tagged enums serialize as objects")
+            .keys()
+        {
+            assert!(
+                !key.contains('_'),
+                "payload key {key:?} on {declared} is not camelCase — the enum carries \
+                 rename_all_fields = \"camelCase\" and TS clients hardcode these names"
+            );
         }
+
+        let back: T = serde_json::from_value(v).expect("round-trip deserialize");
+        assert_eq!(
+            &back, sample,
+            "{declared} did not survive a JSON round-trip"
+        );
+
+        assert!(
+            seen.insert(declared_static),
+            "two samples serialize as {declared} — a sample in wire_freeze! does not match \
+             the pattern on its own line"
+        );
     }
 
     #[test]
-    fn every_event_variant_has_a_pinned_tag() {
-        // Sampling one variant is enough: the compiler enforces coverage, this
-        // just proves the mapping matches what serde actually emits.
-        let event = AgentEvent::AgentStart;
-        let v = serde_json::to_value(&event).expect("serialize");
-        assert_eq!(v["type"], expected_event_tag(&event));
+    fn every_event_variant_is_frozen_tagged_and_round_trips() {
+        let samples = event_samples();
+        let mut seen = BTreeSet::new();
+        for sample in &samples {
+            let declared = expected_event_tag(sample);
+            assert_frozen(sample, declared, &mut seen, declared);
+        }
+        assert_eq!(
+            seen.len(),
+            samples.len(),
+            "every variant must contribute a distinct tag"
+        );
     }
 
     #[test]
-    fn every_delta_variant_has_a_pinned_tag() {
-        let delta = StreamDelta::Text { delta: "x".into() };
-        let v = serde_json::to_value(&delta).expect("serialize");
-        assert_eq!(v["type"], expected_delta_tag(&delta));
+    fn every_delta_variant_is_frozen_tagged_and_round_trips() {
+        let samples = delta_samples();
+        let mut seen = BTreeSet::new();
+        for sample in &samples {
+            let declared = expected_delta_tag(sample);
+            assert_frozen(sample, declared, &mut seen, declared);
+        }
+        assert_eq!(
+            seen.len(),
+            samples.len(),
+            "every variant must contribute a distinct tag"
+        );
     }
 }

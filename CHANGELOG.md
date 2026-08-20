@@ -8,6 +8,46 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The `AgentEvent` wire freeze now catches a new variant**
+  ([#137](https://github.com/yologdev/yoagent/issues/137)). `EVENT_VARIANT_COUNT`
+  claimed to fail when a variant was added without a serialization sample. It
+  could not: both sides of its comparison — the sample list and the count — are
+  hand-written, and a new variant appears in neither. #136 added a 14th variant
+  and the suite stayed 27/27 green, with the new variant's tag and round-trip
+  exactly as untested as the message described.
+
+  `wire_tag_freeze` in `src/types.rs` now declares the frozen tag **and** a
+  sample for every variant from one list, via a `wire_freeze!` macro that emits
+  both the wildcard-free match and the sample vector:
+
+  ```rust,ignore
+  AgentEvent::LoopDetected { .. } => "loopDetected"
+      = AgentEvent::loop_detected("bash", 3, false),
+  ```
+
+  Adding a variant is a non-exhaustive-match compile error, and the only way to
+  fix it is to add a line here — which supplies the sample in the same breath.
+  The two lists cannot drift because they are one list. A duplicated pattern is
+  an `unreachable_pattern` error under `-Dwarnings`, and a mistyped sample does
+  not compile.
+
+  Coverage went from one variant to all of them. The old test serialized
+  `AgentStart` only, so 13 of the 14 tag strings were asserted nowhere — a typo
+  like `"turnEndd"` compiled and passed. Each sample is now checked for its
+  frozen tag, camelCase payload keys, and a JSON round-trip, with a distinctness
+  check catching a sample paired with the wrong pattern.
+
+  Verified by mutation, since a guard that cannot fire is the bug being fixed:
+  adding a 15th variant is a compile error (the integration test stays green on
+  the same mutation), a tag typo fails, a mis-paired sample fails, and dropping
+  `rename_all_fields` fails on `tool_results`.
+
+  Also fixed in `tests/serialization_test.rs`: `test_context_compacted_wire_shape_is_frozen`
+  indexed the sample list **positionally** (`all_agent_events()[12]`), so
+  inserting a variant earlier would have silently retargeted it at a different
+  event; it now looks the variant up. The misleading guard and its false doc
+  claim are gone.
+
 - **Truncated tool output is retrievable instead of lost**
   ([#125](https://github.com/yologdev/yoagent/issues/125)). `truncate_tool_output`
   head-tail-truncates on append and the middle was gone irrecoverably — the full
