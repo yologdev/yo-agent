@@ -80,9 +80,30 @@ struct Preset {
     /// exactly like a database that has not caught up yet.
     absent_upstream: Option<&'static str>,
     /// Set when models.dev lists cost structure a flat `CostConfig` cannot
-    /// express, with what the crate therefore gets wrong. Keeps a known gap
-    /// visible in source rather than silently passing.
-    flat_rate_gap: Option<&'static str>,
+    /// express. Records *exactly* what was acknowledged, so the note cannot
+    /// become a blanket amnesty for whatever appears later.
+    flat_rate_gap: Option<FlatRateGap>,
+}
+
+/// A recorded, verified gap between what models.dev carries and what a flat
+/// `CostConfig` can express.
+///
+/// Prose alone made this a waiver: the audit checked only that a note existed,
+/// so a *new* unknown key — a second tier, an audio rate, a reasoning rate —
+/// folded silently into the old note and the preset stayed green forever. The
+/// reverse went unnoticed too: if the upstream claim vanished, or its key was
+/// renamed (indistinguishable from removal), nothing said the recorded decision
+/// had gone stale.
+///
+/// So the acknowledgement names the keys and the rates it was made against, and
+/// both directions are assertions.
+struct FlatRateGap {
+    /// Cost keys this gap covers. Any *other* unknown key is drift.
+    keys: &'static [&'static str],
+    /// Upstream rates the decision was reasoned against, as
+    /// `(json_pointer, value)`. A revision makes the recorded reasoning stale.
+    rates: &'static [(&'static str, f64)],
+    why: &'static str,
 }
 
 fn presets() -> Vec<Preset> {
@@ -130,20 +151,41 @@ fn presets() -> Vec<Preset> {
             vendor_page: openai,
             cost: ModelConfig::gpt_5_5().cost,
             absent_upstream: None,
-            flat_rate_gap: Some(
-                "models.dev lists a context tier above 272K at $10/$45/$1 — double \
-                 input, 1.5x output. `CostConfig` is a single flat rate, so \
-                 `gpt_5_5` understates long-context calls by up to 2x while \
-                 declaring a 1M window. Tracked as a known gap rather than \
-                 silently certified.",
-            ),
+            flat_rate_gap: Some(FlatRateGap {
+                keys: &["tiers", "context_over_200k"],
+                rates: &[
+                    ("/context_over_200k/input", 10.0),
+                    ("/context_over_200k/output", 45.0),
+                    ("/context_over_200k/cache_read", 1.0),
+                    ("/tiers/0/input", 10.0),
+                    ("/tiers/0/output", 45.0),
+                    ("/tiers/0/cache_read", 1.0),
+                    ("/tiers/0/tier/size", 272000.0),
+                ],
+                why: "models.dev says gpt-5.5 is tiered at 272K; the preset is \
+                      deliberately flat and `ModelConfig::gpt_5_5` documents why. \
+                      Short version: OpenAI publishes a >272K schedule but gpt-5.5 \
+                      has no row in it, the one gpt-5.5 row that appears in a \
+                      long-context table has `-` in every long-context cell, and \
+                      $10/$1/$45 is verbatim `gpt-5.6-sol`'s long-context rates \
+                      on a model with identical short-context rates. models.dev \
+                      also contradicts itself here — `tiers[0].tier.size` is \
+                      272000 beside a key named `context_over_200k`. \
+                      \
+                      The `rates` above are asserted, so this stays honest in both \
+                      directions: if upstream revises the numbers or drops the \
+                      claim, this fails and the decision gets re-made against new \
+                      evidence rather than silently inheriting an old one. \
+                      `CostConfig::with_context_tier` is ready if OpenAI publishes \
+                      a gpt-5.5 long-context row.",
+            }),
         },
         Preset {
             // Generic over the model id; these rates are Muse Spark 1.1/1.2.
             constructor: "ModelConfig::meta",
             provider: "meta",
             model: "muse-spark-1.2",
-            vendor_page: "https://dev.meta.ai/docs",
+            vendor_page: "https://dev.meta.ai/docs/pricing-rate-limits",
             cost: ModelConfig::meta("muse-spark-1.2", "Muse Spark 1.2").cost,
             absent_upstream: None,
             flat_rate_gap: None,
@@ -240,24 +282,69 @@ async fn hardcoded_prices_have_not_drifted() {
         // Structure this audit does not understand is a reason to fail, not to
         // read past. Tiered rates mean the flat preset is wrong somewhere.
         if let Some(obj) = cost.as_object() {
-            let unknown: Vec<&String> = obj
+            let unknown: Vec<String> = obj
                 .keys()
                 .filter(|k| !KNOWN_COST_KEYS.contains(&k.as_str()))
+                .cloned()
                 .collect();
-            if !unknown.is_empty() {
-                match p.flat_rate_gap {
-                    Some(why) => notes.push(format!(
-                        "{}: models.dev carries {unknown:?} — {why}",
-                        p.model
-                    )),
-                    None => drift.push(format!(
-                        "{}: models.dev carries cost keys this audit ignores: {unknown:?}. \
-                         `CostConfig` is one flat rate — if those are tiers, {} is wrong \
-                         above the boundary. Check {}, then either fix the preset or record \
-                         it in `flat_rate_gap`.",
-                        p.model, p.constructor, p.vendor_page
-                    )),
+
+            match &p.flat_rate_gap {
+                Some(gap) => {
+                    // Anything beyond what was acknowledged is new structure,
+                    // not covered by an old decision. Without this the note is
+                    // a blanket amnesty: a second tier or an audio rate would
+                    // fold into it and the preset would stay green forever.
+                    let unacknowledged: Vec<&String> = unknown
+                        .iter()
+                        .filter(|k| !gap.keys.contains(&k.as_str()))
+                        .collect();
+                    if !unacknowledged.is_empty() {
+                        drift.push(format!(
+                            "{}: models.dev carries cost keys beyond the recorded gap: \
+                             {unacknowledged:?}. The note covers {:?} only. Check {} and \
+                             either fix {} or widen the acknowledgement.",
+                            p.model, gap.keys, p.vendor_page, p.constructor
+                        ));
+                    }
+
+                    // The reverse is just as important. If the claim vanishes —
+                    // or a key is renamed, which is indistinguishable from
+                    // removal — the recorded decision has gone stale and
+                    // nothing would otherwise say so.
+                    let missing: Vec<&&str> =
+                        gap.keys.iter().filter(|k| !obj.contains_key(**k)).collect();
+                    if !missing.is_empty() {
+                        drift.push(format!(
+                            "{}: the recorded gap names {missing:?}, which models.dev no \
+                             longer carries. Either upstream dropped the claim — re-check \
+                             {} and delete the note — or a key was renamed and this preset \
+                             is now silently uncovered.",
+                            p.model, p.vendor_page
+                        ));
+                    }
+
+                    // And the rates the decision was reasoned against.
+                    for (pointer, expected) in gap.rates {
+                        match cost.pointer(pointer).and_then(|v| v.as_f64()) {
+                            Some(actual) if (actual - expected).abs() < 1e-9 => {}
+                            other => drift.push(format!(
+                                "{}: recorded gap expects {pointer} == {expected}, models.dev \
+                                 now says {other:?}. The decision in {} was reasoned against \
+                                 the old figure; re-check {}.",
+                                p.model, p.constructor, p.vendor_page
+                            )),
+                        }
+                    }
+                    notes.push(format!("{}: {}", p.model, gap.why));
                 }
+                None if !unknown.is_empty() => drift.push(format!(
+                    "{}: models.dev carries cost keys this audit ignores: {unknown:?}. \
+                     `CostConfig` is one flat rate — if those are tiers, {} is wrong \
+                     above the boundary. Check {}, then either fix the preset or record \
+                     it in `flat_rate_gap`.",
+                    p.model, p.constructor, p.vendor_page
+                )),
+                None => {}
             }
         }
 
@@ -373,21 +460,13 @@ fn is_configured_means_any_rate_set() {
         "all-zero rates mean pricing is unknown, not that the model is free"
     );
 
-    let no_cache_write = CostConfig {
-        input_per_million: 5.0,
-        output_per_million: 30.0,
-        cache_read_per_million: 0.5,
-        cache_write_per_million: 0.0,
-    };
+    let no_cache_write = CostConfig::new(5.0, 30.0, 0.5, 0.0);
     assert!(
         no_cache_write.is_configured(),
         "a provider that charges nothing for cache writes is priced, not unknown"
     );
 
-    let only_one_field = CostConfig {
-        cache_read_per_million: 0.1,
-        ..CostConfig::default()
-    };
+    let only_one_field = CostConfig::new(0.0, 0.0, 0.1, 0.0);
     assert!(
         only_one_field.is_configured(),
         "any single rate is enough to count as priced"
@@ -400,4 +479,70 @@ fn is_configured_means_any_rate_set() {
             p.constructor
         );
     }
+}
+
+/// A request above the tier boundary must cost the tier rate.
+///
+/// Built from a literal, not a preset: no shipped preset is tiered today, and
+/// this must keep testing the mechanism if that stays true. The boundary is
+/// compared against *prompt* tokens — `input + cache_read + cache_write` — so a
+/// long reply to a short prompt stays on the base rate.
+#[test]
+fn cost_usd_applies_the_context_tier_by_prompt_size() {
+    use yoagent::provider::{ContextTier, CostConfig};
+    use yoagent::types::Usage;
+
+    let cfg = CostConfig::new(5.0, 30.0, 0.5, 0.0)
+        .with_context_tier(ContextTier::new(272_000, 10.0, 45.0, 1.0));
+
+    let usage = |input: u64, output: u64| Usage {
+        input,
+        output,
+        cache_read: 0,
+        cache_write: 0,
+        total_tokens: input + output,
+    };
+
+    // Below: base rates. 100k in, 1k out => 100k*$5/M + 1k*$30/M.
+    let below = cfg.cost_usd(&usage(100_000, 1_000));
+    assert!(
+        (below - (0.5 + 0.03)).abs() < 1e-9,
+        "below the boundary must use base rates, got {below}"
+    );
+
+    // Above: tier rates. 300k in, 1k out => 300k*$10/M + 1k*$45/M.
+    let above = cfg.cost_usd(&usage(300_000, 1_000));
+    assert!(
+        (above - (3.0 + 0.045)).abs() < 1e-9,
+        "above the boundary must use tier rates, got {above}"
+    );
+
+    // Exactly at the boundary is *below* — the field is `above_prompt_tokens`.
+    let at = cfg.cost_usd(&usage(272_000, 0));
+    assert!(
+        (at - 1.36).abs() < 1e-9,
+        "the boundary itself must stay on the base rate, got {at}"
+    );
+
+    // Cached tokens count toward prompt size: 272k cache reads and 1 fresh
+    // token is a 272_001-token prompt, so the tier applies.
+    let cached = cfg.cost_usd(&Usage {
+        input: 1,
+        output: 0,
+        cache_read: 272_000,
+        cache_write: 0,
+        total_tokens: 272_001,
+    });
+    assert!(
+        (cached - (272_000.0 + 10.0) / 1_000_000.0).abs() < 1e-9,
+        "cache reads must count toward the boundary and bill at the tier's \
+         cache rate, got {cached}"
+    );
+
+    // Output does not push a short prompt over the line.
+    let long_reply = cfg.cost_usd(&usage(1_000, 400_000));
+    assert!(
+        (long_reply - (0.005 + 12.0)).abs() < 1e-9,
+        "the tier keys on prompt size, not total, got {long_reply}"
+    );
 }

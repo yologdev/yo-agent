@@ -46,6 +46,55 @@ adheres to [Semantic Versioning](https://semver.org/).
   restarts every turn — id alone would let turn 1's frozen marker resolve to
   turn 5's content.
 
+- **`CostConfig` models context tiers; no preset uses one**
+  ([#138](https://github.com/yologdev/yoagent/issues/138)). `cost_usd` applied
+  one rate per token category regardless of request size, while some vendors
+  price long-context requests higher. It now takes an optional
+  `CostConfig::context_tier`, and selects rates by the request's **prompt**
+  tokens (`input + cache_read + cache_write`) so a long reply to a short prompt
+  stays on the base rate.
+
+  ```rust,ignore
+  let cost = CostConfig::new(5.0, 30.0, 0.5, 0.0)
+      .with_context_tier(ContextTier::new(272_000, 10.0, 45.0, 1.0));
+  ```
+
+  **Every shipped preset stays flat**, `gpt_5_5` included — and getting there
+  took three passes, each reversing the last. models.dev records a 272K tier for
+  gpt-5.5 at $10/$45/$1. Reading OpenAI's pricing page said no such row existed.
+  A closer read said it did, as columns rather than rows. Parsing the page's
+  actual markup resolved it: the `>272K input tokens` column group is real, but
+  **gpt-5.5 has no row in it** — the $10/$1/$45 triple belongs to
+  `gpt-5.6-sol`, a model whose short-context rates are identical to gpt-5.5's.
+  The one gpt-5.5 row that does appear in a long-context table,
+  `gpt-5.5-cyber`, has `-` in all four long-context cells.
+
+  What settled it was checking models.dev's tier data where a vendor states the
+  answer unambiguously: 34 Claude entries carry tiers, including
+  `claude-4.6-sonnet` and `claude-opus-4.6` — models Anthropic's own page says
+  bill the full 1M window at standard rates. Its tier data is demonstrably wrong
+  where it is checkable, so a models.dev tier alone is not grounds to double
+  what callers are charged. #132's doctrine, applied: drift alarm, never
+  authority.
+
+  `tests/price_audit.rs` now asserts the disputed rates rather than merely
+  naming the keys, so a revision upstream fails the audit and the decision gets
+  re-made against new evidence instead of silently inheriting this one.
+
+  One caveat for whoever tiers a preset later: prompt size is derived as
+  `input + cache_read + cache_write`, which holds only where the provider
+  subtracts cached tokens out of `input`. `bedrock.rs` populates neither cache
+  field, so a heavily-cached prompt reads small there and would select the cheap
+  tier.
+
+  **Breaking: `CostConfig` is now `#[non_exhaustive]`** and gained a fifth
+  field, so out-of-crate struct-literal construction no longer compiles. Use
+  `CostConfig::new(input, output, cache_read, cache_write)`, optionally with
+  `.with_context_tier(..)`; `..Default::default()` no longer rescues a literal.
+  Field *reads* and mutation through a binding are unaffected. This is the last
+  cheap moment to close it — every future rate category (per-image, per-second
+  audio, a second tier) would otherwise be another breaking release.
+
 - **Truncation stash: one key per content block, and `SubAgentTool` can now
   reach it at all** ([#134](https://github.com/yologdev/yoagent/issues/134)).
 

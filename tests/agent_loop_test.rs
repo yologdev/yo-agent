@@ -2742,12 +2742,7 @@ async fn cost_accrues_when_rates_are_configured_and_stays_none_otherwise() {
         system_prompt: String::new(),
     };
     let mut priced = yoagent::provider::ModelConfig::anthropic("mock", "Mock");
-    priced.cost = yoagent::provider::CostConfig {
-        input_per_million: 3.0,
-        output_per_million: 15.0,
-        cache_read_per_million: 0.0,
-        cache_write_per_million: 0.0,
-    };
+    priced.cost = yoagent::provider::CostConfig::new(3.0, 15.0, 0.0, 0.0);
     let mut config = make_config(MockProvider::new(responses()));
     config.model_config = Some(priced);
     config.get_follow_up_messages = follow_up_once();

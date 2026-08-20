@@ -41,6 +41,23 @@ impl std::fmt::Display for ApiProtocol {
 /// rates across 18 releases, v0.9.0 through v0.16.5, overstating every
 /// `cost_usd` for that model by 50%, and nothing detected it.
 ///
+/// # Context tiers
+///
+/// Some vendors charge more above a prompt-size threshold. Set
+/// [`context_tier`](Self::context_tier) and `cost_usd` selects by the request's
+/// prompt tokens (`input + cache_read + cache_write`).
+///
+/// **No preset here sets one** (checked 2026-08-20). Anthropic states that 4.6+
+/// models bill the full 1M window at standard rates, and Meta's page says there
+/// is no long-context premium; Haiku 4.5 is flat because its window is 200K.
+/// `gpt_5_5` is the one contested case — see its docs for why it stays flat.
+///
+/// Note the derivation: prompt size is `input + cache_read + cache_write`, which
+/// holds only where the provider subtracts cached tokens out of `input`.
+/// `bedrock.rs` populates neither cache field, so a heavily-cached prompt reads
+/// small there and would select the cheap tier. Fix that before tiering a model
+/// Bedrock serves.
+///
 /// `tests/price_audit.rs` now diffs every preset against models.dev; run it
 /// before a release:
 ///
@@ -58,7 +75,35 @@ impl std::fmt::Display for ApiProtocol {
 /// config.cost.input_per_million = 1.80; // your negotiated rate
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CostConfig {
+    pub input_per_million: f64,
+    pub output_per_million: f64,
+    #[serde(default)]
+    pub cache_read_per_million: f64,
+    #[serde(default)]
+    pub cache_write_per_million: f64,
+    /// Rates that replace the above once a request's prompt exceeds a
+    /// threshold. `None` means one flat rate at every size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tier: Option<ContextTier>,
+}
+
+/// Higher rates charged above a context threshold.
+///
+/// OpenAI prices gpt-5.5 at $5/$30 below ~272K prompt tokens and $10/$45 above
+/// it — published as *columns* on the same pricing row, which is easy to miss
+/// if you go looking for a second row. A flat `CostConfig` under-bills those
+/// requests by 2x on input, and this crate's whole compaction subsystem exists
+/// to run agents at high context, so the case is central rather than exotic.
+///
+/// The threshold is compared against the request's **prompt** tokens —
+/// `input + cache_read + cache_write` — not the total including output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ContextTier {
+    /// Prompt tokens above which the tier rates apply.
+    pub above_prompt_tokens: u64,
     pub input_per_million: f64,
     pub output_per_million: f64,
     #[serde(default)]
@@ -67,7 +112,51 @@ pub struct CostConfig {
     pub cache_write_per_million: f64,
 }
 
+impl ContextTier {
+    /// A tier with no separate cache-write rate, which is the common shape.
+    pub fn new(
+        above_prompt_tokens: u64,
+        input_per_million: f64,
+        output_per_million: f64,
+        cache_read_per_million: f64,
+    ) -> Self {
+        Self {
+            above_prompt_tokens,
+            input_per_million,
+            output_per_million,
+            cache_read_per_million,
+            cache_write_per_million: 0.0,
+        }
+    }
+}
+
 impl CostConfig {
+    /// Flat rates, one price per token category at every request size.
+    ///
+    /// `CostConfig` is `#[non_exhaustive]`, so downstream crates build it here
+    /// rather than with a struct literal. Add a tier with
+    /// [`with_context_tier`](Self::with_context_tier).
+    pub fn new(
+        input_per_million: f64,
+        output_per_million: f64,
+        cache_read_per_million: f64,
+        cache_write_per_million: f64,
+    ) -> Self {
+        Self {
+            input_per_million,
+            output_per_million,
+            cache_read_per_million,
+            cache_write_per_million,
+            context_tier: None,
+        }
+    }
+
+    /// Charge higher rates above a prompt-size threshold.
+    pub fn with_context_tier(mut self, tier: ContextTier) -> Self {
+        self.context_tier = Some(tier);
+        self
+    }
+
     /// Whether any rate is set. All-zero rates mean pricing is unknown
     /// (custom/local models), not that the model is free.
     pub fn is_configured(&self) -> bool {
@@ -82,10 +171,27 @@ impl CostConfig {
     /// Consumed by [`crate::Agent::session_cost_usd`]; also usable directly
     /// in `after_turn` callbacks for per-turn cost tracking.
     pub fn cost_usd(&self, usage: &crate::types::Usage) -> f64 {
-        (usage.input as f64 * self.input_per_million
-            + usage.output as f64 * self.output_per_million
-            + usage.cache_read as f64 * self.cache_read_per_million
-            + usage.cache_write as f64 * self.cache_write_per_million)
+        // Prompt size, which is what a context tier is priced against — every
+        // caller passes one request's usage, so no extra parameter is needed.
+        let prompt = usage.input + usage.cache_read + usage.cache_write;
+        let (input, output, cache_read, cache_write) = match &self.context_tier {
+            Some(t) if prompt > t.above_prompt_tokens => (
+                t.input_per_million,
+                t.output_per_million,
+                t.cache_read_per_million,
+                t.cache_write_per_million,
+            ),
+            _ => (
+                self.input_per_million,
+                self.output_per_million,
+                self.cache_read_per_million,
+                self.cache_write_per_million,
+            ),
+        };
+        (usage.input as f64 * input
+            + usage.output as f64 * output
+            + usage.cache_read as f64 * cache_read
+            + usage.cache_write as f64 * cache_write)
             / 1_000_000.0
     }
 }
@@ -97,6 +203,7 @@ impl Default for CostConfig {
             output_per_million: 0.0,
             cache_read_per_million: 0.0,
             cache_write_per_million: 0.0,
+            context_tier: None,
         }
     }
 }
@@ -514,6 +621,7 @@ impl ModelConfig {
                 output_per_million: 50.0,
                 cache_read_per_million: 1.0,
                 cache_write_per_million: 12.5,
+                ..Default::default()
             },
             ..Self::anthropic("claude-fable-5", "Claude Fable 5")
         }
@@ -538,6 +646,7 @@ impl ModelConfig {
                 output_per_million: 25.0,
                 cache_read_per_million: 0.5,
                 cache_write_per_million: 6.25,
+                ..Default::default()
             },
             ..Self::anthropic("claude-opus-5", "Claude Opus 5")
         }
@@ -556,6 +665,7 @@ impl ModelConfig {
                 output_per_million: 25.0,
                 cache_read_per_million: 0.5,
                 cache_write_per_million: 6.25,
+                ..Default::default()
             },
             ..Self::anthropic("claude-opus-4-8", "Claude Opus 4.8")
         }
@@ -574,6 +684,7 @@ impl ModelConfig {
                 output_per_million: 10.0,
                 cache_read_per_million: 0.2,
                 cache_write_per_million: 2.5,
+                ..Default::default()
             },
             ..Self::anthropic("claude-sonnet-5", "Claude Sonnet 5")
         }
@@ -592,6 +703,7 @@ impl ModelConfig {
                 output_per_million: 5.0,
                 cache_read_per_million: 0.1,
                 cache_write_per_million: 1.25,
+                ..Default::default()
             },
             ..Self::anthropic("claude-haiku-4-5", "Claude Haiku 4.5")
         }
@@ -603,11 +715,34 @@ impl ModelConfig {
     /// Rates verified against <https://developers.openai.com/api/docs/pricing>
     /// on 2026-08-19. See [`CostConfig`] — they are a snapshot, not an authority.
     ///
-    /// **Flat rate, tiered upstream.** OpenAI charges roughly double above a
-    /// ~272K context tier ($10/$45/$1), and this preset declares a 1M window —
-    /// so `cost_usd` understates long-context calls by up to 2x. `CostConfig`
-    /// has no tier concept; override `cost` for long-context workloads.
-    /// `tests/price_audit.rs` records this as a known gap.
+    ///
+    /// **Deliberately flat, over a contested tier claim.** models.dev records a
+    /// 272K tier for this model at $10/$45 with $1.00 cache reads. The preset
+    /// does not, because the evidence does not survive checking:
+    ///
+    /// - OpenAI's pricing page does publish a `>272K input tokens` schedule,
+    ///   as a second column group beside `≤272K`. But gpt-5.5 has no row in
+    ///   that table. Across all four Flagship tiers it appears only as
+    ///   `gpt-5.5 (<272K context length)` — Standard $5/$0.50/$30, Batch and
+    ///   Flex $2.50/$15, Fast $12.50/$75 — with no long-context cell.
+    /// - The one gpt-5.5 row that *is* in a long-context table,
+    ///   `gpt-5.5-cyber`, has all four long-context cells set to `-`, and the
+    ///   page hides that row by default.
+    /// - $10/$1/$45 does appear on the page verbatim — as `gpt-5.6-sol`'s
+    ///   long-context rates. Its short-context rates are identical to
+    ///   gpt-5.5's, which is a plausible route for the number to have been
+    ///   copied onto the wrong model.
+    /// - models.dev's own entry contradicts itself: `tiers[0].tier.size` is
+    ///   272000 while the sibling key carrying the same rates is named
+    ///   `context_over_200k`.
+    ///
+    /// Tiering this preset on that would have doubled the input rate every
+    /// caller is charged above 272K prompt tokens. If OpenAI publishes a
+    /// gpt-5.5 long-context row, the machinery is ready —
+    /// [`CostConfig::with_context_tier`]. Until then, flat.
+    ///
+    /// Rates verified against <https://developers.openai.com/api/docs/pricing>
+    /// on 2026-08-20, both column groups read. See [`CostConfig`].
     pub fn gpt_5_5() -> Self {
         Self {
             reasoning: true,
@@ -618,6 +753,7 @@ impl ModelConfig {
                 output_per_million: 30.0,
                 cache_read_per_million: 0.5,
                 cache_write_per_million: 0.0,
+                context_tier: None,
             },
             ..Self::openai("gpt-5.5", "GPT-5.5")
         }
@@ -844,6 +980,7 @@ impl ModelConfig {
                 output_per_million: 4.25,
                 cache_read_per_million: 0.15,
                 cache_write_per_million: 0.0,
+                ..Default::default()
             },
             headers: HashMap::new(),
             anthropic: None,
@@ -1038,6 +1175,7 @@ mod tests {
             output_per_million: 15.0,
             cache_read_per_million: 0.3,
             cache_write_per_million: 3.75,
+            ..Default::default()
         };
         let usage = crate::types::Usage {
             input: 1_000_000,
