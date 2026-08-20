@@ -9,16 +9,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Development Commands
 
 ```bash
-cargo build                          # Build the library
-cargo test                           # Run all unit tests
-cargo test <test_name>               # Run a single test by name
-cargo test --test agent_test         # Run a specific test file
+cargo test --all-features            # Run all tests — what CI runs
+cargo clippy --all-targets --all-features   # Lint — what CI runs (-Dwarnings)
 cargo fmt                            # Auto-format code
 cargo fmt -- --check                 # Check formatting (CI uses this)
-cargo clippy --all-targets           # Lint (CI runs with -Dwarnings)
+
+cargo test <test_name>               # Run a single test by name
+cargo test --test agent_test         # Run a specific test file
 cargo run --example cli              # Run the interactive CLI example
 cargo run --example basic            # Run the minimal example
 ```
+
+**Pass `--all-features` when checking your work.** `openapi` and `gasp` are off
+by default, and some targets exist only behind them: `gasp_emit` and
+`llm_compaction_live` are both `required-features = ["gasp"]`, so plain
+`cargo clippy --all-targets` skips them entirely and reports clean on code CI
+will reject. This is not hypothetical — a breaking change to `CostConfig`
+passed local clippy while `llm_compaction_live` no longer compiled.
 
 CI (`RUSTFLAGS="-Dwarnings"`) treats all clippy warnings as errors. Integration tests in `tests/integration_anthropic.rs` require a live API key and are skipped by default.
 
