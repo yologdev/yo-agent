@@ -3456,7 +3456,8 @@ async fn run_with_limits(
 async fn a_steer_nudge_does_not_orphan_the_tool_calls_it_interrupts() {
     let (_events, messages) = run_with_limits_msgs(
         repeat_call(6, serde_json::json!({"q": "same"})),
-        yoagent::context::ExecutionLimits::default().with_max_identical_tool_calls(Some(3)),
+        yoagent::context::ExecutionLimits::default()
+            .with_max_consecutive_identical_tool_calls(Some(3)),
     )
     .await;
     assert_tool_calls_are_answered(&messages, "steer");
@@ -3470,7 +3471,8 @@ async fn a_steer_nudge_does_not_orphan_the_tool_calls_it_interrupts() {
 async fn an_abort_answers_its_outstanding_tool_calls_before_stopping() {
     let (events, messages) = run_with_limits_msgs(
         repeat_call(12, serde_json::json!({"q": "same"})),
-        yoagent::context::ExecutionLimits::default().with_max_identical_tool_calls(Some(3)),
+        yoagent::context::ExecutionLimits::default()
+            .with_max_consecutive_identical_tool_calls(Some(3)),
     )
     .await;
     assert!(
@@ -3486,7 +3488,8 @@ async fn an_abort_answers_its_outstanding_tool_calls_before_stopping() {
 async fn an_abort_actually_halts_the_run() {
     let (events, _messages) = run_with_limits_msgs(
         repeat_call(40, serde_json::json!({"q": "same"})),
-        yoagent::context::ExecutionLimits::default().with_max_identical_tool_calls(Some(3)),
+        yoagent::context::ExecutionLimits::default()
+            .with_max_consecutive_identical_tool_calls(Some(3)),
     )
     .await;
     let turns = events
@@ -3504,7 +3507,7 @@ async fn an_abort_actually_halts_the_run() {
 #[test]
 fn loop_detection_is_enabled_by_default() {
     assert_eq!(
-        yoagent::context::ExecutionLimits::default().max_identical_tool_calls,
+        yoagent::context::ExecutionLimits::default().max_consecutive_identical_tool_calls,
         Some(3),
         "loop detection must ship on; a change here turns it off for everyone who \
          never sets the field"
@@ -3520,7 +3523,8 @@ fn loop_detection_is_enabled_by_default() {
 async fn loop_detection_messages_are_clean_prose() {
     let (_events, messages) = run_with_limits_msgs(
         repeat_call(12, serde_json::json!({"q": "same"})),
-        yoagent::context::ExecutionLimits::default().with_max_identical_tool_calls(Some(3)),
+        yoagent::context::ExecutionLimits::default()
+            .with_max_consecutive_identical_tool_calls(Some(3)),
     )
     .await;
     let injected: Vec<String> = messages
@@ -3547,6 +3551,137 @@ async fn loop_detection_messages_are_clean_prose() {
     }
 }
 
+/// The threshold is exact: `Some(n)` trips on the nth consecutive call, not
+/// the (n+1)th.
+///
+/// The existing tests feed 12 repeats and assert only that *some* steer
+/// occurred, so `>=` could become `>` unnoticed and every user would get one
+/// extra wasted call before intervention.
+#[test]
+fn the_threshold_trips_on_the_nth_consecutive_call() {
+    use yoagent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
+    let mut tracker = ExecutionTracker::new(
+        ExecutionLimits::default().with_max_consecutive_identical_tool_calls(Some(3)),
+    );
+    let call = |n: &str| vec![(n.to_string(), serde_json::json!({"q": 1}))];
+
+    assert_eq!(tracker.record_tool_calls(&call("a")), LoopVerdict::Continue);
+    assert_eq!(tracker.record_tool_calls(&call("a")), LoopVerdict::Continue);
+    assert!(
+        matches!(
+            tracker.record_tool_calls(&call("a")),
+            LoopVerdict::Steer { repetitions: 3, .. }
+        ),
+        "the 3rd consecutive call must steer, and report 3 repetitions"
+    );
+}
+
+/// Duplicates inside a single batch count.
+///
+/// This is the motivating case in `record_tool_calls`'s own doc — with
+/// `Parallel` execution a model can emit the same call three times in one
+/// message and never take a second turn — but every fixture emitted one call
+/// per response, so only the across-turns path was ever walked.
+#[test]
+fn identical_calls_within_one_batch_trip_the_detector() {
+    use yoagent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
+    let mut tracker = ExecutionTracker::new(
+        ExecutionLimits::default().with_max_consecutive_identical_tool_calls(Some(3)),
+    );
+    let batch = vec![
+        ("bash".to_string(), serde_json::json!({"cmd": "ls"})),
+        ("bash".to_string(), serde_json::json!({"cmd": "ls"})),
+        ("bash".to_string(), serde_json::json!({"cmd": "ls"})),
+    ];
+    assert!(
+        matches!(
+            tracker.record_tool_calls(&batch),
+            LoopVerdict::Steer { repetitions: 3, .. }
+        ),
+        "three identical calls in one message must trip without a second turn"
+    );
+}
+
+/// The worst verdict in a batch wins.
+///
+/// Regression: the loop stopped at the first escalation, so an `Abort` later in
+/// the batch was downgraded to an earlier `Steer` — and that later signature
+/// never reached `steered`, giving it a free pass on the next turn too.
+#[test]
+fn a_batch_reports_its_most_severe_verdict() {
+    use yoagent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
+    let mut tracker = ExecutionTracker::new(
+        ExecutionLimits::default().with_max_consecutive_identical_tool_calls(Some(3)),
+    );
+    let b = |n: &str| (n.to_string(), serde_json::json!({"q": 1}));
+
+    // Get "b" steered first, so a later trip on it is an abort.
+    assert!(matches!(
+        tracker.record_tool_calls(&[b("b"), b("b"), b("b")]),
+        LoopVerdict::Steer { .. }
+    ));
+
+    // "a" trips for the first time (steer) and "b" trips again (abort) in one
+    // batch. Abort must win regardless of order.
+    let verdict = tracker.record_tool_calls(&[b("a"), b("a"), b("a"), b("b"), b("b"), b("b")]);
+    assert!(
+        matches!(&verdict, LoopVerdict::Abort { tool_name, .. } if tool_name == "b"),
+        "an abort later in the batch must not be downgraded to the earlier steer, got {verdict:?}"
+    );
+}
+
+/// Signature comparison is structural, not textual: two calls differing only
+/// in key order are the same call.
+#[test]
+fn key_order_does_not_disguise_a_repeat() {
+    use yoagent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
+    let mut tracker = ExecutionTracker::new(
+        ExecutionLimits::default().with_max_consecutive_identical_tool_calls(Some(2)),
+    );
+    let a = vec![("t".to_string(), serde_json::json!({"x": 1, "y": 2}))];
+    let b = vec![("t".to_string(), serde_json::json!({"y": 2, "x": 1}))];
+    assert_eq!(tracker.record_tool_calls(&a), LoopVerdict::Continue);
+    assert!(
+        matches!(tracker.record_tool_calls(&b), LoopVerdict::Steer { .. }),
+        "reordered keys are the same call — string comparison would miss the loop"
+    );
+}
+
+/// `Some(0)` disables the check rather than tripping on every call.
+#[test]
+fn a_zero_threshold_disables_the_check() {
+    use yoagent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
+    let mut tracker = ExecutionTracker::new(
+        ExecutionLimits::default().with_max_consecutive_identical_tool_calls(Some(0)),
+    );
+    let call = vec![("t".to_string(), serde_json::json!({}))];
+    for _ in 0..10 {
+        assert_eq!(tracker.record_tool_calls(&call), LoopVerdict::Continue);
+    }
+}
+
+/// Alternating calls are deliberately *not* detected, and this pins that so the
+/// trade-off is a decision rather than a surprise.
+///
+/// Widening to a windowed count would regress
+/// `an_interleaved_different_call_resets_the_counter` — an agent working
+/// through a list calls one tool repeatedly and legitimately.
+#[test]
+fn alternating_calls_are_not_detected_by_design() {
+    use yoagent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
+    let mut tracker = ExecutionTracker::new(
+        ExecutionLimits::default().with_max_consecutive_identical_tool_calls(Some(3)),
+    );
+    for i in 0..50 {
+        let name = if i % 2 == 0 { "a" } else { "b" };
+        assert_eq!(
+            tracker.record_tool_calls(&[(name.to_string(), serde_json::json!({}))]),
+            LoopVerdict::Continue,
+            "the consecutive detector must not fire on alternating calls"
+        );
+    }
+}
+
 /// Three identical calls steer; continued repetition aborts. The steer comes
 /// first on purpose — a model repeating a call is often retrying something
 /// transient, and aborting immediately would regress that.
@@ -3554,7 +3689,8 @@ async fn loop_detection_messages_are_clean_prose() {
 async fn repeated_identical_calls_steer_then_abort() {
     let events = run_with_limits(
         repeat_call(12, serde_json::json!({"q": "same"})),
-        yoagent::context::ExecutionLimits::default().with_max_identical_tool_calls(Some(3)),
+        yoagent::context::ExecutionLimits::default()
+            .with_max_consecutive_identical_tool_calls(Some(3)),
     )
     .await;
 
@@ -3594,7 +3730,8 @@ async fn distinct_arguments_never_trip() {
 
     let events = run_with_limits(
         responses,
-        yoagent::context::ExecutionLimits::default().with_max_identical_tool_calls(Some(3)),
+        yoagent::context::ExecutionLimits::default()
+            .with_max_consecutive_identical_tool_calls(Some(3)),
     )
     .await;
     assert!(
@@ -3622,7 +3759,8 @@ async fn an_interleaved_different_call_resets_the_counter() {
 
     let events = run_with_limits(
         responses,
-        yoagent::context::ExecutionLimits::default().with_max_identical_tool_calls(Some(3)),
+        yoagent::context::ExecutionLimits::default()
+            .with_max_consecutive_identical_tool_calls(Some(3)),
     )
     .await;
     assert!(
@@ -3636,7 +3774,8 @@ async fn an_interleaved_different_call_resets_the_counter() {
 async fn detection_can_be_switched_off() {
     let events = run_with_limits(
         repeat_call(12, serde_json::json!({"q": "same"})),
-        yoagent::context::ExecutionLimits::default().with_max_identical_tool_calls(None),
+        yoagent::context::ExecutionLimits::default()
+            .with_max_consecutive_identical_tool_calls(None),
     )
     .await;
     assert!(

@@ -500,15 +500,22 @@ pub const TOOL_OUTPUT_KEY_PREFIX: &str = "tool-out-";
 /// Hashing the content keeps the key deterministic on replay while making a
 /// collision mean the contents were identical anyway.
 pub fn tool_output_key(tool_call_id: &str, full_output: &str) -> String {
-    // FNV-1a, for the same reason the GASP recorder uses it: `DefaultHasher`
-    // is documented as unstable across releases, and a key that moves between
-    // compiler versions silently stops resolving.
+    format!(
+        "{TOOL_OUTPUT_KEY_PREFIX}{tool_call_id}-{:016x}",
+        fnv1a(full_output.as_bytes())
+    )
+}
+
+/// FNV-1a, for the same reason the GASP recorder uses it: `DefaultHasher` is
+/// documented as unstable across Rust releases, and a key that moves between
+/// compiler versions silently stops resolving.
+fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in full_output.as_bytes() {
+    for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!("{TOOL_OUTPUT_KEY_PREFIX}{tool_call_id}-{hash:016x}")
+    hash
 }
 
 /// The stash key for one content block of a tool result.
@@ -951,8 +958,19 @@ pub struct ExecutionLimits {
     /// but only after burning the full turn, token and wall-clock budget — so
     /// the run costs its maximum to discover it achieved nothing.
     ///
-    /// `None` disables the check. Default `Some(3)`.
-    pub max_identical_tool_calls: Option<usize>,
+    /// **Consecutive**, and that word is load-bearing. A different signature
+    /// resets the streak, so a model alternating `[a, b, a, b, …]` forever is
+    /// *not* detected. That is a deliberate trade, not an oversight: an agent
+    /// working through a list calls one tool repeatedly and legitimately, and
+    /// a detector that fired on interleaved repeats would be worse than none.
+    /// See `an_interleaved_different_call_resets_the_counter`. Widening this
+    /// to a windowed count is tracked separately.
+    ///
+    /// `None` disables the check. `Some(0)` also disables it — there is no
+    /// streak length below which a call has not been made. `Some(1)` steers on
+    /// the very first tool call of a run, which is almost never wanted.
+    /// Default `Some(3)`.
+    pub max_consecutive_identical_tool_calls: Option<usize>,
 }
 
 impl Default for ExecutionLimits {
@@ -961,7 +979,7 @@ impl Default for ExecutionLimits {
             max_turns: 50,
             max_total_tokens: 1_000_000,
             max_duration: std::time::Duration::from_secs(600),
-            max_identical_tool_calls: Some(3),
+            max_consecutive_identical_tool_calls: Some(3),
         }
     }
 }
@@ -987,10 +1005,25 @@ impl ExecutionLimits {
 
     /// Consecutive identical tool calls tolerated before steering, then
     /// stopping. `None` disables loop detection entirely.
-    pub fn with_max_identical_tool_calls(mut self, calls: Option<usize>) -> Self {
-        self.max_identical_tool_calls = calls;
+    pub fn with_max_consecutive_identical_tool_calls(mut self, calls: Option<usize>) -> Self {
+        self.max_consecutive_identical_tool_calls = calls;
         self
     }
+}
+
+/// How many steered signatures to remember before dropping the oldest.
+const MAX_STEERED_SIGNATURES: usize = 32;
+
+/// Stable hash of a tool call's identity, for the steered-signature set.
+///
+/// Hashes the serialized `Value`, but only after `serde_json` has normalised
+/// it — `to_string` on a `Value` emits object keys in the map's own order, so
+/// two calls differing only in key order hash the same, matching how
+/// `last_signature` compares `Value`s rather than text.
+fn signature_hash(name: &str, args: &serde_json::Value) -> u64 {
+    let mut h = fnv1a(name.as_bytes());
+    h ^= fnv1a(args.to_string().as_bytes());
+    h
 }
 
 /// What the loop should do about a repeated tool call.
@@ -1037,10 +1070,23 @@ pub struct ExecutionTracker {
     /// same call, and string comparison would miss the loop.
     last_signature: Option<(String, serde_json::Value)>,
     consecutive: usize,
-    /// Signatures already steered about. A second trip on one of these aborts
+    /// Hashes of signatures already steered about, capped. A second trip on one
+    /// of these aborts.
+    ///
+    /// Hashes rather than the signatures themselves, and bounded rather than
+    /// unbounded: this held a full clone of every steered call's arguments —
+    /// for a file-write tool, the entire file body — inside the one type whose
+    /// job is bounding runaway resource use. FNV for the same reason
+    /// [`fnv1a`] is used elsewhere here: `DefaultHasher` is documented as
+    /// unstable across Rust releases.
+    ///
+    /// A collision would abort a run one escalation early. At 64 bits, across
+    /// the handful of distinct signatures a single run steers about, that is
+    /// far less likely than the memory blowup it replaces.
+    ///
     /// rather than steering again, so a model that ignores the nudge does not
     /// loop forever between nudges.
-    steered: Vec<(String, serde_json::Value)>,
+    steered: Vec<u64>,
 }
 
 impl ExecutionTracker {
@@ -1062,7 +1108,7 @@ impl ExecutionTracker {
     /// defaults to `Parallel`, so a model can emit the same call three times in
     /// one message and never take a second turn.
     pub fn record_tool_calls(&mut self, calls: &[(String, serde_json::Value)]) -> LoopVerdict {
-        let Some(threshold) = self.limits.max_identical_tool_calls else {
+        let Some(threshold) = self.limits.max_consecutive_identical_tool_calls else {
             return LoopVerdict::Continue;
         };
         if threshold == 0 {
@@ -1090,13 +1136,20 @@ impl ExecutionTracker {
             // assessed; the most severe verdict wins via the fold below.
             if self.consecutive >= threshold {
                 let repetitions = self.consecutive;
-                let this_call = if self.steered.contains(&sig) {
+                let sig_hash = signature_hash(name, args);
+                let this_call = if self.steered.contains(&sig_hash) {
                     LoopVerdict::Abort {
                         tool_name: name.clone(),
                         repetitions,
                     }
                 } else {
-                    self.steered.push(sig);
+                    // Bounded: a run that steers about many distinct
+                    // signatures is already pathological, and the oldest
+                    // entries are the least likely to recur.
+                    if self.steered.len() >= MAX_STEERED_SIGNATURES {
+                        self.steered.remove(0);
+                    }
+                    self.steered.push(sig_hash);
                     // Reset so the abort needs another full run of repeats,
                     // rather than firing on the very next call.
                     self.consecutive = 0;

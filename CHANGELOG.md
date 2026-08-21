@@ -287,7 +287,7 @@ adheres to [Semantic Versioning](https://semver.org/).
   eventually, but only after burning the full turn, token and wall-clock budget,
   so the run costs its maximum to discover it achieved nothing.
 
-  `max_identical_tool_calls: Option<usize>`, default `Some(3)`, `None` to
+  `max_consecutive_identical_tool_calls: Option<usize>`, default `Some(3)`, `None` to
   disable. Two escalations, mirroring the house pattern of steering before
   aborting:
 
@@ -310,7 +310,7 @@ adheres to [Semantic Versioning](https://semver.org/).
   The check runs **before** tool execution, so a stuck model does not also pay
   for the tool run it was never going to learn from.
 
-- **Breaking: `ExecutionLimits` gained `max_identical_tool_calls`.** The struct
+- **Breaking: `ExecutionLimits` gained `max_consecutive_identical_tool_calls`.** The struct
   is not `#[non_exhaustive]`, so downstream struct-literal construction needs
   the new field or `..Default::default()`. Behaviour changes only for
   pathological sessions, but it *is* on by default.
