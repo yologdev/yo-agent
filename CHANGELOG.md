@@ -8,6 +8,44 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Fixed: tools with no parameters were uncallable on Anthropic.** A tool
+  whose schema takes no arguments has no JSON to stream, and Anthropic still
+  emits an `input_json_delta` carrying `""`. `serde_json::from_str("")` fails
+  with "EOF while parsing a value", so the `__partial_json` sentinel survived
+  `content_block_stop` and the post-stream sweep failed the whole turn with
+  *"tool call(s) with unusable arguments, not executed"*. Every no-argument
+  tool — `get_status`, `list_files`, `read_log` — was affected.
+
+  An empty accumulator is an empty argument object, not malformed input. The
+  decision is now a small pure function, `resolve_tool_arguments`, so it has a
+  regression test; genuinely truncated JSON still fails, which is what the
+  sentinel exists for.
+
+  Found by `examples/release_smoke.rs` against a live provider, not by the
+  suite: `MockProvider` never streams SSE, so nothing exercised the tool-call
+  accumulator at all.
+
+- **`examples/release_smoke.rs` — a pre-release check against a live provider.**
+  All 618 unit tests use `MockProvider`, which accepts any message sequence
+  handed to it. That is structural, not an oversight, and it is where this
+  release's worst bug lived: loop detection injected a message between an
+  assistant's `tool_use` blocks and their `tool_result`s, which every real
+  provider rejects, and the suite stayed green.
+
+  Four checks, chosen for what a mock cannot verify: that loop detection
+  produces a transcript the provider accepts *and leaves the agent usable for a
+  second prompt*; that the model follows a truncation marker and retrieves
+  content head+tail truncation cannot contain; that cost comes from real usage;
+  and that a stable system prompt still produces cache reads.
+
+  ```
+  ANTHROPIC_API_KEY=... cargo run --example release_smoke
+  SMOKE_MODEL=deepseek DEEPSEEK_API_KEY=... cargo run --example release_smoke
+  ```
+
+  Verified 6/6 on Sonnet 5 and 5/5 on DeepSeek (its config is unpriced, so the
+  cost check reports n/a rather than failing). Exits non-zero on failure.
+
 - **Stash eviction protects caller-owned keys; the default backend no longer
   wedges** ([#144](https://github.com/yologdev/yoagent/issues/144)).
 

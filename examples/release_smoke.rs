@@ -210,6 +210,10 @@ fn model() -> ModelConfig {
     match std::env::var("SMOKE_MODEL").ok().as_deref() {
         Some("gpt") => ModelConfig::openai("gpt-5.5", "GPT-5.5"),
         Some("gemini") => ModelConfig::google("gemini-3-pro", "Gemini 3 Pro"),
+        // The OpenAI-compat path is a separate provider implementation from
+        // Anthropic's, with its own SSE parsing and tool-call accumulation —
+        // worth running before a release, not just one provider.
+        Some("deepseek") => ModelConfig::deepseek("deepseek-chat", "DeepSeek Chat"),
         _ => ModelConfig::claude_sonnet_5(),
     }
 }
@@ -236,6 +240,10 @@ async fn main() {
 
         let mut rx = agent.prompt("Check the status of service 'api'.").await;
         let (_text, err) = drain(&mut rx).await;
+        // Required: `prompt` spawns the loop, `finish` awaits it and syncs
+        // messages back. Without it `messages()` is empty and the transcript
+        // check below passes having inspected nothing.
+        agent.finish().await;
 
         report.record(
             "loop run completes without a provider error",
@@ -244,7 +252,13 @@ async fn main() {
                 .unwrap_or_else(|| "no provider error".to_string()),
         );
 
+        let n = agent.messages().len();
         match transcript_is_well_formed(agent.messages()) {
+            Ok(()) if n == 0 => report.record(
+                "transcript is well-formed after loop detection",
+                false,
+                "0 messages — nothing was inspected, so this check proves nothing",
+            ),
             Ok(()) => report.record(
                 "transcript is well-formed after loop detection",
                 true,
@@ -295,6 +309,7 @@ async fn main() {
             )
             .await;
         let (text, err) = drain(&mut rx).await;
+        agent.finish().await;
 
         let found = text.contains(NEEDLE);
         report.record(
@@ -320,17 +335,31 @@ async fn main() {
         let mut agent = Agent::from_config(cfg.clone()).with_system_prompt("Be concise.");
         let mut rx = agent.prompt("Name three primary colours.").await;
         let (_t, err) = drain(&mut rx).await;
+        agent.finish().await;
 
         let cost = agent.session_cost_usd();
-        let ok = err.is_none() && cost.map(|c| c > 0.0).unwrap_or(false);
-        report.record(
-            "session cost is computed from real usage",
-            ok,
-            match cost {
-                Some(c) => format!("session_cost_usd = ${c:.6}"),
-                None => "session_cost_usd = None — the preset reports unpriced".to_string(),
-            },
-        );
+        // Only the priced presets carry rates. A generic constructor like
+        // `ModelConfig::deepseek(id, name)` reports unpriced by design —
+        // all-zero rates mean unknown, not free — so failing here would be
+        // testing the harness's choice of model, not the library.
+        if cfg.cost.is_configured() {
+            let ok = err.is_none() && cost.map(|c| c > 0.0).unwrap_or(false);
+            report.record(
+                "session cost is computed from real usage",
+                ok,
+                match cost {
+                    Some(c) => format!("session_cost_usd = ${c:.6}"),
+                    None => "priced preset returned None — is_configured and \
+                             session_cost_usd disagree"
+                        .to_string(),
+                },
+            );
+        } else {
+            println!(
+                "  n/a  session cost — {} is an unpriced config, nothing to check",
+                cfg.name
+            );
+        }
     }
 
     // -----------------------------------------------------------------
