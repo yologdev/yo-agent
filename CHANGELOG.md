@@ -8,6 +8,65 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The `AgentEvent` wire freeze now catches a new variant**
+  ([#137](https://github.com/yologdev/yoagent/issues/137)). `EVENT_VARIANT_COUNT`'s
+  message claimed it failed when a variant was added without a serialization
+  sample. It could not fire for that: the integration test's match carries a
+  `_ => "unknown"` arm, forced by `#[non_exhaustive]`, so adding a variant
+  requires no edit to that file at all — the count and the sample list are both
+  hand-written and a new variant appears in neither. #136 added a 14th variant
+  and the suite stayed green, but only because the author added the sample by
+  hand and said so in the commit message; nothing would have complained
+  otherwise.
+
+  `wire_tag_freeze` in `src/types.rs` now declares the frozen tag **and** a
+  sample for every variant from one list, via a `wire_freeze!` macro that emits
+  both the wildcard-free match and the sample vector:
+
+  ```rust,ignore
+  AgentEvent::LoopDetected { .. } => "loopDetected"
+      = AgentEvent::loop_detected("bash", 3, false),
+  ```
+
+  Adding a variant is a non-exhaustive-match compile error, and the only way to
+  fix it is to add a line here — which supplies the sample in the same breath.
+  The specifier is `pat_param`, not `pat`, and that is load-bearing: `pat` would
+  accept an or-pattern, letting someone answer the compile error by widening an
+  unrelated arm (`TurnStart | NewVariant => "turnStart"`) and leave the new
+  variant with no coverage at all.
+
+  Each sample is checked for its frozen tag, a JSON round-trip, and camelCase
+  keys **recursively** — a snake_case key at `agentEnd.messages[0].usage`
+  reaches clients as surely as a top-level one. Samples are deliberately
+  populated rather than defaulted: a round-trip cannot notice a field that
+  `#[serde(skip)]` drops if the value it reconstructs is the default anyway.
+
+  Scope, stated plainly because this entry is about a guard that overclaimed:
+  this freezes tags, per-variant sample coverage, and round-tripping. It does
+  **not** freeze payload shape — a `#[serde(rename)]` on a field still passes.
+  Field names are pinned only where `tests/serialization_test.rs` asserts them
+  by literal.
+
+  Verified by mutation, since a guard that cannot fire is the bug being fixed:
+  adding a 15th variant is a compile error (the integration test stays green on
+  the same mutation), an or-pattern bypass is a macro parse error, a tag typo
+  fails, dropping `Usage`'s `totalTokens` rename fails on the nested key, and
+  `#[serde(skip)]` on `AgentEnd.stats` now fails the round-trip.
+
+  Two related fixes. `ToolResult` reaches the wire as `toolExecutionEnd.result`
+  but carried no `rename_all = "camelCase"`, unlike its siblings — a no-op for
+  today's single-word fields, and a silent snake_case leak for the first
+  multi-word one. And `ContextCompacted`'s doc block had been concatenated onto
+  `LoopDetected` since #136, leaving `ContextCompacted` undocumented.
+
+  In `tests/serialization_test.rs`: `test_context_compacted_wire_shape_is_frozen`
+  indexed the sample list positionally (`all_agent_events()[12]`), so inserting
+  a variant earlier broke it with a confusing `contextCompacted` tag mismatch
+  rather than an edit to this test; it now looks the variant up. The count guard
+  is kept under an accurate name and message — it never caught an *added*
+  variant, but it does catch a sample being *deleted*, which silently drops that
+  variant's payload coverage.
+
 - **Truncated tool output is retrievable instead of lost**
   ([#125](https://github.com/yologdev/yoagent/issues/125)). `truncate_tool_output`
   head-tail-truncates on append and the middle was gone irrecoverably — the full
