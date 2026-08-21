@@ -262,7 +262,17 @@ fn default_headroom_turns() -> Option<usize> {
 /// both lossless and directed; cutting the middle out of a source file on top
 /// of that would remove exactly the part the agent asked for.
 fn default_tool_output_overrides() -> HashMap<String, usize> {
-    HashMap::from([("read_file".to_string(), usize::MAX)])
+    HashMap::from([
+        ("read_file".to_string(), usize::MAX),
+        // The retrieval side of the truncation stash. Without this the marker
+        // is a lie: the model follows `shared_state get "tool-out-…"`, and the
+        // full text it asks for is re-truncated by the very cap that stashed
+        // it — head+tail of what it already had, plus a fresh stash entry
+        // against the cap on every attempt. A directed fetch of a known key is
+        // the model asking for exactly this content; capping it defeats the
+        // feature.
+        ("shared_state".to_string(), usize::MAX),
+    ])
 }
 
 impl ContextConfig {
@@ -926,6 +936,7 @@ fn keep_within_budget(messages: &[AgentMessage], budget: usize) -> Vec<AgentMess
 
 /// Execution limits for the agent loop
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ExecutionLimits {
     /// Maximum number of turns (LLM calls)
     pub max_turns: usize,
@@ -955,8 +966,47 @@ impl Default for ExecutionLimits {
     }
 }
 
+impl ExecutionLimits {
+    /// Cap on turns before the run stops.
+    pub fn with_max_turns(mut self, turns: usize) -> Self {
+        self.max_turns = turns;
+        self
+    }
+
+    /// Cap on total tokens across the run.
+    pub fn with_max_total_tokens(mut self, tokens: usize) -> Self {
+        self.max_total_tokens = tokens;
+        self
+    }
+
+    /// Wall-clock cap on the run.
+    pub fn with_max_duration(mut self, duration: std::time::Duration) -> Self {
+        self.max_duration = duration;
+        self
+    }
+
+    /// Consecutive identical tool calls tolerated before steering, then
+    /// stopping. `None` disables loop detection entirely.
+    pub fn with_max_identical_tool_calls(mut self, calls: Option<usize>) -> Self {
+        self.max_identical_tool_calls = calls;
+        self
+    }
+}
+
 /// What the loop should do about a repeated tool call.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Ordered by severity, and that ordering is load-bearing: one batch can
+/// contain several repeated signatures, and the loop must act on the worst.
+/// Declaration order is the severity order, so `Ord` is derived rather than
+/// hand-written — a new escalation slots in by being declared in the right
+/// place.
+///
+/// Deliberately **not** `#[non_exhaustive]`: this is control flow, so a new
+/// variant should be a compile error for matchers, not a silent wildcard
+/// fallthrough. Matches the `ToolDecision` precedent.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[must_use = "a loop verdict that is not acted on silently disables loop detection, \
+              while still advancing the tracker's state"]
 pub enum LoopVerdict {
     /// Nothing repetitive, or below the threshold.
     Continue,
@@ -1032,22 +1082,32 @@ impl ExecutionTracker {
                 }
             }
 
-            if self.consecutive >= threshold && verdict == LoopVerdict::Continue {
+            // No `verdict == Continue` guard: with `Parallel` execution a
+            // model emits multi-call batches routinely, and stopping at the
+            // first escalation both downgraded a later `Abort` to the earlier
+            // `Steer` and skipped recording that later signature in `steered`,
+            // giving it a free pass on the next turn too. Every call is
+            // assessed; the most severe verdict wins via the fold below.
+            if self.consecutive >= threshold {
                 let repetitions = self.consecutive;
-                if self.steered.contains(&sig) {
-                    verdict = LoopVerdict::Abort {
+                let this_call = if self.steered.contains(&sig) {
+                    LoopVerdict::Abort {
                         tool_name: name.clone(),
                         repetitions,
-                    };
+                    }
                 } else {
                     self.steered.push(sig);
                     // Reset so the abort needs another full run of repeats,
                     // rather than firing on the very next call.
                     self.consecutive = 0;
-                    verdict = LoopVerdict::Steer {
+                    LoopVerdict::Steer {
                         tool_name: name.clone(),
                         repetitions,
-                    };
+                    }
+                };
+                // Keep the worst verdict in the batch, not the first.
+                if this_call > verdict {
+                    verdict = this_call;
                 }
             }
         }

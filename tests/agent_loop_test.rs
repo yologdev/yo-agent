@@ -767,12 +767,12 @@ async fn test_execution_limit_counts_cached_tokens() {
         })),
         context_config: None,
         compaction_strategy: None,
-        execution_limits: Some(ExecutionLimits {
-            max_turns: 50,
-            max_total_tokens: 100,
-            max_duration: std::time::Duration::from_secs(60),
-            ..Default::default()
-        }),
+        execution_limits: Some(
+            ExecutionLimits::default()
+                .with_max_turns(50)
+                .with_max_total_tokens(100)
+                .with_max_duration(std::time::Duration::from_secs(60)),
+        ),
         cache_config: CacheConfig::default(),
         tool_output_sink: None,
         output_schema: None,
@@ -2289,12 +2289,12 @@ fn calibration_config(
             ..Default::default()
         }),
         compaction_strategy: Some(strategy),
-        execution_limits: Some(ExecutionLimits {
-            max_turns: 2,
-            max_total_tokens: 1_000_000,
-            max_duration: std::time::Duration::from_secs(60),
-            ..Default::default()
-        }),
+        execution_limits: Some(
+            ExecutionLimits::default()
+                .with_max_turns(2)
+                .with_max_total_tokens(1_000_000)
+                .with_max_duration(std::time::Duration::from_secs(60)),
+        ),
         cache_config: CacheConfig::default(),
         tool_output_sink: None,
         output_schema: None,
@@ -2742,7 +2742,7 @@ async fn cost_accrues_when_rates_are_configured_and_stays_none_otherwise() {
         system_prompt: String::new(),
     };
     let mut priced = yoagent::provider::ModelConfig::anthropic("mock", "Mock");
-    priced.cost = yoagent::provider::CostConfig::new(3.0, 15.0, 0.0, 0.0);
+    priced.cost = yoagent::provider::CostConfig::new(3.0, 15.0);
     let mut config = make_config(MockProvider::new(responses()));
     config.model_config = Some(priced);
     config.get_follow_up_messages = follow_up_once();
@@ -3344,6 +3344,85 @@ fn repeat_call(n: usize, args: serde_json::Value) -> Vec<MockResponse> {
         .collect()
 }
 
+/// Like [`run_with_limits`] but also returns the final transcript.
+///
+/// The events alone were what every loop-detection test asserted on, and that
+/// is exactly how a transcript-corrupting bug shipped: the nudge was injected
+/// between an assistant's `tool_use` blocks and their `tool_result`s, a shape
+/// every provider rejects, while the event stream looked perfect.
+async fn run_with_limits_msgs(
+    responses: Vec<MockResponse>,
+    limits: yoagent::context::ExecutionLimits,
+) -> (Vec<AgentEvent>, Vec<AgentMessage>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut context = AgentContext {
+        messages: vec![],
+        tools: vec![Box::new(SilentTool)],
+        system_prompt: String::new(),
+    };
+    let mut config = make_config(MockProvider::new(responses));
+    config.execution_limits = Some(limits);
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user("go"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+    (collect_events(rx), context.messages)
+}
+
+/// Every `tool_use` an assistant emits must be answered by `tool_result`s
+/// before any other message intervenes.
+///
+/// `src/context.rs` calls an unanswered call "an orphan every provider
+/// rejects", and `llm_compaction.rs` has a dedicated test for it on the
+/// compaction path. This is the same invariant on the loop path.
+fn assert_tool_calls_are_answered(messages: &[AgentMessage], context: &str) {
+    let mut pending: Vec<String> = Vec::new();
+    for (i, m) in messages.iter().enumerate() {
+        let AgentMessage::Llm(msg) = m else { continue };
+        match msg {
+            Message::Assistant { content, .. } => {
+                assert!(
+                    pending.is_empty(),
+                    "{context}: assistant at [{i}] while {pending:?} are still unanswered"
+                );
+                pending = content
+                    .iter()
+                    .filter_map(|c| match c {
+                        Content::ToolCall { id, .. } => Some(id.clone()),
+                        _ => None,
+                    })
+                    .collect();
+            }
+            Message::ToolResult { tool_call_id, .. } => {
+                let at = pending.iter().position(|p| p == tool_call_id);
+                assert!(
+                    at.is_some(),
+                    "{context}: tool_result at [{i}] for {tool_call_id:?} answers no open call"
+                );
+                pending.remove(at.unwrap());
+            }
+            Message::User { .. } => {
+                assert!(
+                    pending.is_empty(),
+                    "{context}: a user message at [{i}] lands between an assistant's tool_use \
+                     and its tool_result — {pending:?} still unanswered. Every provider rejects \
+                     this: Anthropic wants tool_result blocks first in the next message, OpenAI \
+                     wants tool messages for each tool_call_id"
+                );
+            }
+        }
+    }
+    assert!(
+        pending.is_empty(),
+        "{context}: run ended with {pending:?} unanswered — the agent is unusable for any \
+         later prompt, because the orphan stays in its history"
+    );
+}
+
 async fn run_with_limits(
     responses: Vec<MockResponse>,
     limits: yoagent::context::ExecutionLimits,
@@ -3367,6 +3446,107 @@ async fn run_with_limits(
     collect_events(rx)
 }
 
+/// The steer nudge must not orphan the tool calls it interrupts.
+///
+/// Regression: the nudge was pushed into the transcript the moment the verdict
+/// came back, which is *before* the tools run. The next provider request then
+/// carried `assistant(tool_use) -> user(text) -> user(tool_result)` and 400'd,
+/// with an error naming tool_result blocks rather than loop detection.
+#[tokio::test]
+async fn a_steer_nudge_does_not_orphan_the_tool_calls_it_interrupts() {
+    let (_events, messages) = run_with_limits_msgs(
+        repeat_call(6, serde_json::json!({"q": "same"})),
+        yoagent::context::ExecutionLimits::default().with_max_identical_tool_calls(Some(3)),
+    )
+    .await;
+    assert_tool_calls_are_answered(&messages, "steer");
+}
+
+/// An abort must answer the outstanding calls before it stops.
+///
+/// Worse than a failed turn: `Agent::prompt` keeps these messages, so an
+/// orphaned `tool_use` poisons the agent and *every later* prompt fails too.
+#[tokio::test]
+async fn an_abort_answers_its_outstanding_tool_calls_before_stopping() {
+    let (events, messages) = run_with_limits_msgs(
+        repeat_call(12, serde_json::json!({"q": "same"})),
+        yoagent::context::ExecutionLimits::default().with_max_identical_tool_calls(Some(3)),
+    )
+    .await;
+    assert!(
+        loop_events(&events).iter().any(|(_, _, a)| *a),
+        "this fixture must reach an abort or the test proves nothing"
+    );
+    assert_tool_calls_are_answered(&messages, "abort");
+}
+
+/// An abort stops the run. Halting *is* the feature — the other limits all
+/// fire eventually, but only after burning the whole budget.
+#[tokio::test]
+async fn an_abort_actually_halts_the_run() {
+    let (events, _messages) = run_with_limits_msgs(
+        repeat_call(40, serde_json::json!({"q": "same"})),
+        yoagent::context::ExecutionLimits::default().with_max_identical_tool_calls(Some(3)),
+    )
+    .await;
+    let turns = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::TurnStart))
+        .count();
+    assert!(
+        turns < 40,
+        "the run consumed all 40 turns despite aborting — it did not stop, got {turns}"
+    );
+}
+
+/// Loop detection is on by default. Nothing else pins the shipped default, so
+/// flipping it to `None` disabled the whole feature with a green suite.
+#[test]
+fn loop_detection_is_enabled_by_default() {
+    assert_eq!(
+        yoagent::context::ExecutionLimits::default().max_identical_tool_calls,
+        Some(3),
+        "loop detection must ship on; a change here turns it off for everyone who \
+         never sets the field"
+    );
+}
+
+/// The messages the model reads must not carry accidental whitespace.
+///
+/// Regression: the literals were wrapped across source lines without `\`
+/// continuations, baking ~40 spaces mid-sentence into the model's context.
+/// `rustfmt` does not touch literal contents and clippy has no lint for it.
+#[tokio::test]
+async fn loop_detection_messages_are_clean_prose() {
+    let (_events, messages) = run_with_limits_msgs(
+        repeat_call(12, serde_json::json!({"q": "same"})),
+        yoagent::context::ExecutionLimits::default().with_max_identical_tool_calls(Some(3)),
+    )
+    .await;
+    let injected: Vec<String> = messages
+        .iter()
+        .filter_map(|m| match m {
+            AgentMessage::Llm(Message::User { content, .. }) => {
+                content.iter().find_map(|c| match c {
+                    Content::Text { text } if text.starts_with('[') => Some(text.clone()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !injected.is_empty(),
+        "expected loop-detection messages in the transcript"
+    );
+    for text in &injected {
+        assert!(
+            !text.contains("  "),
+            "loop-detection text reaches the model with a run of spaces: {text:?}"
+        );
+    }
+}
+
 /// Three identical calls steer; continued repetition aborts. The steer comes
 /// first on purpose — a model repeating a call is often retrying something
 /// transient, and aborting immediately would regress that.
@@ -3374,10 +3554,7 @@ async fn run_with_limits(
 async fn repeated_identical_calls_steer_then_abort() {
     let events = run_with_limits(
         repeat_call(12, serde_json::json!({"q": "same"})),
-        yoagent::context::ExecutionLimits {
-            max_identical_tool_calls: Some(3),
-            ..Default::default()
-        },
+        yoagent::context::ExecutionLimits::default().with_max_identical_tool_calls(Some(3)),
     )
     .await;
 
@@ -3417,10 +3594,7 @@ async fn distinct_arguments_never_trip() {
 
     let events = run_with_limits(
         responses,
-        yoagent::context::ExecutionLimits {
-            max_identical_tool_calls: Some(3),
-            ..Default::default()
-        },
+        yoagent::context::ExecutionLimits::default().with_max_identical_tool_calls(Some(3)),
     )
     .await;
     assert!(
@@ -3448,10 +3622,7 @@ async fn an_interleaved_different_call_resets_the_counter() {
 
     let events = run_with_limits(
         responses,
-        yoagent::context::ExecutionLimits {
-            max_identical_tool_calls: Some(3),
-            ..Default::default()
-        },
+        yoagent::context::ExecutionLimits::default().with_max_identical_tool_calls(Some(3)),
     )
     .await;
     assert!(
@@ -3465,10 +3636,7 @@ async fn an_interleaved_different_call_resets_the_counter() {
 async fn detection_can_be_switched_off() {
     let events = run_with_limits(
         repeat_call(12, serde_json::json!({"q": "same"})),
-        yoagent::context::ExecutionLimits {
-            max_identical_tool_calls: None,
-            ..Default::default()
-        },
+        yoagent::context::ExecutionLimits::default().with_max_identical_tool_calls(None),
     )
     .await;
     assert!(

@@ -577,9 +577,14 @@ async fn run_loop(
                 _ => vec![],
             };
 
+            // A loop-detection nudge, held until the assistant's tool calls
+            // have been answered. Injecting it before the `tool_result`s would
+            // orphan them, which every provider rejects.
+            let mut loop_nudge: Option<AgentMessage> = None;
+
             // Repetition check runs *before* execution, so a stuck model does
             // not also pay for the tool run it was never going to learn from.
-            if has_tool_calls_early(&tool_calls) {
+            if !tool_calls.is_empty() {
                 if let Some(ref mut tracker) = tracker {
                     let sigs: Vec<(String, serde_json::Value)> = tool_calls
                         .iter()
@@ -592,7 +597,7 @@ async fn run_loop(
                             repetitions,
                         } => {
                             warn!(
-                                "loop detection: {tool_name} called {repetitions}x with                                  identical arguments; steering"
+                                "loop detection: {tool_name} called {repetitions}x with identical arguments; steering"
                             );
                             tx.send(AgentEvent::LoopDetected {
                                 tool_name: tool_name.clone(),
@@ -607,21 +612,17 @@ async fn run_loop(
                             let nudge = AgentMessage::Llm(Message::User {
                                 content: vec![Content::Text {
                                     text: format!(
-                                        "[You have called {tool_name} {repetitions} times with                                          identical arguments. The result will not change —                                          change approach, or say why the repetition is needed.]"
+                                        "[You have called {tool_name} {repetitions} times with identical arguments. The result will not change — change approach, or say why the repetition is needed.]"
                                     ),
                                 }],
                                 timestamp: now_ms(),
                             });
-                            tx.send(AgentEvent::MessageStart {
-                                message: nudge.clone(),
-                            })
-                            .ok();
-                            tx.send(AgentEvent::MessageEnd {
-                                message: nudge.clone(),
-                            })
-                            .ok();
-                            context.messages.push(nudge.clone());
-                            new_messages.push(nudge);
+                            // Deferred, not pushed here. The assistant's
+                            // `tool_use` blocks are still unanswered at this
+                            // point, and every provider rejects a transcript
+                            // where anything but their `tool_result`s comes
+                            // next. Appended after the results, below.
+                            loop_nudge = Some(nudge);
                         }
                         context::LoopVerdict::Abort {
                             tool_name,
@@ -637,11 +638,34 @@ async fn run_loop(
                             let stop = AgentMessage::Llm(Message::User {
                                 content: vec![Content::Text {
                                     text: format!(
-                                        "[Agent stopped: {tool_name} was called repeatedly with                                          identical arguments after being asked to change                                          approach.]"
+                                        "[Agent stopped: {tool_name} was called repeatedly with identical arguments after being asked to change approach.]"
                                     ),
                                 }],
                                 timestamp: now_ms(),
                             });
+                            // The tools are deliberately not run — a stuck
+                            // model should not also pay for a call it was
+                            // never going to learn from. But the assistant's
+                            // `tool_use` blocks must still be answered, or the
+                            // transcript is one every provider rejects and the
+                            // agent is unusable for any later prompt. Synthesize
+                            // one error result per outstanding call.
+                            for (id, name, _) in &tool_calls {
+                                let denied = Message::ToolResult {
+                                    tool_call_id: id.clone(),
+                                    tool_name: name.clone(),
+                                    content: vec![Content::Text {
+                                        text: "Not executed: the run was stopped for repeating \
+                                               this call with identical arguments."
+                                            .into(),
+                                    }],
+                                    is_error: true,
+                                    timestamp: now_ms(),
+                                };
+                                let am: AgentMessage = denied.into();
+                                context.messages.push(am.clone());
+                                new_messages.push(am);
+                            }
                             tx.send(AgentEvent::MessageStart {
                                 message: stop.clone(),
                             })
@@ -652,6 +676,22 @@ async fn run_loop(
                             .ok();
                             context.messages.push(stop.clone());
                             new_messages.push(stop);
+                            // Match every other abort path in this function:
+                            // callers tracking usage must not miss this turn,
+                            // and a UI pairing TurnStart/TurnEnd must not be
+                            // left with an unmatched TurnStart.
+                            if let Some(after_turn) = config.after_turn.as_ref() {
+                                let usage = match &message {
+                                    Message::Assistant { usage, .. } => usage.clone(),
+                                    _ => Usage::default(),
+                                };
+                                after_turn(&context.messages, &usage);
+                            }
+                            tx.send(AgentEvent::TurnEnd {
+                                message: agent_msg,
+                                tool_results: Vec::new(),
+                            })
+                            .ok();
                             return stats;
                         }
                     }
@@ -833,6 +873,21 @@ async fn run_loop(
                 after_turn(&context.messages, &usage);
             }
 
+            // Now that every `tool_result` is appended, the transcript is
+            // well-formed again and the nudge can land.
+            if let Some(nudge) = loop_nudge.take() {
+                tx.send(AgentEvent::MessageStart {
+                    message: nudge.clone(),
+                })
+                .ok();
+                tx.send(AgentEvent::MessageEnd {
+                    message: nudge.clone(),
+                })
+                .ok();
+                context.messages.push(nudge.clone());
+                new_messages.push(nudge);
+            }
+
             tx.send(AgentEvent::TurnEnd {
                 message: agent_msg,
                 tool_results,
@@ -875,11 +930,6 @@ async fn run_loop(
     }
 
     stats
-}
-
-/// Whether this turn produced any tool call at all.
-fn has_tool_calls_early(calls: &[(String, String, serde_json::Value)]) -> bool {
-    !calls.is_empty()
 }
 
 /// Stream an assistant response from the LLM.

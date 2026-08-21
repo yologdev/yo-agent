@@ -8,7 +8,88 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **The `AgentEvent` wire freeze now catches a new variant**
+- **Release-gate fixes found by a whole-release review** (pre-0.18.0). Eight
+  commits were each reviewed alone; reviewing them together found defects in
+  the interactions no single-PR review could see.
+
+  **Loop detection corrupted the transcript.** The steering nudge and the abort
+  message were pushed the moment the verdict came back — which is *before* the
+  tools run — so the next request carried `assistant(tool_use)` →
+  `user(text)` → `user(tool_result)`. Every provider rejects that shape, and
+  the resulting 400 names tool_result blocks rather than loop detection. The
+  abort was worse: it returned with the calls unanswered, and since
+  `Agent::prompt` keeps those messages, a loop-aborted agent was poisoned —
+  every *later* prompt failed too. The nudge is now deferred until the results
+  are appended, and the abort synthesizes an `is_error` result per outstanding
+  call before stopping. It still does not run the tools.
+
+  This invariant is treated as sacred elsewhere in the crate — `context.rs`
+  calls an unanswered call "an orphan every provider rejects" and
+  `llm_compaction.rs` has a dedicated test for it. Loop detection was the one
+  path that broke it, and no test caught it because `MockProvider` ignores
+  message shape and every loop test asserted only on the event stream. There is
+  now a transcript-invariant assertion, and reverting the fix fails it.
+
+  **Stash retrieval was re-truncated by the cap it exists to escape.** The
+  marker says `shared_state get "tool-out-…"`; the model calls it; the full
+  text came back through the same append-path cap that stashed it. 2000 lines
+  in, 200 out, plus a fresh stash entry against the cap on every attempt. The
+  headline feature of this release did not work through the path the model
+  actually takes — only from Rust, which is what the tests asserted.
+  `shared_state` now joins `read_file` in `default_tool_output_overrides`.
+
+  **`is_configured()` ignored `context_tier`,** so a config priced only above
+  its threshold reported "pricing unknown" and billed every request at $0.
+
+  **GASP recorded a loop abort as `"completed"`.** `LoopDetected` fell into a
+  `_ => {}` wildcard, so the outcome stayed whatever the last stop reason
+  mapped to. The CHANGELOG claimed the opposite. Now `loop_aborted:{tool}`.
+
+  **`Agent::with_shared_state` shipped undocumented** — its doc block ran into
+  `take_tools`'s with no separator, landing the whole thing on a private
+  function. The release's headline API would have rendered blank on docs.rs.
+
+  **An `Abort` later in a batch was downgraded to an earlier `Steer`,** and its
+  signature never reached `steered`, giving it a free pass the next turn too.
+  `LoopVerdict` now derives `Ord` — declaration order is severity order — and
+  the loop keeps the worst verdict rather than the first. It is also
+  `#[must_use]`: an ignored verdict silently disabled detection while still
+  advancing the tracker.
+
+  **The loop-detection text reaching the model carried ~40-space runs**, from
+  literals wrapped across source lines without `\` continuations. `rustfmt`
+  does not reformat literal contents and clippy has no lint for it.
+
+  **The price audit could pass having compared zero fields.** Its guard derived
+  the expected count from the same list it was checking, so an empty
+  `presets()` reported "0 compared, 0 drifted" and passed. It now pins a floor
+  against the number of priced constructors.
+
+  **Breaking: `CostConfig::new` and `ContextTier::new` take two rates, not
+  four.** Cache rates move to `with_cache_read`/`with_cache_write`. Four
+  same-typed `f64`s in a row is a transposition hazard, and no vendor publishes
+  them in one order — Anthropic lists input/cache-write/cache-read/output,
+  OpenAI lists input/cached-input/output. A transposed config still returns
+  `true` from `is_configured`, so every downstream guard passes; that is how
+  `claude_sonnet_5` billed 50% high for 18 releases. This repo had already made
+  the mistake: `examples/llm_compaction_live.rs` silently dropped cache-write
+  pricing in a cost-measurement harness. `ContextTier::cache_write_per_million`
+  was also unreachable — `new` hardcoded it to 0.0 with no setter on a
+  `#[non_exhaustive]` struct.
+
+  **Breaking: `CostConfig::context_tier: Option<ContextTier>` is now
+  `context_tiers: Vec<ContextTier>`,** kept sorted by threshold. Vendors
+  publish multi-step schedules and models.dev already models this as an array —
+  which this release's own audit reads at `/tiers/0/`. Leaving it as one tier
+  would have cost a second breaking release, and would have broken the serde
+  key as well as the field type, invalidating persisted configs.
+
+  **Breaking: `ExecutionLimits` is `#[non_exhaustive]`** with `with_*` builders,
+  closing a break this crate has now taken twice. Also note `ExecutionTracker`
+  lost struct-literal construction in this release (it gained three private
+  fields) — an undeclared fourth breaking change, recorded here.
+
+- **The `AgentEvent` wire freeze now forces a sample for every variant**
   ([#137](https://github.com/yologdev/yoagent/issues/137)). `EVENT_VARIANT_COUNT`'s
   message claimed it failed when a variant was added without a serialization
   sample. It could not fire for that: the integration test's match carries a
@@ -54,7 +135,7 @@ adheres to [Semantic Versioning](https://semver.org/).
   `#[serde(skip)]` on `AgentEnd.stats` now fails the round-trip.
 
   Two related fixes. `ToolResult` reaches the wire as `toolExecutionEnd.result`
-  but carried no `rename_all = "camelCase"`, unlike its siblings — a no-op for
+  but carried no `rename_all = "camelCase"` — a no-op for
   today's single-word fields, and a silent snake_case leak for the first
   multi-word one. And `ContextCompacted`'s doc block had been concatenated onto
   `LoopDetected` since #136, leaving `ContextCompacted` undocumented.

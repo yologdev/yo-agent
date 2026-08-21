@@ -475,6 +475,17 @@ async fn record_event(
             })
             .await?;
         }
+        AgentEvent::LoopDetected {
+            aborted: true,
+            tool_name,
+            ..
+        } if tracking.started => {
+            // Without this the run's outcome stays whatever the last stop
+            // reason mapped to — `ToolUse` -> "completed" — so the durable log
+            // recorded a budget-exhausting loop abort as a clean success, the
+            // exact opposite of what this event exists to make auditable.
+            tracking.outcome = format!("loop_aborted:{tool_name}");
+        }
         AgentEvent::InputRejected { .. } if tracking.started => {
             // A policy rejection is not a crash — label it distinctly in the
             // durable log.
