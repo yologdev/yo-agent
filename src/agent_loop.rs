@@ -123,6 +123,24 @@ fn default_convert_to_llm(messages: &[AgentMessage]) -> Vec<Message> {
 }
 
 /// Start an agent loop with new prompt messages.
+/// Prefix of the message the loop appends when it stops a run itself.
+///
+/// A run stopped by a limit or by loop detection ends with a `Message::User`
+/// carrying this prefix. The last *assistant* message still reports whatever
+/// stop reason it had — `ToolUse` for a loop abort — so a consumer inspecting
+/// only assistant messages cannot tell a stopped run from a finished one.
+/// `SubAgentTool` uses this to avoid reporting an aborted delegation as a
+/// bland success.
+pub const AGENT_STOPPED_PREFIX: &str = "[Agent stopped:";
+
+/// The stop marker for a run halted by loop detection specifically.
+///
+/// Distinct from the limit stops because the two mean opposite things to a
+/// caller. Hitting `max_turns` is a bound: the work was cut short but what it
+/// produced is real, and `SubAgentTool` returns it. A loop abort is a failure:
+/// the model was emitting the same call forever and there is nothing to keep.
+pub const LOOP_ABORT_PREFIX: &str = "[Agent stopped: repeated tool call —";
+
 pub async fn agent_loop(
     prompts: Vec<AgentMessage>,
     context: &mut AgentContext,
@@ -351,7 +369,7 @@ async fn run_loop(
                     warn!("Execution limit reached: {}", reason);
                     let limit_msg = AgentMessage::Llm(Message::User {
                         content: vec![Content::Text {
-                            text: format!("[Agent stopped: {}]", reason),
+                            text: format!("{AGENT_STOPPED_PREFIX} {}]", reason),
                         }],
                         timestamp: now_ms(),
                     });
@@ -638,7 +656,8 @@ async fn run_loop(
                             let stop = AgentMessage::Llm(Message::User {
                                 content: vec![Content::Text {
                                     text: format!(
-                                        "[Agent stopped: {tool_name} was called repeatedly with identical arguments after being asked to change approach.]"
+                                        "{LOOP_ABORT_PREFIX} {tool_name} was called repeatedly with identical \
+                                         arguments after being asked to change approach.]"
                                     ),
                                 }],
                                 timestamp: now_ms(),
@@ -831,7 +850,14 @@ async fn run_loop(
                                 // artifacts to make room for debris.
                                 if !all_stored {
                                     for key in &written {
-                                        sink.remove(key).await;
+                                        if !sink.remove(key).await {
+                                            // `remove` already swallowed any backend error into
+                                            // `false` + a warn. Surfacing it here too matters
+                                            // because a failed rollback leaves a stashed value
+                                            // no marker names, consuming cap quota for the rest
+                                            // of the run.
+                                            warn!("shared state: rollback could not remove {key}");
+                                        }
                                     }
                                 }
                                 if all_stored {

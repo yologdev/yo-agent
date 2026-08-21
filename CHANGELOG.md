@@ -8,6 +8,71 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Stash eviction protects caller-owned keys; the default backend no longer
+  wedges** ([#144](https://github.com/yologdev/yoagent/issues/144)).
+
+  `MemoryBackend` — what `SharedState::new()` returns, and the documented path
+  for `Agent::with_shared_state` — rejected rather than evicted, and nothing
+  ever removed `tool-out-*`. At ~300KB per stashed build or grep output a 10MB
+  cap holds ~33 results, after which **every** write failed for the rest of the
+  run, including the model's own `shared_state set`, with the bytes never
+  reclaimed. It now evicts stashed output, oldest first.
+
+  `FileBackend` had the opposite bug: it evicted whatever was oldest, including
+  keys a caller had set through the backend's own API. A parent that stored a
+  `plan` got `None` back later with no error path anywhere.
+
+  Both now draw the same line. **Stash entries are evictable; caller keys are
+  not.** Losing a stash entry degrades a marker to an ordinary "key not found"
+  the agent can act on, and the head+tail is still in the transcript — nothing
+  regenerates a caller's artifact. When only caller keys remain, the write
+  reports capacity instead of destroying data. Every eviction now logs; a
+  successful one was previously silent, which mattered because the
+  verify-after-store loop only checks the keys written for the current result
+  and cannot see that this write evicted an earlier one.
+
+  The line is drawn scope-aware: a sub-agent's stash lands as
+  `scope\u{1f}tool-out-…`, so a whole-key prefix test would read it as
+  caller-owned and never evict it — re-creating the wedge for every delegating
+  run and starving the parent's keys instead.
+
+- **A looping sub-agent no longer reports success to its parent**
+  ([#146](https://github.com/yologdev/yoagent/issues/146)). `extract_error`
+  matched only `StopReason::Error`, but a loop abort leaves `ToolUse` on the
+  last assistant message, and `extract_final_text` scans assistant messages
+  only — so it never saw the trailing `[Agent stopped: …]` and fell through to
+  `"(sub-agent produced no text output)"`. The parent received
+  `is_error: false`. A sub-agent that burned its entire budget looping was
+  indistinguishable from one that had nothing to say.
+
+  The marker prefix is now a public constant, `agent_loop::AGENT_STOPPED_PREFIX`,
+  so recognising a self-stopped run does not mean matching a magic string.
+
+  Also: `FileBackend::set` returned `Err` for a value already written to disk —
+  `evict_to_fit` propagates `read_dir`/`next_entry` errors, both of which run
+  *after* the write, and the loop's error arm never records the key so rollback
+  could not reach it. It now unlinks before propagating. And a failed rollback
+  is logged rather than discarded.
+
+- **Loop detection: accurate name, bounded state, and the coverage it lacked**
+  ([#145](https://github.com/yologdev/yoagent/issues/145)).
+  `max_identical_tool_calls` is now `max_consecutive_identical_tool_calls`. The
+  implementation caps consecutive-run length only, so an alternating
+  `[a, b, a, b, …]` loop is never detected; the doc was honest about that, the
+  name was not, and a public field is far cheaper to rename before release.
+
+  Deliberately **not** widened to a windowed count — that would regress
+  `an_interleaved_different_call_resets_the_counter`, which pins a considered
+  trade-off: an agent working through a list calls one tool repeatedly and
+  legitimately, and a detector firing on interleaved repeats would be worse than
+  none. The limitation is documented on the field and pinned by a test, so it is
+  a decision rather than a surprise.
+
+  `steered` held a full clone of every steered signature's arguments — for a
+  file-write tool, the entire file body — unbounded, inside the one type whose
+  job is bounding runaway resource use. Now a capped list of FNV hashes, sharing
+  the one `fnv1a` that `tool_output_key` had inlined.
+
 - **Release-gate fixes found by a whole-release review** (pre-0.18.0). Eight
   commits were each reviewed alone; reviewing them together found defects in
   the interactions no single-PR review could see.
