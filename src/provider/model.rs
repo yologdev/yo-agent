@@ -84,9 +84,16 @@ pub struct CostConfig {
     #[serde(default)]
     pub cache_write_per_million: f64,
     /// Rates that replace the above once a request's prompt exceeds a
-    /// threshold. `None` means one flat rate at every size.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_tier: Option<ContextTier>,
+    /// threshold, ascending by threshold. Empty means one flat rate at every
+    /// size.
+    ///
+    /// A `Vec` rather than a single tier because vendors publish multi-step
+    /// schedules and models.dev already represents this as an array — making
+    /// it one tier would buy a second breaking release the first time a
+    /// three-tier model appears, and it would break the serde key as well as
+    /// the field type, invalidating every persisted config.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_tiers: Vec<ContextTier>,
 }
 
 /// Higher rates charged above a context threshold.
@@ -113,47 +120,100 @@ pub struct ContextTier {
 }
 
 impl ContextTier {
-    /// A tier with no separate cache-write rate, which is the common shape.
-    pub fn new(
-        above_prompt_tokens: u64,
-        input_per_million: f64,
-        output_per_million: f64,
-        cache_read_per_million: f64,
-    ) -> Self {
+    /// A tier's threshold and the two rates every tier has.
+    ///
+    /// Cache rates are added with [`with_cache_read`](Self::with_cache_read)
+    /// and [`with_cache_write`](Self::with_cache_write), mirroring
+    /// [`CostConfig::new`] and for the same reason. The previous shape took
+    /// cache-read positionally and silently zeroed cache-write, which would
+    /// have dropped an Anthropic-style tier's $12.50/M cache writes to $0
+    /// above the threshold.
+    ///
+    /// `above_prompt_tokens` is exclusive: a prompt exactly at the threshold
+    /// stays on the band below, matching how vendors publish `>272K`.
+    pub fn new(above_prompt_tokens: u64, input_per_million: f64, output_per_million: f64) -> Self {
+        debug_assert!(
+            above_prompt_tokens > 0,
+            "a tier at 0 applies to every request, making the base rates dead code"
+        );
         Self {
             above_prompt_tokens,
             input_per_million,
             output_per_million,
-            cache_read_per_million,
+            cache_read_per_million: 0.0,
             cache_write_per_million: 0.0,
         }
+    }
+
+    /// Rate for reading a cached prompt prefix above this threshold.
+    pub fn with_cache_read(mut self, per_million: f64) -> Self {
+        self.cache_read_per_million = per_million;
+        self
+    }
+
+    /// Rate for writing a prompt prefix into the cache above this threshold.
+    pub fn with_cache_write(mut self, per_million: f64) -> Self {
+        self.cache_write_per_million = per_million;
+        self
+    }
+
+    /// Whether this tier sets any rate. Mirrors [`CostConfig::is_configured`]:
+    /// all-zero means unknown, not free.
+    pub fn is_configured(&self) -> bool {
+        self.input_per_million != 0.0
+            || self.output_per_million != 0.0
+            || self.cache_read_per_million != 0.0
+            || self.cache_write_per_million != 0.0
     }
 }
 
 impl CostConfig {
-    /// Flat rates, one price per token category at every request size.
+    /// The two rates every priced model has.
+    ///
+    /// Cache rates are set with [`with_cache_read`](Self::with_cache_read) and
+    /// [`with_cache_write`](Self::with_cache_write) rather than as positional
+    /// arguments. Four same-typed `f64`s in a row is a transposition waiting to
+    /// happen, and no vendor publishes them in one order: Anthropic lists
+    /// input / cache write / cache read / output, OpenAI lists input / cached
+    /// input / output. Transcribing top-to-bottom from either page produced a
+    /// wrong-but-compiling config, and `is_configured` returns `true` for a
+    /// transposed one, so every downstream guard passes. That is exactly how
+    /// `claude_sonnet_5` billed 50% high for 18 releases. Two arguments still
+    /// transpose, but output is always dearer than input, so the mistake is
+    /// visible.
     ///
     /// `CostConfig` is `#[non_exhaustive]`, so downstream crates build it here
-    /// rather than with a struct literal. Add a tier with
-    /// [`with_context_tier`](Self::with_context_tier).
-    pub fn new(
-        input_per_million: f64,
-        output_per_million: f64,
-        cache_read_per_million: f64,
-        cache_write_per_million: f64,
-    ) -> Self {
+    /// rather than with a struct literal.
+    pub fn new(input_per_million: f64, output_per_million: f64) -> Self {
         Self {
             input_per_million,
             output_per_million,
-            cache_read_per_million,
-            cache_write_per_million,
-            context_tier: None,
+            cache_read_per_million: 0.0,
+            cache_write_per_million: 0.0,
+            context_tiers: Vec::new(),
         }
     }
 
+    /// Rate for reading a cached prompt prefix.
+    pub fn with_cache_read(mut self, per_million: f64) -> Self {
+        self.cache_read_per_million = per_million;
+        self
+    }
+
+    /// Rate for writing a prompt prefix into the cache.
+    pub fn with_cache_write(mut self, per_million: f64) -> Self {
+        self.cache_write_per_million = per_million;
+        self
+    }
+
     /// Charge higher rates above a prompt-size threshold.
+    ///
+    /// Repeatable. Tiers are kept sorted by threshold so `cost_usd` can take
+    /// the last one the prompt clears, and so declaration order cannot change
+    /// what a config costs.
     pub fn with_context_tier(mut self, tier: ContextTier) -> Self {
-        self.context_tier = Some(tier);
+        self.context_tiers.push(tier);
+        self.context_tiers.sort_by_key(|t| t.above_prompt_tokens);
         self
     }
 
@@ -164,6 +224,10 @@ impl CostConfig {
             || self.output_per_million != 0.0
             || self.cache_read_per_million != 0.0
             || self.cache_write_per_million != 0.0
+            // A config priced only above its threshold is still priced.
+            // Without this, "free below 272K, paid above" reports as unknown
+            // and bills every request at $0.
+            || self.context_tiers.iter().any(|t| t.is_configured())
     }
 
     /// Dollar cost of a usage record at these per-million-token rates.
@@ -174,14 +238,20 @@ impl CostConfig {
         // Prompt size, which is what a context tier is priced against — every
         // caller passes one request's usage, so no extra parameter is needed.
         let prompt = usage.input + usage.cache_read + usage.cache_write;
-        let (input, output, cache_read, cache_write) = match &self.context_tier {
-            Some(t) if prompt > t.above_prompt_tokens => (
+        // The last tier the prompt clears. `with_context_tier` keeps the vec
+        // sorted, so this is the most expensive applicable band.
+        let tier = self
+            .context_tiers
+            .iter()
+            .rfind(|t| prompt > t.above_prompt_tokens);
+        let (input, output, cache_read, cache_write) = match tier {
+            Some(t) => (
                 t.input_per_million,
                 t.output_per_million,
                 t.cache_read_per_million,
                 t.cache_write_per_million,
             ),
-            _ => (
+            None => (
                 self.input_per_million,
                 self.output_per_million,
                 self.cache_read_per_million,
@@ -203,7 +273,7 @@ impl Default for CostConfig {
             output_per_million: 0.0,
             cache_read_per_million: 0.0,
             cache_write_per_million: 0.0,
-            context_tier: None,
+            context_tiers: Vec::new(),
         }
     }
 }
@@ -753,7 +823,7 @@ impl ModelConfig {
                 output_per_million: 30.0,
                 cache_read_per_million: 0.5,
                 cache_write_per_million: 0.0,
-                context_tier: None,
+                context_tiers: Vec::new(),
             },
             ..Self::openai("gpt-5.5", "GPT-5.5")
         }

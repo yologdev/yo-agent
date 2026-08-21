@@ -123,7 +123,7 @@ fn priced(id: &str) -> ModelConfig {
 /// DeepSeek has no write category — populating its cache is free.
 fn deepseek_priced(id: &str, input: f64, output: f64, cache_read: f64) -> ModelConfig {
     let mut config = ModelConfig::deepseek(id, id);
-    config.cost = CostConfig::new(input, output, cache_read, 0.0);
+    config.cost = CostConfig::new(input, output).with_cache_read(cache_read);
     config
 }
 

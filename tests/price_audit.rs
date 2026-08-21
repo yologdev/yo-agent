@@ -422,6 +422,20 @@ async fn hardcoded_prices_have_not_drifted() {
     // The load-bearing assertion. Without it, every schema change at or above
     // the `cost` level yields drift.is_empty() == true and a green pass having
     // verified nothing.
+    // `expected` below is derived from `all`, so it cannot notice `all` itself
+    // shrinking — an empty `presets()` produced "0 compared, 0 drifted" and a
+    // green pass. Pin the floor against something independent: the number of
+    // priced constructors in `src/provider/model.rs`. Raise it when you add
+    // one, which is the moment you should also be adding it here.
+    const PRICED_PRESETS: usize = 7;
+    assert!(
+        all.len() >= PRICED_PRESETS,
+        "\n\nThe audit is checking {} presets but the crate ships at least {PRICED_PRESETS}. \
+         A priced preset is unaudited — its rates can drift for as many releases as it takes \
+         someone to notice, which for `claude_sonnet_5` was 18.\n",
+        all.len()
+    );
+
     let expected = all.len() * 4;
     assert_eq!(
         compared + absent,
@@ -460,13 +474,13 @@ fn is_configured_means_any_rate_set() {
         "all-zero rates mean pricing is unknown, not that the model is free"
     );
 
-    let no_cache_write = CostConfig::new(5.0, 30.0, 0.5, 0.0);
+    let no_cache_write = CostConfig::new(5.0, 30.0).with_cache_read(0.5);
     assert!(
         no_cache_write.is_configured(),
         "a provider that charges nothing for cache writes is priced, not unknown"
     );
 
-    let only_one_field = CostConfig::new(0.0, 0.0, 0.1, 0.0);
+    let only_one_field = CostConfig::new(0.0, 0.0).with_cache_read(0.1);
     assert!(
         only_one_field.is_configured(),
         "any single rate is enough to count as priced"
@@ -492,8 +506,9 @@ fn cost_usd_applies_the_context_tier_by_prompt_size() {
     use yoagent::provider::{ContextTier, CostConfig};
     use yoagent::types::Usage;
 
-    let cfg = CostConfig::new(5.0, 30.0, 0.5, 0.0)
-        .with_context_tier(ContextTier::new(272_000, 10.0, 45.0, 1.0));
+    let cfg = CostConfig::new(5.0, 30.0)
+        .with_cache_read(0.5)
+        .with_context_tier(ContextTier::new(272_000, 10.0, 45.0).with_cache_read(1.0));
 
     let usage = |input: u64, output: u64| Usage {
         input,

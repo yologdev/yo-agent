@@ -342,16 +342,6 @@ impl Agent {
         self
     }
 
-    /// Attach a shared key-value store.
-    ///
-    /// Two things follow. The `shared_state` tool is registered, so the model
-    /// can read and write the store — `SharedState` was always described as a
-    /// parent↔sub-agent medium, but until now only `SubAgentTool` wired it, so
-    /// a parent could populate it and never read it back.
-    ///
-    /// And truncated tool output is stashed here: head-tail truncation
-    /// currently discards the middle irrecoverably, and with a store attached
-    /// the marker names a key the model can fetch instead.
     /// Take the tool list for a run, injecting `shared_state` when a store is
     /// configured.
     ///
@@ -370,6 +360,16 @@ impl Agent {
         tools
     }
 
+    /// Attach a shared key-value store.
+    ///
+    /// Two things follow. The `shared_state` tool is registered, so the model
+    /// can read and write the store — `SharedState` was always described as a
+    /// parent↔sub-agent medium, but until now only `SubAgentTool` wired it, so
+    /// a parent could populate it and never read it back.
+    ///
+    /// And truncated tool output is stashed here: head-tail truncation
+    /// currently discards the middle irrecoverably, and with a store attached
+    /// the marker names a key the model can fetch instead.
     pub fn with_shared_state(mut self, state: crate::shared_state::SharedState) -> Self {
         // Only the field. The tool is injected where the tool list is
         // assembled, mirroring `SubAgentTool` — pushing here would double a
