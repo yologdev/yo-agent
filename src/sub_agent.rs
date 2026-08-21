@@ -543,6 +543,24 @@ impl AgentTool for SubAgentTool {
 
 /// Check if the last assistant message was an error, return the error message.
 fn extract_error(messages: &[AgentMessage]) -> Option<String> {
+    // A loop abort ends with a marker user message while the last *assistant*
+    // message still carries `ToolUse`, so the scan below returned `None` and
+    // the delegation reported as a clean success with "(sub-agent produced no
+    // text output)". A sub-agent that burned its entire budget looping looked
+    // like one that simply had nothing to say.
+    //
+    // Only loop aborts. Hitting `max_turns` is a bound, not a failure — the
+    // work was cut short but what it produced is real, so it is returned, with
+    // the stop notice appended by `extract_final_text` so the parent's model
+    // knows the answer is partial.
+    if let Some(AgentMessage::Llm(Message::User { content, .. })) = messages.last() {
+        if let Some(Content::Text { text }) = content.first() {
+            if text.starts_with(crate::agent_loop::LOOP_ABORT_PREFIX) {
+                return Some(text.clone());
+            }
+        }
+    }
+
     for msg in messages.iter().rev() {
         if let AgentMessage::Llm(Message::Assistant {
             stop_reason,
@@ -564,7 +582,20 @@ fn extract_error(messages: &[AgentMessage]) -> Option<String> {
 
 /// Extract the final assistant text from agent messages.
 /// Collects text from the last assistant message, or returns a fallback.
+/// The loop's own stop marker, if the run ended on one.
+fn stopped_notice(messages: &[AgentMessage]) -> Option<String> {
+    if let Some(AgentMessage::Llm(Message::User { content, .. })) = messages.last() {
+        if let Some(Content::Text { text }) = content.first() {
+            if text.starts_with(crate::agent_loop::AGENT_STOPPED_PREFIX) {
+                return Some(text.clone());
+            }
+        }
+    }
+    None
+}
+
 fn extract_final_text(messages: &[AgentMessage]) -> String {
+    let mut out = None;
     for msg in messages.iter().rev() {
         if let AgentMessage::Llm(Message::Assistant { content, .. }) = msg {
             let texts: Vec<&str> = content
@@ -575,9 +606,20 @@ fn extract_final_text(messages: &[AgentMessage]) -> String {
                 })
                 .collect();
             if !texts.is_empty() {
-                return texts.join("\n");
+                out = Some(texts.join("\n"));
+                break;
             }
         }
     }
-    "(sub-agent produced no text output)".to_string()
+
+    // Tell the parent the answer is partial, whether or not there was text to
+    // return. A turn-limited run whose last assistant message held only tool
+    // calls has no text at all, and reporting that as "produced no text output"
+    // reads as an empty success rather than a run cut short.
+    match (out, stopped_notice(messages)) {
+        (Some(text), Some(stop)) => format!("{text}\n\n{stop}"),
+        (Some(text), None) => text,
+        (None, Some(stop)) => stop,
+        (None, None) => "(sub-agent produced no text output)".to_string(),
+    }
 }

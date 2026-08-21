@@ -468,7 +468,7 @@ fn a_marker_inside_the_tools_own_output_is_left_alone() {
 }
 
 #[tokio::test]
-async fn file_backend_evicts_oldest_to_stay_under_its_cap() {
+async fn file_backend_evicts_the_oldest_stash_entry_to_stay_under_its_cap() {
     let dir = tempfile::tempdir().unwrap();
     let state = SharedState::with_backend(yoagent::shared_state::FileBackend::with_max_bytes(
         dir.path(),
@@ -480,7 +480,10 @@ async fn file_backend_evicts_oldest_to_stay_under_its_cap() {
     // tiebreak agrees with mtime, so the test would pass whether or not the
     // age ordering worked at all.
     for name in ["z", "y", "x", "w", "v", "a"] {
-        state.set(name, "q".repeat(100)).await.unwrap();
+        state
+            .set(&format!("tool-out-{name}"), "q".repeat(100))
+            .await
+            .unwrap();
     }
 
     let keys = state.keys().await;
@@ -490,12 +493,115 @@ async fn file_backend_evicts_oldest_to_stay_under_its_cap() {
         "cap must bound the directory without emptying it, got {keys:?}"
     );
     assert!(
-        keys.contains(&"a".to_string()),
+        keys.contains(&"tool-out-a".to_string()),
         "the newest write is 'a', which sorts first — it must survive anyway: {keys:?}"
     );
     assert!(
-        !keys.contains(&"z".to_string()),
+        !keys.contains(&"tool-out-z".to_string()),
         "the oldest write is 'z', which sorts last — it must go first anyway: {keys:?}"
+    );
+}
+
+/// Caller-owned keys are never evicted; only stashed tool output is.
+///
+/// The old policy evicted whatever was oldest, so a parent that stored a plan
+/// through this very backend got `None` back later with no error path anywhere.
+/// Stash entries are recyclable — losing one degrades a marker to an ordinary
+/// "not found" the agent can act on — and a caller's key is not.
+#[tokio::test]
+async fn eviction_never_takes_a_caller_owned_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = SharedState::with_backend(yoagent::shared_state::FileBackend::with_max_bytes(
+        dir.path(),
+        300,
+    ));
+
+    state.set("plan", "q".repeat(100)).await.unwrap();
+    for i in 0..5 {
+        state
+            .set(&format!("tool-out-tc{i}-aaaa-b0"), "q".repeat(100))
+            .await
+            .unwrap();
+    }
+
+    let keys = state.keys().await;
+    assert!(
+        keys.contains(&"plan".to_string()),
+        "the caller's own key must survive five stash writes that blew the cap: {keys:?}"
+    );
+    assert_eq!(
+        state.get("plan").await.as_deref(),
+        Some("q".repeat(100).as_str()),
+        "and it must still hold its value, not merely exist"
+    );
+}
+
+/// A sub-agent's scoped stash is evictable too.
+///
+/// Scoped writes land as `scope\u{1f}tool-out-…`, so a whole-key prefix test
+/// reads them as caller-owned and never evicts them — re-creating the wedge for
+/// every delegating run, and starving the parent's own keys instead. The
+/// scope-stripping in `is_stash_key` is what prevents that, and nothing else
+/// here exercises it.
+#[tokio::test]
+async fn a_scoped_stash_entry_is_evictable() {
+    let state =
+        SharedState::with_backend(yoagent::shared_state::MemoryBackend::with_max_bytes(500));
+    let sub = state.scoped("worker-1");
+
+    state.set("plan", "q".repeat(80)).await.unwrap();
+    for i in 0..20 {
+        sub.set(&format!("tool-out-tc{i}-aaaa-b0"), "q".repeat(100))
+            .await
+            .unwrap_or_else(|e| panic!("scoped stash write {i} failed — sub-agent wedged: {e}"));
+    }
+    assert!(
+        state.get("plan").await.is_some(),
+        "the parent's key must not be starved by a sub-agent's stash"
+    );
+}
+
+/// A store full of caller keys reports capacity rather than destroying them.
+#[tokio::test]
+async fn a_store_of_caller_keys_refuses_rather_than_evicting() {
+    let state =
+        SharedState::with_backend(yoagent::shared_state::MemoryBackend::with_max_bytes(300));
+    for i in 0..2 {
+        state
+            .set(&format!("artifact{i}"), "q".repeat(100))
+            .await
+            .unwrap();
+    }
+    let err = state.set("artifact9", "q".repeat(200)).await;
+    assert!(
+        err.is_err(),
+        "with nothing evictable the write must fail loudly, not silently drop a caller's data"
+    );
+    assert!(
+        state.get("artifact0").await.is_some(),
+        "and the existing caller keys must be untouched"
+    );
+}
+
+/// The default in-memory backend recycles stash entries instead of wedging.
+///
+/// Regression: `MemoryBackend` rejected rather than evicted and nothing ever
+/// removed `tool-out-*`, so after ~33 large results every write failed for the
+/// rest of the run — including the model's own `shared_state set` — with the
+/// bytes never reclaimed.
+#[tokio::test]
+async fn the_default_backend_does_not_wedge_once_full() {
+    let state =
+        SharedState::with_backend(yoagent::shared_state::MemoryBackend::with_max_bytes(500));
+    for i in 0..40 {
+        state
+            .set(&format!("tool-out-tc{i}-aaaa-b0"), "q".repeat(100))
+            .await
+            .unwrap_or_else(|e| panic!("write {i} failed — the store wedged: {e}"));
+    }
+    assert!(
+        state.get("tool-out-tc39-aaaa-b0").await.is_some(),
+        "the most recent stash must be retrievable after 40 writes over a 500-byte cap"
     );
 }
 

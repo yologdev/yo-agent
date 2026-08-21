@@ -1103,3 +1103,107 @@ async fn stashed_output_does_not_leak_into_the_sub_agent_system_prompt() {
     assert!(store.prompt_summary().await.contains("findings"));
     assert!(store.summary().await.contains("tool-out-"));
 }
+
+/// A sub-agent stopped by loop detection must not report success.
+///
+/// Regression: `extract_error` matched only `StopReason::Error`, but a loop
+/// abort leaves `ToolUse` on the last assistant message, and
+/// `extract_final_text` scans assistant messages only — so it never saw the
+/// trailing `[Agent stopped: …]` and fell through to "(sub-agent produced no
+/// text output)". The parent got `is_error: false`. A sub-agent that burned its
+/// whole budget looping was indistinguishable from one that had nothing to say.
+///
+/// Loop detection is inherited, not configured here: `SubAgentTool` takes
+/// `ExecutionLimits::default()`, so every delegation runs with `Some(3)`.
+#[tokio::test]
+async fn a_looping_sub_agent_reports_failure_not_empty_success() {
+    let responses: Vec<MockResponse> = (0..12)
+        .map(|_| {
+            MockResponse::ToolCalls(vec![MockToolCall {
+                provider_metadata: None,
+                name: "echo".into(),
+                arguments: serde_json::json!({"text": "same"}),
+            }])
+        })
+        .collect();
+
+    let echo_tool: Arc<dyn AgentTool> = Arc::new(EchoTool);
+    let sub_agent = SubAgentTool::from_provider(
+        "looper",
+        Arc::new(MockProvider::new(responses)),
+        ModelConfig::mock(),
+    )
+    .with_system_prompt("Use the echo tool.")
+    .with_tools(vec![echo_tool]);
+
+    let result = sub_agent
+        .execute(
+            serde_json::json!({"task": "go"}),
+            ToolContext::new("tc-1", "looper"),
+        )
+        .await;
+
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("echo") || msg.contains("repeatedly"),
+                "the failure must say why the sub-agent stopped, got: {msg}"
+            );
+        }
+        Ok(r) => {
+            let text = match &r.content[0] {
+                Content::Text { text } => text.clone(),
+                _ => String::new(),
+            };
+            panic!("a loop-aborted sub-agent reported success to its parent: {text:?}");
+        }
+    }
+}
+
+/// A turn-limited sub-agent returns its work, and says the work is partial.
+///
+/// The two self-stop kinds mean opposite things to a parent: `max_turns` is a
+/// bound (keep the output), a loop abort is a failure (there is nothing to
+/// keep). Without the notice, half-finished work is indistinguishable from a
+/// complete answer and the parent's model treats it as final.
+///
+/// The limit fires at the top of a turn, so the fixture must call a tool —
+/// a text-only reply ends the run normally and never reaches the check.
+#[tokio::test]
+async fn a_turn_limited_sub_agent_returns_partial_work_and_says_so() {
+    let sub_provider = Arc::new(MockProvider::new(vec![
+        MockResponse::ToolCalls(vec![MockToolCall {
+            provider_metadata: None,
+            name: "echo".into(),
+            arguments: serde_json::json!({"text": "more"}),
+        }]),
+        MockResponse::Text("Should not reach".into()),
+    ]));
+
+    let echo_tool: Arc<dyn AgentTool> = Arc::new(EchoTool);
+    let sub_agent = SubAgentTool::from_provider("limited2", sub_provider, ModelConfig::mock())
+        .with_tools(vec![echo_tool])
+        .with_max_turns(1);
+
+    let result = sub_agent
+        .execute(
+            serde_json::json!({"task": "keep going"}),
+            ToolContext::new("tc-1", "limited2"),
+        )
+        .await
+        .expect("a turn limit is a bound, not a failure");
+
+    let text = match &result.content[0] {
+        Content::Text { text } => text.clone(),
+        _ => panic!("expected text"),
+    };
+    assert!(
+        text.contains(yoagent::agent_loop::AGENT_STOPPED_PREFIX),
+        "and the parent must be told the answer is partial: {text:?}"
+    );
+    assert!(
+        !text.contains("Should not reach"),
+        "the turn limit must actually have stopped it: {text:?}"
+    );
+}

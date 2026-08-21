@@ -111,7 +111,10 @@ pub trait SharedStateBackend: Send + Sync {
 
 /// In-memory backend backed by `HashMap` with a byte capacity limit.
 pub struct MemoryBackend {
-    inner: RwLock<HashMap<String, String>>,
+    /// Value plus the sequence number it was written at, so eviction has a
+    /// definition of "oldest" — a `HashMap` has no insertion order.
+    inner: RwLock<HashMap<String, (u64, String)>>,
+    next_seq: std::sync::atomic::AtomicU64,
     max_bytes: usize,
 }
 
@@ -125,6 +128,7 @@ impl MemoryBackend {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            next_seq: std::sync::atomic::AtomicU64::new(0),
             max_bytes: DEFAULT_MAX_BYTES,
         }
     }
@@ -132,6 +136,7 @@ impl MemoryBackend {
     pub fn with_max_bytes(max_bytes: usize) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            next_seq: std::sync::atomic::AtomicU64::new(0),
             max_bytes,
         }
     }
@@ -140,21 +145,49 @@ impl MemoryBackend {
 #[async_trait::async_trait]
 impl SharedStateBackend for MemoryBackend {
     async fn get(&self, key: &str) -> Result<Option<String>, SharedStateError> {
-        Ok(self.inner.read().await.get(key).cloned())
+        Ok(self.inner.read().await.get(key).map(|(_, v)| v.clone()))
     }
 
     async fn set(&self, key: &str, value: String) -> Result<(), SharedStateError> {
         let mut map = self.inner.write().await;
 
         // Calculate current total excluding the old value for this key.
-        let current: usize = map
+        let mut current: usize = map
             .iter()
             .filter(|(k, _)| k.as_str() != key)
-            .map(|(k, v)| k.len() + v.len())
+            .map(|(k, (_, v))| k.len() + v.len())
             .sum();
         let new_entry = key.len() + value.len();
 
+        // Evict stashed tool output, oldest first, to make room. Without this
+        // the default backend wedged permanently: at ~300KB per stashed build
+        // or grep output a 10MB cap holds ~33 results, after which *every*
+        // write failed for the rest of the run — including the model's own
+        // `shared_state set` — with no way to recover and the bytes never
+        // reclaimed.
         if current + new_entry > self.max_bytes {
+            let mut evictable: Vec<(u64, String, usize)> = map
+                .iter()
+                .filter(|(k, _)| k.as_str() != key && is_stash_key(k))
+                .map(|(k, (seq, v))| (*seq, k.clone(), k.len() + v.len()))
+                .collect();
+            evictable.sort_by_key(|(seq, _, _)| *seq);
+
+            for (_, victim, size) in evictable {
+                if current + new_entry <= self.max_bytes {
+                    break;
+                }
+                map.remove(&victim);
+                current = current.saturating_sub(size);
+                // Never silent: a marker in the transcript may still name this
+                // key, and the agent will get "not found" when it follows it.
+                warn!("shared state: evicted {victim} to make room for {key}");
+            }
+        }
+
+        if current + new_entry > self.max_bytes {
+            // Only caller-owned keys remain. Refuse rather than destroy data
+            // nothing can regenerate.
             return Err(CapacityError {
                 key: key.to_string(),
                 value_bytes: value.len(),
@@ -164,7 +197,10 @@ impl SharedStateBackend for MemoryBackend {
             .into());
         }
 
-        map.insert(key.to_string(), value);
+        let seq = self
+            .next_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        map.insert(key.to_string(), (seq, value));
         Ok(())
     }
 
@@ -182,7 +218,7 @@ impl SharedStateBackend for MemoryBackend {
     async fn summary(&self) -> Result<String, SharedStateError> {
         let map = self.inner.read().await;
         Ok(format_summary(
-            map.iter().map(|(k, v)| (k.as_str(), v.len())),
+            map.iter().map(|(k, (_, v))| (k.as_str(), v.len())),
         ))
     }
 }
@@ -272,7 +308,13 @@ impl FileBackend {
         }
 
         entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        for (_, name, path, len) in entries {
+        // Only stashed tool output is evictable. This directory previously
+        // evicted whatever was oldest, including keys a caller had set through
+        // this very backend — a parent that stored a `plan` got `None` back
+        // later with no error path anywhere. The total still counts every file,
+        // so caller keys constrain the budget without being destroyed by it;
+        // when only they remain the write reports capacity instead.
+        for (_, name, path, len) in entries.into_iter().filter(|(_, n, _, _)| is_stash_key(n)) {
             if total as usize <= self.max_bytes {
                 break;
             }
@@ -281,7 +323,17 @@ impl FileBackend {
                 continue;
             }
             match tokio::fs::remove_file(&path).await {
-                Ok(()) => total = total.saturating_sub(len),
+                Ok(()) => {
+                    total = total.saturating_sub(len);
+                    // Never silent: a marker frozen in the transcript may still
+                    // name this key, and the verify-after-store loop only
+                    // checks keys written for the current result — it cannot
+                    // see that this write just evicted an earlier one.
+                    warn!(
+                        "shared state: evicted {} to stay under the cap",
+                        path.display()
+                    );
+                }
                 // A failed unlink must not fail the write that triggered
                 // eviction — the cap is a bound, not a guarantee — but it must
                 // not be silent either, or the directory grows without bound
@@ -369,7 +421,18 @@ impl SharedStateBackend for FileBackend {
         tokio::fs::write(&path, &value).await?;
         // Eviction runs after the write and skips this key, so the value that
         // triggered it is never the one removed.
-        self.evict_to_fit(Some(key)).await?;
+        //
+        // Unlink on failure. `evict_to_fit` propagates errors from `read_dir`
+        // and `next_entry`, both of which run *after* the write — so a failure
+        // returned `Err` for a value already on disk. The loop's error arm
+        // never records the key, so rollback could not reach it: orphan bytes,
+        // referenced by no marker, consuming cap quota forever and going on to
+        // evict other keys. The exact inverse of the case handled above.
+        if let Err(e) = self.evict_to_fit(Some(key)).await {
+            let _ = tokio::fs::remove_file(&path).await;
+            warn!("shared state: eviction failed after writing {key}; write rolled back: {e}");
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -430,6 +493,24 @@ impl SharedStateBackend for FileBackend {
 /// Separator between a scope name and a key. Non-printable, so it cannot
 /// collide with a key a caller would plausibly choose.
 const SCOPE_SEP: char = '\u{1f}';
+
+/// Whether a key holds machine-generated stashed tool output.
+///
+/// The eviction line. Stash entries are *recyclable*: losing one degrades the
+/// marker to an ordinary "key not found" tool result the agent can act on, and
+/// the content is still in the transcript's head+tail. A caller-owned key is
+/// not recyclable — nothing regenerates a parent's `plan` — so it is never
+/// evicted, and a store that is full of caller keys reports capacity rather
+/// than silently destroying them.
+///
+/// Scope-aware: a scoped write lands as `scope\u{1f}tool-out-…`, so a
+/// whole-key prefix test would miss it and treat it as caller-owned.
+fn is_stash_key(key: &str) -> bool {
+    key.rsplit(SCOPE_SEP)
+        .next()
+        .unwrap_or(key)
+        .starts_with(crate::context::TOOL_OUTPUT_KEY_PREFIX)
+}
 
 /// A shared string key-value store for sub-agent communication.
 ///
