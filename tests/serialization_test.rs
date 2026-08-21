@@ -298,7 +298,9 @@ fn sample_tool_result() -> ToolResult {
     }
 }
 
-/// One value of every `AgentEvent` variant.
+/// One value per `AgentEvent` variant — **by hand**. Nothing in this file
+/// enforces completeness; `wire_tag_freeze` in `src/types.rs` is what fails to
+/// compile when a variant has no sample.
 fn all_agent_events() -> Vec<AgentEvent> {
     vec![
         AgentEvent::AgentStart,
@@ -432,13 +434,16 @@ fn test_stream_delta_every_variant_roundtrips() {
     }
 }
 
-/// The frozen `"type"` tag for every `AgentEvent` variant. Exhaustive match
+/// The frozen `"type"` tag for the `AgentEvent` variants sampled in
+/// `all_agent_events`. **Not** exhaustive — the `_` arm below is forced by
+/// `#[non_exhaustive]`, so this match cannot be a coverage guarantee.
+///
 /// The compile-time half of this freeze moved into `src/types.rs`
 /// (`wire_tag_freeze`) when `AgentEvent` and `StreamDelta` became
 /// `#[non_exhaustive]` — an integration test can no longer match them
 /// exhaustively, so the "adding a variant fails to compile" guarantee only
 /// holds inside the defining crate. What remains here is the round-trip and
-/// payload-shape coverage **for the variants sampled below** — nothing here
+/// payload-shape coverage **for the variants sampled in `all_agent_events`** — nothing here
 /// notices a variant that has no sample, because `all_agent_events` and the
 /// match arms are both hand-written and a new variant is in neither. That
 /// coverage guarantee lives in `wire_tag_freeze`, where the compiler enforces
@@ -464,7 +469,9 @@ fn expected_event_tag(event: &AgentEvent) -> &'static str {
     }
 }
 
-/// Same exhaustive-match freeze for `StreamDelta` tags.
+/// Same tag freeze for the `StreamDelta` variants sampled above. The `_` arm
+/// is forced by `#[non_exhaustive]`, so this is not a coverage guarantee
+/// either.
 fn expected_delta_tag(delta: &StreamDelta) -> &'static str {
     match delta {
         StreamDelta::Text { .. } => "text",
@@ -474,9 +481,25 @@ fn expected_delta_tag(delta: &StreamDelta) -> &'static str {
     }
 }
 
+/// Guards `all_agent_events` against silent *shrinkage*.
+///
+/// This is the one thing the old `EVENT_VARIANT_COUNT` genuinely did. It never
+/// caught a variant being **added** — the `_ => "unknown"` arm means adding one
+/// forces no edit to this file at all — but deleting a sample here quietly
+/// removes the payload coverage below, and that it does catch. Adding a variant
+/// is `wire_tag_freeze`'s job, where the compiler enforces it.
+const SAMPLED_EVENT_COUNT: usize = 14;
+
 #[test]
 fn test_agent_event_type_tags_are_frozen() {
-    for event in all_agent_events() {
+    let events = all_agent_events();
+    assert_eq!(
+        events.len(),
+        SAMPLED_EVENT_COUNT,
+        "a sample was removed from all_agent_events — the payload-shape assertions in this \
+         file silently stop covering that variant. Deliberate? Lower the constant."
+    );
+    for event in events {
         let v: serde_json::Value = serde_json::to_value(&event).expect("serialize");
         assert_eq!(
             v["type"],

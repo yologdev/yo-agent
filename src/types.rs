@@ -692,6 +692,7 @@ pub trait AgentTool: Send + Sync {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolResult {
     pub content: Vec<Content>,
     #[serde(default)]
@@ -792,13 +793,6 @@ pub enum AgentEvent {
     InputRejected {
         reason: String,
     },
-    /// History was compacted before a turn.
-    ///
-    /// Emitted by [`LlmCompaction`](crate::LlmCompaction) on both of its paths
-    /// — the spliced summary and the deterministic fallback — so a consumer can
-    /// tell which one ran and what it cost. The built-in
-    /// [`DefaultCompaction`](crate::context::DefaultCompaction) does not emit
-    /// this; it has no event channel and never issues a request.
     /// A tool was called repeatedly with identical arguments.
     ///
     /// Emitted on both escalations: the first trip steers the model and
@@ -811,6 +805,13 @@ pub enum AgentEvent {
         repetitions: usize,
         aborted: bool,
     },
+    /// History was compacted before a turn.
+    ///
+    /// Emitted by [`LlmCompaction`](crate::LlmCompaction) on both of its paths
+    /// — the spliced summary and the deterministic fallback — so a consumer can
+    /// tell which one ran and what it cost. The built-in
+    /// [`DefaultCompaction`](crate::context::DefaultCompaction) does not emit
+    /// this; it has no event channel and never issues a request.
     ContextCompacted {
         /// Which compaction path produced this result.
         method: CompactionMethod,
@@ -1173,10 +1174,15 @@ impl fmt::Display for StopReason {
 /// Freezes the serde wire contract for `AgentEvent` and `StreamDelta`.
 ///
 /// Both enums are documented as a stable wire format for websocket fanout
-/// servers, TypeScript clients and JSONL pipes, so a changed tag, a changed
-/// payload shape, or a variant that quietly serializes however serde happens
-/// to derive it are all breaking changes for consumers who never rebuild
-/// against this crate.
+/// servers, TypeScript clients and JSONL pipes, so a changed tag or a variant
+/// that quietly serializes however serde happens to derive it are breaking
+/// changes for consumers who never rebuild against this crate.
+///
+/// **Scope.** This freezes the `"type"` tag of every variant, that every
+/// variant has a sample, and that each sample round-trips. It does **not**
+/// freeze payload shape: a `#[serde(rename)]` on a field, a field added or
+/// removed, or a changed field type all pass here. Field names are pinned
+/// only where `tests/serialization_test.rs` asserts them by literal.
 ///
 /// This lives in the defining crate on purpose. Both enums are
 /// `#[non_exhaustive]`, so an integration test *cannot* match them
@@ -1196,59 +1202,94 @@ mod wire_tag_freeze {
     /// notice a *new* variant, because a new variant appears in neither. Here
     /// the generated match has no wildcard, so adding a variant fails to
     /// compile — and the only way to fix that is to add a line below, which
-    /// supplies the sample in the same breath. The two lists cannot drift
-    /// because they are one list.
+    /// supplies the sample in the same breath.
     ///
-    /// Three further mistakes are caught by the compiler rather than by luck:
-    /// a duplicated pattern makes the later arm `unreachable_pattern` (an
-    /// error under CI's `-Dwarnings`), a sample of the wrong type does not
-    /// compile, and a missing arm is a non-exhaustive match.
+    /// Three mistakes are caught by the compiler rather than by luck: a
+    /// duplicated pattern makes the later arm `unreachable_patterns` (an error
+    /// under CI's `-Dwarnings`), a sample of the wrong type does not compile,
+    /// and a missing arm is a non-exhaustive match.
     ///
-    /// What the *tests* below add, which no macro can: that the declared tag
-    /// is the one serde actually emits, that each sample survives a
-    /// round-trip, and that a sample on the wrong line is caught (via the
-    /// distinctness check).
+    /// The specifier is `pat_param`, not `pat`, and that is load-bearing: `pat`
+    /// would accept an or-pattern, letting someone answer the compile error by
+    /// widening an unrelated arm (`TurnStart | NewVariant => "turnStart"`)
+    /// instead of adding a line — leaving the new variant with no sample and no
+    /// coverage, which is exactly the hole this macro exists to close. No arm
+    /// can legitimately need one, since two variants cannot share a tag.
     macro_rules! wire_freeze {
-        ($ty:ty, $tag_of:ident, $samples:ident, $($pat:pat => $tag:literal = $sample:expr),+ $(,)?) => {
+        ($ty:ty, $tag_of:ident, $samples:ident, $($pat:pat_param => $tag:literal = $sample:expr),+ $(,)?) => {
             /// The frozen `"type"` tag per variant. Changing one breaks every
             /// deployed wire client — do not edit casually.
             fn $tag_of(v: &$ty) -> &'static str {
                 match v { $($pat => $tag,)+ }
             }
 
-            /// One sample per variant, positionally paired with the tags above.
+            /// One sample per variant, in declaration order. The tests re-derive
+            /// each tag from its sample rather than trusting that order — see
+            /// [`assert_frozen`].
             fn $samples() -> Vec<$ty> { vec![$($sample,)+] }
         };
     }
 
+    /// A populated assistant message. Every field is deliberately non-default:
+    /// a round-trip cannot detect a field that `#[serde(skip)]` drops if the
+    /// value it reconstructs is the default anyway.
     fn msg() -> AgentMessage {
         AgentMessage::Llm(Message::Assistant {
             content: vec![Content::Text { text: "hi".into() }],
-            stop_reason: StopReason::Stop,
-            model: "mock".into(),
+            stop_reason: StopReason::ToolUse,
+            model: "mock-1".into(),
             provider: "mock".into(),
-            usage: Usage::default(),
+            usage: Usage {
+                input: 11,
+                output: 22,
+                cache_read: 33,
+                cache_write: 44,
+                total_tokens: 110,
+            },
             timestamp: 7,
-            error_message: None,
+            error_message: Some("boom".into()),
         })
     }
 
     fn tool_result() -> ToolResult {
         ToolResult {
             content: vec![Content::Text { text: "ok".into() }],
-            details: serde_json::Value::Null,
+            details: serde_json::json!({"exitCode": 0}),
+        }
+    }
+
+    fn tool_result_message() -> Message {
+        Message::ToolResult {
+            tool_call_id: "tc-1".into(),
+            tool_name: "bash".into(),
+            content: vec![Content::Text { text: "ok".into() }],
+            is_error: false,
+            timestamp: 9,
         }
     }
 
     wire_freeze! {
         AgentEvent, expected_event_tag, event_samples,
         AgentEvent::AgentStart => "agentStart" = AgentEvent::AgentStart,
-        AgentEvent::AgentEnd { .. } => "agentEnd"
-            = AgentEvent::agent_end(vec![msg()], SessionStats::default()),
+        AgentEvent::AgentEnd { .. } => "agentEnd" = AgentEvent::agent_end(
+            vec![msg()],
+            SessionStats {
+                usage: Usage {
+                    input: 5,
+                    output: 6,
+                    cache_read: 7,
+                    cache_write: 8,
+                    total_tokens: 26,
+                },
+                turns: 3,
+                cost_usd: Some(0.02),
+                compactions: 1,
+            },
+        ),
         AgentEvent::TurnStart => "turnStart" = AgentEvent::TurnStart,
         AgentEvent::TurnEnd { .. } => "turnEnd" = AgentEvent::TurnEnd {
             message: msg(),
-            tool_results: vec![],
+            tool_results: vec![tool_result_message()],
         },
         AgentEvent::MessageStart { .. } => "messageStart"
             = AgentEvent::MessageStart { message: msg() },
@@ -1294,7 +1335,17 @@ mod wire_tag_freeze {
                 messages_after: 13,
                 tokens_before: 96_500,
                 tokens_after: 41_200,
-                summary: None,
+                summary: Some(SummaryStats::new(
+                    28,
+                    Usage {
+                        input: 54_000,
+                        output: 900,
+                        cache_read: 0,
+                        cache_write: 0,
+                        total_tokens: 54_900,
+                    },
+                    Some(0.17),
+                )),
             },
     }
 
@@ -1307,18 +1358,41 @@ mod wire_tag_freeze {
             = StreamDelta::ToolCallDelta { delta: "{}".into() },
     }
 
-    /// Asserts the frozen contract for one sample: declared tag == emitted tag,
-    /// payload keys are camelCase, and the value survives a round-trip.
+    /// Every key in `v`, recursively, as `path -> key` pairs.
     ///
-    /// `seen` collects tags so a sample paired with the wrong pattern is caught
-    /// — that is the one error the macro cannot catch, since both lines
-    /// compile fine and the mismatch only shows as a repeated tag.
-    fn assert_frozen<T>(
-        sample: &T,
-        declared: &str,
-        seen: &mut BTreeSet<&'static str>,
-        declared_static: &'static str,
-    ) where
+    /// Recursive on purpose. Checking only the top level would pass a
+    /// snake_case key one level down — `message.usage.total_tokens` reaches
+    /// clients just as surely as `turnEnd.toolResults` does, and the nested
+    /// payload structs carry their own `rename_all`, which nothing else here
+    /// would notice going missing.
+    fn all_keys(v: &serde_json::Value, path: &str, out: &mut Vec<(String, String)>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, child) in map {
+                    out.push((path.to_string(), k.clone()));
+                    all_keys(child, &format!("{path}.{k}"), out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    all_keys(child, &format!("{path}[{i}]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Asserts the frozen contract for one sample: the declared tag is the one
+    /// serde emits, no payload key anywhere in the value contains an
+    /// underscore, and the value survives a JSON round-trip.
+    ///
+    /// `seen` collects tags so a mis-paired sample is caught **when it
+    /// duplicates another variant** — which is the case that costs coverage,
+    /// since some variant is then left unsampled. Two samples swapped between
+    /// lines is invisible here, and harmless: the set of samples is unchanged
+    /// and every tag is still checked against serde.
+    fn assert_frozen<T>(sample: &T, declared: &'static str, seen: &mut BTreeSet<&'static str>)
+    where
         T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug + PartialEq,
     {
         let v = serde_json::to_value(sample).expect("serialize");
@@ -1331,15 +1405,14 @@ mod wire_tag_freeze {
             v["type"]
         );
 
-        for key in v
-            .as_object()
-            .expect("tagged enums serialize as objects")
-            .keys()
-        {
+        let mut keys = Vec::new();
+        all_keys(&v, declared, &mut keys);
+        for (path, key) in &keys {
             assert!(
                 !key.contains('_'),
-                "payload key {key:?} on {declared} is not camelCase — the enum carries \
-                 rename_all_fields = \"camelCase\" and TS clients hardcode these names"
+                "payload key {key:?} at {path} is not camelCase. Every struct on this wire \
+                 carries rename_all = \"camelCase\" and TS clients hardcode these names, so a \
+                 snake_case key here means a rename attribute is missing"
             );
         }
 
@@ -1350,39 +1423,25 @@ mod wire_tag_freeze {
         );
 
         assert!(
-            seen.insert(declared_static),
+            seen.insert(declared),
             "two samples serialize as {declared} — a sample in wire_freeze! does not match \
-             the pattern on its own line"
+             the pattern on its own line, so some variant has no sample at all"
         );
     }
 
     #[test]
     fn every_event_variant_is_frozen_tagged_and_round_trips() {
-        let samples = event_samples();
         let mut seen = BTreeSet::new();
-        for sample in &samples {
-            let declared = expected_event_tag(sample);
-            assert_frozen(sample, declared, &mut seen, declared);
+        for sample in &event_samples() {
+            assert_frozen(sample, expected_event_tag(sample), &mut seen);
         }
-        assert_eq!(
-            seen.len(),
-            samples.len(),
-            "every variant must contribute a distinct tag"
-        );
     }
 
     #[test]
     fn every_delta_variant_is_frozen_tagged_and_round_trips() {
-        let samples = delta_samples();
         let mut seen = BTreeSet::new();
-        for sample in &samples {
-            let declared = expected_delta_tag(sample);
-            assert_frozen(sample, declared, &mut seen, declared);
+        for sample in &delta_samples() {
+            assert_frozen(sample, expected_delta_tag(sample), &mut seen);
         }
-        assert_eq!(
-            seen.len(),
-            samples.len(),
-            "every variant must contribute a distinct tag"
-        );
     }
 }
