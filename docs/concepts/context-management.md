@@ -144,6 +144,52 @@ Keeps the last `keep_recent` messages in full detail. Older assistant messages a
 
 Drops the smallest span of middle messages that reaches the target, keeping at least `keep_first` from the start and `keep_recent` from the end. A constant marker message stands in for what was removed; the count goes to the debug log rather than into the marker, so the text does not change from pass to pass.
 
+## Retrievable tool output
+
+Head-tail truncation on the append path keeps a huge tool result from eating the
+context, but the middle is gone irrecoverably — it survives only in the event
+stream, which the *agent* cannot read.
+
+Attach a `SharedState` and the full text is stashed, with the marker naming
+where it went:
+
+```rust
+let agent = Agent::from_config(config)
+    .with_shared_state(SharedState::new());
+```
+
+```
+[... 1847 lines truncated — full output: shared_state get "tool-out-tc_01abc-9f2a-b0" ...]
+```
+
+The `shared_state` tool is registered for the run, so the model can act on the
+pointer. **Opt-in**: with no store attached, truncation behaves exactly as
+before and the marker advertises no retrieval it cannot honour.
+
+Keys are block-qualified — a result carrying several text blocks gets one key
+per block, suffixed by the block's position in the content vector, so
+text/image/text yields `…-b0` and `…-b2`. The key combines the tool call id
+with a hash of the output, because Gemini synthesizes call ids as a per-response
+index that restarts every turn; id alone would let turn 1's frozen marker
+resolve to turn 5's content.
+
+Two limits worth knowing:
+
+- **Lossy compaction drops the marker but not the stash entry.** Levels 2 and 3
+  drop whole turns, taking the pointer with them, while the stored value lives
+  on and keeps consuming cap quota.
+- **Stash entries are evictable; caller keys are not.** Both backends evict
+  oldest-first under their cap, but only `tool-out-*` entries — losing one
+  degrades a marker to an ordinary "key not found" the agent can act on, and the
+  head+tail is still in the transcript. Nothing regenerates an artifact you
+  stored yourself, so when only caller keys remain the write reports capacity
+  instead.
+
+`SubAgentTool::with_context_config` makes the same path reachable for
+sub-agents; their stash is scoped, and scoped keys are excluded from the system
+prompt summary so a second delegation does not see the first one's keys and cold
+-start the prefix cache.
+
 ## Prefix Cache Stability
 
 Providers cache request prefixes — automatically on DeepSeek, explicitly via `cache_control` on Anthropic. A cache hit needs the new request to share a byte-identical prefix with the last one, so **every rewrite of already-sent history costs full price for every token from the rewrite point onward**.
@@ -189,14 +235,51 @@ In input-token spend that is −9.2% to −21.3% on DeepSeek and −15.2% to −
 Prevents runaway agents:
 
 ```rust
+#[non_exhaustive]
 pub struct ExecutionLimits {
     pub max_turns: usize,              // Default: 50
     pub max_total_tokens: usize,       // Default: 1,000,000
     pub max_duration: Duration,        // Default: 600s (10 min)
+    pub max_consecutive_identical_tool_calls: Option<usize>,  // Default: Some(3)
 }
 ```
 
 When a limit is reached, the agent stops with a message like `"[Agent stopped: Max turns reached (50/50)]"`.
+
+## Loop detection
+
+The cheapest catastrophic failure is a model calling one tool with the same
+arguments forever. The three limits above all fire eventually — but only after
+the run has burned its entire turn, token and wall-clock budget to discover it
+achieved nothing.
+
+`max_consecutive_identical_tool_calls` is on by default at `Some(3)`, with two
+escalations that mirror the house pattern of steering before aborting:
+
+1. **First trip** injects a steering message and continues. A model repeating a
+   call is often retrying something transient, and aborting immediately would
+   regress that legitimate case.
+2. **A later trip on the same signature** stops the run.
+
+Both emit `AgentEvent::LoopDetected { tool_name, repetitions, aborted }`, so a
+UI can show the intervention and an audit can tell a loop abort from a
+turn-limit stop.
+
+Signatures compare `serde_json::Value`, not serialized text — two calls
+differing only in key order are the same call. Counting covers duplicates
+*within* one batch as well as across turns, because `ToolExecutionStrategy`
+defaults to `Parallel` and a model can emit the same call three times in a
+single message.
+
+**Consecutive**, and that word is load-bearing: a different call resets the
+streak, so an alternating `[a, b, a, b, …]` loop is *not* detected. That is a
+deliberate trade — an agent working through a list calls one tool repeatedly and
+legitimately, and a detector that fired on interleaved repeats would be worse
+than none.
+
+```rust
+ExecutionLimits::default().with_max_consecutive_identical_tool_calls(None)  // off
+```
 
 ## Disabling Context Management
 
