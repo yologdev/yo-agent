@@ -1748,3 +1748,99 @@ mod tests {
         assert!(tracker.check_limits().is_some());
     }
 }
+
+#[cfg(test)]
+mod compaction_retention {
+    use super::*;
+    use crate::types::{Content, StopReason, Usage};
+
+    fn assistant_call(i: usize) -> AgentMessage {
+        AgentMessage::Llm(Message::Assistant {
+            content: vec![Content::ToolCall {
+                id: format!("tc-{i}"),
+                name: "fetch_record".into(),
+                arguments: serde_json::json!({"n": i}),
+                provider_metadata: None,
+            }],
+            stop_reason: StopReason::ToolUse,
+            model: "m".into(),
+            provider: "p".into(),
+            usage: Usage::default(),
+            timestamp: i as u64,
+            error_message: None,
+        })
+    }
+
+    fn tool_result(i: usize) -> AgentMessage {
+        AgentMessage::Llm(Message::ToolResult {
+            tool_call_id: format!("tc-{i}"),
+            tool_name: "fetch_record".into(),
+            content: vec![Content::Text {
+                text: "record line, nominal, no action required ".repeat(400),
+            }],
+            is_error: false,
+            timestamp: i as u64,
+        })
+    }
+
+    /// Compaction must leave a transcript a provider will accept, and must
+    /// leave the agent something to work with.
+    ///
+    /// Written after a live long-horizon run reported a compaction collapsing
+    /// 22 messages / 21371 tokens to **1 message / 22 tokens** — far below
+    /// `keep_first + keep_recent`. That did not reproduce here (retention is
+    /// 15-24 messages on the same shape), so this pins the two properties that
+    /// matter, in-crate where the live path cannot be reached: no orphaned tool
+    /// call, and never emptied to nothing.
+    #[test]
+    fn compaction_keeps_a_usable_well_formed_transcript() {
+        let cfg = ContextConfig {
+            max_context_tokens: 30_000,
+            keep_recent: 6,
+            keep_first: 2,
+            ..Default::default()
+        };
+        for pairs in [6usize, 11, 12, 20, 40] {
+            let mut msgs = vec![AgentMessage::Llm(Message::user("go"))];
+            for i in 0..pairs {
+                msgs.push(assistant_call(i));
+                msgs.push(tool_result(i));
+            }
+            let before = msgs.len();
+            let out = compact_messages(msgs, &cfg);
+
+            assert!(
+                !out.is_empty(),
+                "compaction of {before} messages emptied the transcript"
+            );
+
+            // No `tool_use` may be left unanswered — the shape every provider
+            // rejects, and the one thing compaction must never produce.
+            let mut pending: Vec<String> = Vec::new();
+            for m in &out {
+                let AgentMessage::Llm(msg) = m else { continue };
+                match msg {
+                    Message::Assistant { content, .. } => {
+                        pending = content
+                            .iter()
+                            .filter_map(|c| match c {
+                                Content::ToolCall { id, .. } => Some(id.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                    }
+                    Message::ToolResult { tool_call_id, .. } => {
+                        if let Some(at) = pending.iter().position(|p| p == tool_call_id) {
+                            pending.remove(at);
+                        }
+                    }
+                    Message::User { .. } => {}
+                }
+            }
+            assert!(
+                pending.is_empty(),
+                "compaction of {before} messages orphaned tool calls {pending:?}"
+            );
+        }
+    }
+}
