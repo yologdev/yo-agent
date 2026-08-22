@@ -83,11 +83,19 @@ let config = ContextConfig::from_context_window(200_000);
 Prevents runaway agents:
 
 ```rust
+#[non_exhaustive]                      // build with Default::default() + with_*
 pub struct ExecutionLimits {
     pub max_turns: usize,              // Default: 50
     pub max_total_tokens: usize,       // Default: 1,000,000
     pub max_duration: Duration,        // Default: 600s
+    pub max_consecutive_identical_tool_calls: Option<usize>,  // Default: Some(3)
 }
+```
+
+```rust
+ExecutionLimits::default()
+    .with_max_turns(20)
+    .with_max_consecutive_identical_tool_calls(None)  // disable loop detection
 ```
 
 ## ThinkingLevel
@@ -111,13 +119,50 @@ compat flags enable it; the Google and Bedrock providers currently ignore
 Token pricing per million:
 
 ```rust
+#[non_exhaustive]                          // build with new() + with_*, not a literal
 pub struct CostConfig {
     pub input_per_million: f64,
     pub output_per_million: f64,
     pub cache_read_per_million: f64,
     pub cache_write_per_million: f64,
+    pub context_tiers: Vec<ContextTier>,   // empty = one flat rate at every size
 }
 ```
+
+Cache rates are set with builders rather than positionally. Four same-typed
+`f64` arguments in a row is a transposition hazard, and no vendor publishes them
+in one order — Anthropic lists input / cache-write / cache-read / output, OpenAI
+lists input / cached-input / output:
+
+```rust
+CostConfig::new(5.0, 30.0)          // input, output — output is always dearer
+    .with_cache_read(0.5)
+    .with_cache_write(6.25)
+```
+
+All-zero rates mean **pricing unknown**, not free. `is_configured()` reports
+which, and `session_cost_usd()` returns `None` for an unpriced model rather than
+$0.
+
+### Context tiers
+
+Some vendors charge more above a prompt-size threshold. `cost_usd` selects by
+the request's **prompt** tokens (`input + cache_read + cache_write`), so a long
+reply to a short prompt stays on the base rate:
+
+```rust
+CostConfig::new(5.0, 30.0)
+    .with_context_tier(ContextTier::new(272_000, 10.0, 45.0).with_cache_read(1.0))
+```
+
+Tiers are kept sorted, and `cost_usd` takes the last one the prompt clears, so a
+multi-step schedule works. **No shipped preset sets one** — see
+`ModelConfig::gpt_5_5`'s docs for why the one candidate stayed flat.
+
+One caveat if you add a tier: prompt size is derived as
+`input + cache_read + cache_write`, which holds only where the provider
+subtracts cached tokens out of `input`. `bedrock.rs` populates neither cache
+field, so a heavily-cached prompt reads small there.
 
 ## ModelConfig Presets
 
