@@ -312,10 +312,10 @@ impl StreamProvider for AnthropicProvider {
                                                     .and_then(|v| v.as_str())
                                                     .map(|s| s.to_string())
                                                 {
-                                                    match serde_json::from_str(&partial) {
-                                                        Ok(parsed) => *arguments = parsed,
-                                                        Err(e) => warn!(
-                                                            "tool call `{}` has malformed JSON arguments ({e}): {}",
+                                                    match resolve_tool_arguments(&partial) {
+                                                        Some(parsed) => *arguments = parsed,
+                                                        None => warn!(
+                                                            "tool call `{}` has malformed JSON arguments: {}",
                                                             name,
                                                             truncate_for_error(&partial)
                                                         ),
@@ -861,6 +861,24 @@ struct AnthropicMessageDeltaInner {
     stop_reason: Option<String>,
 }
 
+/// Resolve a tool call's accumulated `input_json_delta` text into arguments.
+///
+/// `None` means malformed, and the caller leaves the `__partial_json` sentinel
+/// in place so the post-stream sweep fails the turn rather than running the
+/// tool on its defaults.
+///
+/// An **empty** accumulator is not malformed. A tool with no parameters has no
+/// JSON to stream, and Anthropic still emits an `input_json_delta` carrying
+/// `""` — so `from_str("")` failed with "EOF while parsing a value", the
+/// sentinel survived, and the sweep rejected the whole turn. Every
+/// no-argument tool (`get_status`, `list_files`, …) was uncallable.
+fn resolve_tool_arguments(partial: &str) -> Option<serde_json::Value> {
+    if partial.trim().is_empty() {
+        return Some(serde_json::Value::Object(Default::default()));
+    }
+    serde_json::from_str(partial).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1399,5 +1417,49 @@ mod tests {
             request_url(&config),
             "https://api.anthropic.com/v1/messages"
         );
+    }
+}
+
+#[cfg(test)]
+mod no_arg_tool_calls {
+    use super::resolve_tool_arguments;
+
+    /// A tool with no parameters must be callable.
+    ///
+    /// Found on the 0.18 line by a live smoke harness, not by the suite:
+    /// `MockProvider` never streams SSE, so nothing exercised the
+    /// `input_json_delta` accumulator. Anthropic answered a no-argument tool
+    /// call with an empty argument stream and the whole turn failed with
+    /// "tool call(s) with unusable arguments".
+    #[test]
+    fn an_empty_argument_stream_is_an_empty_object() {
+        for partial in ["", "   ", "\n"] {
+            assert_eq!(
+                resolve_tool_arguments(partial),
+                Some(serde_json::json!({})),
+                "a no-parameter tool streams no JSON; {partial:?} must resolve to {{}}"
+            );
+        }
+    }
+
+    #[test]
+    fn well_formed_arguments_parse() {
+        assert_eq!(
+            resolve_tool_arguments(r#"{"service":"api"}"#),
+            Some(serde_json::json!({"service": "api"}))
+        );
+    }
+
+    /// Truncated input must still fail, or a cut-off stream would silently run
+    /// the tool on its defaults — the case the sentinel exists for.
+    #[test]
+    fn malformed_arguments_still_fail() {
+        for partial in [r#"{"service":"#, "not json", "{"] {
+            assert_eq!(
+                resolve_tool_arguments(partial),
+                None,
+                "{partial:?} must not resolve"
+            );
+        }
     }
 }
