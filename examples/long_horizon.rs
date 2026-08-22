@@ -233,6 +233,14 @@ fn transcript_is_well_formed(messages: &[AgentMessage]) -> Result<(), String> {
     }
 }
 
+/// The model that writes briefings. Deliberately not the loop's model.
+fn summarizer() -> ModelConfig {
+    match std::env::var("SMOKE_MODEL").ok().as_deref() {
+        Some("deepseek") => ModelConfig::deepseek("deepseek-chat", "DeepSeek Chat"),
+        _ => ModelConfig::claude_haiku_4_5(),
+    }
+}
+
 fn model() -> ModelConfig {
     match std::env::var("SMOKE_MODEL").ok().as_deref() {
         Some("deepseek") => ModelConfig::deepseek("deepseek-chat", "DeepSeek Chat"),
@@ -243,6 +251,20 @@ fn model() -> ModelConfig {
 
 #[tokio::main]
 async fn main() {
+    // Compaction decisions are only visible through tracing — `RUST_LOG=yoagent=debug`
+    // shows which path each compaction took and why summarization did or did
+    // not arm. Without a subscriber the diagnosis is guesswork.
+    let level = match std::env::var("YO_LOG").as_deref() {
+        Ok("debug") => tracing::Level::DEBUG,
+        Ok("trace") => tracing::Level::TRACE,
+        Ok("info") => tracing::Level::INFO,
+        _ => tracing::Level::WARN,
+    };
+    tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_target(true)
+        .init();
+
     let cfg = model();
     println!(
         "\nyoagent long-horizon validation — live provider: {}\n",
@@ -277,7 +299,13 @@ async fn main() {
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     agent = agent.with_compaction_strategy(
-        yoagent::LlmCompaction::from_config(cfg.clone())
+        // A *cheaper, faster* summarizer, per LlmCompaction's own docs: "the
+        // request is standalone, so this can (and usually should) name a
+        // cheaper model than the main loop's". Passing the loop model is the
+        // obvious call and the worst one — the briefing then loses the race
+        // against the budget and is discarded when compaction rewrites the
+        // history it was computed over.
+        yoagent::LlmCompaction::from_config(summarizer())
             .with_trigger_ratio(0.35)
             .with_event_sender(tx.clone()),
     );

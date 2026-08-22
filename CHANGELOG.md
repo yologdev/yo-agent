@@ -4,6 +4,42 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Changed
+
+- **`LlmCompaction` says so when briefings keep losing the race**
+  ([#150](https://github.com/yologdev/yoagent/issues/150)). A session where
+  every compaction takes the deterministic path still issues a summarization
+  request each time — paying input tokens for the summarized span and output
+  tokens for a briefing it never uses, while silently getting the lossy
+  behaviour `LlmCompaction` was chosen to avoid. After two consecutive
+  fallbacks it warns once, naming the likely cause. A successful splice resets
+  the streak, so a session that mostly works is not told otherwise.
+
+  The measured cause is a documentation problem, not a logic one:
+  `LlmCompaction::from_config(loop_config)` is the obvious call and the worst
+  one. A briefing on the loop's own slow model cannot finish before the budget
+  is crossed, and the compaction that fires meanwhile **rewrites the history the
+  briefing was computed over**, so the fingerprint check discards it on arrival
+  even when it does land.
+
+  Same 25-turn tool-heavy run at a 30K budget, changing only the summarizer:
+
+  | summarizer | first compaction | history retained |
+  |---|---|---|
+  | the loop's model (Sonnet 5) | `Deterministic` | 3 msgs / 1.7K tokens |
+  | a fast model (Haiku 4.5) | `Summarized` | 22 msgs / 16.7K tokens |
+
+  The module docs now lead with that table.
+
+  **Still open on #150:** `compact_headroom_turns` defaults to `Some(30)`, which
+  for any agent whose turns carry real tool output exceeds the budget outright
+  and pins `effective_target_ratio` to its `MIN_HEADROOM_RATIO` floor of 0.15 —
+  so compaction is aggressive enough to destroy an in-flight summary's history.
+  Changing that constant alters compaction for every user and wants measurement
+  across growth rates first, not a guess at a release gate.
+
 ## 0.18.0
 
 ### Added
