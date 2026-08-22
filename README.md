@@ -386,8 +386,6 @@ MSRV is **1.86**, enforced in CI. Raising it is a minor-version change.
 
 MIT — see [LICENSE](LICENSE).
 
-Inspired by [pi-agent-core](https://github.com/badlogic/pi-mono/tree/main/packages/agent) (TypeScript).
-
 <!-- Badge link definitions -->
 [crates-shield]: https://img.shields.io/crates/v/yoagent?labelColor=black&style=flat-square&logo=rust&color=orange
 [crates-link]: https://crates.io/crates/yoagent

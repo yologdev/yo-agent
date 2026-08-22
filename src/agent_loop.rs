@@ -1,6 +1,6 @@
 //! The core agent loop: prompt → LLM stream → tool execution → repeat.
 //!
-//! This is the heart of yoagent. Inspired by pi-agent-core's agent-loop.ts:
+//! This is the heart of yoagent:
 //!
 //! - `agent_loop()` starts with new prompt messages
 //! - `agent_loop_continue()` resumes from existing context
