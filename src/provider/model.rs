@@ -509,15 +509,21 @@ impl ModelConfig {
     }
 
     /// Claude Sonnet 5. 1M context; defaults to 64K of the model's 128K max output.
+    ///
+    /// Rates verified against <https://platform.claude.com/docs/en/about-claude/pricing>
+    /// and models.dev on 2026-08-23. This preset carried Sonnet 4.6's entire
+    /// price row — $3/$15 with $0.30/$3.75 cache, uniformly 1.5x high — from
+    /// v0.9.0 through v0.16.5, overstating every `cost_usd` for the model by
+    /// 50% with nothing to detect it.
     pub fn claude_sonnet_5() -> Self {
         Self {
             context_window: 1_000_000,
             max_tokens: 64_000,
             cost: CostConfig {
-                input_per_million: 3.0,
-                output_per_million: 15.0,
-                cache_read_per_million: 0.3,
-                cache_write_per_million: 3.75,
+                input_per_million: 2.0,
+                output_per_million: 10.0,
+                cache_read_per_million: 0.2,
+                cache_write_per_million: 2.5,
             },
             ..Self::anthropic("claude-sonnet-5", "Claude Sonnet 5")
         }
@@ -1005,7 +1011,13 @@ mod tests {
 
         let sonnet = ModelConfig::claude_sonnet_5();
         assert_eq!(sonnet.id, "claude-sonnet-5");
-        assert_eq!(sonnet.cost.output_per_million, 15.0);
+        // All four, not just output. This preset carried Sonnet 4.6's entire
+        // price row — uniformly 1.5x high — for 18 releases, and pinning one
+        // field would let a partial correction pass just as quietly.
+        assert_eq!(sonnet.cost.input_per_million, 2.0);
+        assert_eq!(sonnet.cost.output_per_million, 10.0);
+        assert_eq!(sonnet.cost.cache_read_per_million, 0.2);
+        assert_eq!(sonnet.cost.cache_write_per_million, 2.5);
 
         let haiku = ModelConfig::claude_haiku_4_5();
         assert_eq!(haiku.id, "claude-haiku-4-5");

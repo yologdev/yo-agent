@@ -8,6 +8,21 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`claude_sonnet_5` was priced 50% high.** The preset carried Sonnet 4.6's
+  entire price row — $3/$15 with $0.30/$3.75 cache rates, uniformly 1.5x the
+  real figures — from v0.9.0 through v0.16.5. Every `cost_usd` and
+  `session_cost_usd` for that model overstated spend by half, across 18
+  releases, with nothing in the crate able to detect it.
+
+  Now $2/$10 with $0.20/$2.50, verified against Anthropic's pricing page and
+  models.dev on 2026-08-23.
+
+  Corrected on the 0.18.0 line by [#121](https://github.com/yologdev/yoagent/pull/121);
+  this back-ports it. The drift alarm that catches this class of error
+  (`tests/price_audit.rs`, which diffs every priced preset against models.dev)
+  is 0.18.0-only — this line has the corrected numbers but not the guard, so
+  future drift here is again undetected.
+
 - **Tools with no parameters were uncallable on Anthropic.** A tool whose
   schema takes no arguments has no JSON to stream, and Anthropic still emits an
   `input_json_delta` carrying `""`. `serde_json::from_str("")` fails with "EOF
