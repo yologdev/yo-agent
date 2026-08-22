@@ -4,6 +4,27 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.16.6
+
+### Fixed
+
+- **Tools with no parameters were uncallable on Anthropic.** A tool whose
+  schema takes no arguments has no JSON to stream, and Anthropic still emits an
+  `input_json_delta` carrying `""`. `serde_json::from_str("")` fails with "EOF
+  while parsing a value", so the `__partial_json` sentinel survived
+  `content_block_stop` and the post-stream sweep failed the whole turn with
+  *"tool call(s) with unusable arguments, not executed"*. Every no-argument tool
+  — `get_status`, `list_files`, `read_log` — was affected.
+
+  An empty accumulator is an empty argument object, not malformed input. The
+  decision is now a small pure function, `resolve_tool_arguments`, so it has a
+  regression test; genuinely truncated JSON still fails, which is what the
+  sentinel exists for.
+
+  Forward-ported from the 0.18.0 line, where it was found by a live smoke
+  harness rather than the suite: `MockProvider` never streams SSE, so nothing
+  exercised the tool-call accumulator.
+
 ## 0.16.5
 
 ### Fixed

@@ -1,6 +1,6 @@
 [package]
 name = "yoagent"
-version = "0.16.5"
+version = "0.16.6"
 edition = "2021"
 # MSRV-aware dependency resolution (cargo 1.84+): prefer dependency versions
 # whose own rust-version fits ours. Without it CI re-resolves to whatever is
