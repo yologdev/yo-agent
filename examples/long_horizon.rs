@@ -233,6 +233,25 @@ fn transcript_is_well_formed(messages: &[AgentMessage]) -> Result<(), String> {
     }
 }
 
+/// The model that writes briefings — deliberately a *fast* one.
+///
+/// For the Anthropic default that means Haiku rather than the loop's Sonnet.
+/// The DeepSeek branch reuses the loop's model on purpose: it is already cheap
+/// and fast, and the rule is about speed, not about avoiding a shared config.
+///
+/// Note `SMOKE_MODEL=gpt` runs the loop on OpenAI and the summarizer on
+/// Anthropic, so that combination needs both keys. Without the Anthropic key
+/// every summarization fails, every compaction goes deterministic, and the
+/// losing-race warning fires blaming a slow summarizer — misreading an auth
+/// failure. Kept deliberately, because the alternative is reusing a slow loop
+/// model and demonstrating the anti-pattern this example warns about.
+fn summarizer() -> ModelConfig {
+    match std::env::var("SMOKE_MODEL").ok().as_deref() {
+        Some("deepseek") => ModelConfig::deepseek("deepseek-chat", "DeepSeek Chat"),
+        _ => ModelConfig::claude_haiku_4_5(),
+    }
+}
+
 fn model() -> ModelConfig {
     match std::env::var("SMOKE_MODEL").ok().as_deref() {
         Some("deepseek") => ModelConfig::deepseek("deepseek-chat", "DeepSeek Chat"),
@@ -243,6 +262,24 @@ fn model() -> ModelConfig {
 
 #[tokio::main]
 async fn main() {
+    // Compaction decisions are only visible through tracing. `YO_LOG=debug`
+    // shows which path each compaction took and why summarization did or did
+    // not arm; without a subscriber the diagnosis is guesswork.
+    //
+    // Level-based, not per-target: `env-filter` is not among the crate's
+    // tracing-subscriber features, matching `llm_compaction_live.rs`. So
+    // `debug` is noisy — reqwest, hyper and rustls come with it.
+    let level = match std::env::var("YO_LOG").as_deref() {
+        Ok("debug") => tracing::Level::DEBUG,
+        Ok("trace") => tracing::Level::TRACE,
+        Ok("info") => tracing::Level::INFO,
+        _ => tracing::Level::WARN,
+    };
+    tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_target(true)
+        .init();
+
     let cfg = model();
     println!(
         "\nyoagent long-horizon validation — live provider: {}\n",
@@ -277,7 +314,12 @@ async fn main() {
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     agent = agent.with_compaction_strategy(
-        yoagent::LlmCompaction::from_config(cfg.clone())
+        // A *faster* summarizer, per LlmCompaction's own docs: "the request is
+        // standalone, so this can (and usually should) name a cheaper model
+        // than the main loop's". Passing a slow loop model is the obvious call
+        // and the worst one — `compact` then finds no briefing ready and takes
+        // the deterministic tiers.
+        yoagent::LlmCompaction::from_config(summarizer())
             .with_trigger_ratio(0.35)
             .with_event_sender(tx.clone()),
     );

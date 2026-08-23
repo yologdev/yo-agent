@@ -8,6 +8,45 @@
 //! as prose: a "shift-handoff briefing" covering goals, progress, and decisions,
 //! spliced in where the dropped span used to be.
 //!
+//! # Choosing the summarizer
+//!
+//! **The summarizer must be fast enough to finish before the budget is
+//! crossed.** Reusing the loop's `ModelConfig` —
+//! `LlmCompaction::from_config(cfg)` with the session's own config — is the
+//! obvious call, and for a slow loop model it is the worst one: `compact` then
+//! finds no briefing ready and takes the deterministic tiers, so the retention
+//! this strategy exists for is silently not delivered.
+//!
+//! Reusing the config is fine when the loop model is *already* cheap and fast;
+//! see the #127 section below, where DeepSeek-in-session beats
+//! DeepSeek-standalone. The rule is about speed, not about sharing a config.
+//!
+//! Measured on the `long_horizon` harness at a 30K configured budget (26K after
+//! the `system_prompt_tokens` reserve), **one run each — the model is not
+//! deterministic, so read these as the shape of the effect, not as calibrated
+//! figures**. Both rows are the harness's own `[compaction #1]` line, and the
+//! two runs differ only in the summarizer:
+//!
+//! | summarizer | first compaction | history retained |
+//! |---|---|---|
+//! | the loop's model (Sonnet 5) | `Deterministic` | 3 msgs / 1.7K tokens |
+//! | a fast model (Haiku 4.5) | `Summarized` | 22 msgs / 16.7K tokens |
+//!
+//! ```text
+//! cargo run --example long_horizon        # ANTHROPIC_API_KEY, YO_LOG=debug
+//! ```
+//!
+//! ```rust,ignore
+//! LlmCompaction::from_config(ModelConfig::claude_haiku_4_5())   // not the loop's config
+//! ```
+//!
+//! When briefings keep losing that race the strategy says so once, via
+//! `tracing::warn!`, rather than degrading silently. Note what it does *not*
+//! claim: while a request is in flight `arm` starts no second one, so a very
+//! slow summarizer costs fewer requests than it does fallbacks — measured at 19
+//! fallbacks against 7 billed requests. The waste is worst in the middle
+//! regime, where the briefing lands but always just too late.
+//!
 //! # What it buys, and what it costs
 //!
 //! **Buys: retention quality, at no added loop latency.**
@@ -371,17 +410,45 @@ struct Warned {
     inert: bool,
     /// "No tokio runtime" has been reported.
     no_runtime: bool,
+    /// "Briefings keep losing the race" has been reported.
+    losing_race: bool,
 }
+
+/// Consecutive deterministic fallbacks before reporting that briefings are
+/// being issued and not used.
+///
+/// Five, not two. Two consecutive misses is ordinary — one burst of large tool
+/// results can cross the budget twice before any briefing lands. A session
+/// measured at seven splices in nine compactions (a 78% success rate) still
+/// contained a run of two, and a two-in-a-row threshold reported it as broken.
+///
+/// The latch is also cleared by a splice that lands, so this reports "the last
+/// five compactions in a row were deterministic" rather than "at some point
+/// two in a row were". A signal that cannot retract is one that goes stale the
+/// moment the configuration improves.
+const FALLBACKS_BEFORE_WARNING: u32 = 5;
 
 struct State {
     phase: Phase,
     warned: Warned,
+    /// Consecutive compactions that took the deterministic path.
+    fallbacks: u32,
+    /// Whether any summarization request has ever been issued.
+    ///
+    /// Gates the losing-race warning. Without it the warning also fired in the
+    /// *inert* configuration — where `choose_cut` never finds a split and
+    /// `spawn_summarize` is never called — telling the caller they were
+    /// "paying for briefings" having spent nothing, in the same session as
+    /// `warn_inert_once` giving the opposite `trigger_ratio` advice.
+    ever_spawned: bool,
 }
 
 impl Default for State {
     fn default() -> Self {
         Self {
             phase: Phase::Idle,
+            fallbacks: 0,
+            ever_spawned: false,
             warned: Warned::default(),
         }
     }
@@ -718,6 +785,60 @@ impl LlmCompaction {
         }
     }
 
+    /// Report, once, that briefings are being paid for and thrown away.
+    ///
+    /// A run where every compaction takes the deterministic path still issues
+    /// a summarization request each time — so the session pays input tokens
+    /// for the summarized span and output tokens for a briefing it never uses,
+    /// and silently gets the lossy behaviour `LlmCompaction` was chosen to
+    /// avoid. `CompactionMethod::Deterministic` on the event is the only other
+    /// signal, and only if the caller is listening for it.
+    ///
+    /// The usual cause is a summarizer too slow to finish before the budget is
+    /// crossed — most often because it is the *loop's* own model.
+    /// `LlmCompaction::from_config(loop_config)` is the obvious call and, for a
+    /// slow loop model, the worst one.
+    ///
+    /// The dominant mechanism is simply that the briefing is not there yet:
+    /// `compact` finds no `Phase::Ready` and takes the deterministic tiers.
+    /// Measured over 60 fed-back rounds with a summarizer slower than the
+    /// compaction interval: 13 fallbacks for "not ready" against 6 fingerprint
+    /// rejections, and zero splices. It is **not** the case that the fallback
+    /// invalidates the pending summary — see the guarantee above; `arm` always
+    /// fingerprints the history `compact` is about to return, never the one it
+    /// received, precisely so that cannot happen.
+    ///
+    /// Not one wasted request per fallback, either: `arm` will not start a
+    /// second request while one is in flight, so a very slow summarizer costs
+    /// fewer requests than it does fallbacks.
+    fn warn_losing_race_once(&self) {
+        {
+            let mut state = lock(&self.state);
+            state.fallbacks = state.fallbacks.saturating_add(1);
+            if state.fallbacks < FALLBACKS_BEFORE_WARNING || state.warned.losing_race {
+                return;
+            }
+            // Nothing has been spawned, so nothing is being paid for — this is
+            // the inert configuration, which `warn_inert_once` already reports
+            // with the *opposite* trigger_ratio advice. Claiming a cost here
+            // would be false and would contradict that message in the same
+            // session.
+            if !state.ever_spawned {
+                return;
+            }
+            state.warned.losing_race = true;
+        }
+        tracing::warn!(
+            "llm compaction: {FALLBACKS_BEFORE_WARNING} compactions in a row fell back to the \
+             deterministic tiers, so this session is getting DefaultCompaction's retention while \
+             still issuing summarization requests it does not splice. The usual cause is a \
+             summarizer too slow to finish before the budget is crossed — name a cheaper, faster \
+             model than the loop's rather than reusing its config, or lower trigger_ratio \
+             (currently {}) to start summarizing sooner.",
+            self.trigger_ratio,
+        );
+    }
+
     /// Report, once, that no summary can be produced under the current
     /// settings. Silence here was the original bug: the strategy looked
     /// configured and did nothing, forever.
@@ -744,6 +865,8 @@ impl LlmCompaction {
     /// Spawn the standalone summarization request for `messages[head_end..cut)`.
     fn spawn_summarize(&self, messages: &[AgentMessage], head_end: usize, cut: usize) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // Note: `ever_spawned` stays false here on purpose — no request is
+            // issued, so nothing is being paid for.
             // The strategy is wholly inert here — every compaction will be
             // deterministic — so this is a warning, not a debug note.
             let mut state = lock(&self.state);
@@ -791,7 +914,13 @@ impl LlmCompaction {
             ..Default::default()
         };
 
-        lock(&state).phase = Phase::Inflight;
+        {
+            let mut s = lock(&state);
+            s.phase = Phase::Inflight;
+            // From here the session is genuinely paying for briefings, which is
+            // what the losing-race warning asserts.
+            s.ever_spawned = true;
+        }
         tracing::debug!(
             "llm compaction: summarizing messages[{}..{}) in background",
             head_end,
@@ -1013,6 +1142,7 @@ impl CompactionStrategy for LlmCompaction {
         let used = total_tokens(&messages);
         let messages_before = messages.len();
 
+        let mut wasted: Option<crate::types::Usage> = None;
         // 1. Over budget and a summary is ready → splice (verify identity).
         if used > budget {
             let ready = {
@@ -1071,18 +1201,53 @@ impl CompactionStrategy for LlmCompaction {
                         // reported even when the briefing could not be kept.
                         summary: Some(SummaryStats::new(summarized, summary.usage, cost)),
                     });
+                    // Only a briefing that actually survived into the result
+                    // resets the streak. Reaching here with `Deterministic`
+                    // means the summary was ready, was paid for, and was then
+                    // discarded because head + briefing overflowed the budget
+                    // on their own — the most expensive fallback there is.
+                    //
+                    // Resetting on it did more than under-count: it *cleared*
+                    // the streak, so a session alternating this path with the
+                    // not-ready path sawtoothed 1,0,1,0 and could never reach
+                    // the threshold. Six consecutive deterministic compactions,
+                    // three of them paid for, warned nobody.
+                    if method == CompactionMethod::Summarized {
+                        let mut s = lock(&self.state);
+                        s.fallbacks = 0;
+                        // Retractable: a configuration that starts working
+                        // again must be able to warn again later if it
+                        // degrades, and must not keep asserting a problem it
+                        // no longer has.
+                        s.warned.losing_race = false;
+                    } else {
+                        // Counted, not warned: this path already emitted its
+                        // own more specific warning above. What it must not do
+                        // is stay invisible to the streak.
+                        lock(&self.state).fallbacks += 1;
+                    }
                     self.arm(&result, config, budget);
                     return result;
                 }
+                // The request was billed even though the briefing is unusable.
+                // `types.rs` states the contract plainly — "the request was
+                // still paid for, so the event still reports it" — and the
+                // sibling discard branch above already honours it. Reporting
+                // `None` here meant a cost-accounting caller under-counted
+                // exactly the failure mode that wastes the most.
+                wasted = Some(summary.usage.clone());
                 tracing::warn!("llm compaction: history changed under summary, discarding");
             }
         }
 
         // 2. Over budget with no usable summary → deterministic fallback.
+        //    `wasted` is set when a briefing was produced and then rejected, so
+        //    the event below can still report what it cost.
         //    The loop always makes progress; a slow or dead summarizer can
         //    never wedge it.
         if used > budget {
             tracing::debug!("llm compaction: summary not ready, deterministic fallback");
+            self.warn_losing_race_once();
             let result = compact_messages(messages, config);
             let after = total_tokens(&result);
             self.emit(AgentEvent::ContextCompacted {
@@ -1091,7 +1256,12 @@ impl CompactionStrategy for LlmCompaction {
                 messages_after: result.len(),
                 tokens_before: used,
                 tokens_after: after,
-                summary: None,
+                // Zero messages summarized, but a real cost when a briefing was
+                // produced and rejected. `None` only when nothing was billed.
+                summary: wasted.map(|u| {
+                    let cost = self.summary_cost(&u);
+                    SummaryStats::new(0, u, cost)
+                }),
             });
             self.arm(&result, config, budget);
             return result;
@@ -2023,6 +2193,258 @@ mod tests {
         assert!(
             lock(&strategy.state).phase.is_idle(),
             "a failed request must leave the slot idle, not pinned in flight"
+        );
+    }
+}
+
+#[cfg(test)]
+mod losing_race_warning {
+    use super::*;
+
+    /// A strategy that has already issued at least one request, which is what
+    /// the losing-race warning is gated on — without it the warning would
+    /// claim a cost in the inert configuration, where nothing is ever spawned.
+    fn strategy() -> LlmCompaction {
+        let s = LlmCompaction::from_config(crate::provider::ModelConfig::mock());
+        lock(&s.state).ever_spawned = true;
+        s
+    }
+
+    /// The warning is one-shot, and only after a *streak*.
+    ///
+    /// A single fallback is ordinary — the first compaction of a session
+    /// usually arrives before any summary could have been ready — so warning on
+    /// it would train callers to ignore the message.
+    #[test]
+    fn one_fallback_is_quiet_and_the_warning_fires_once() {
+        let s = strategy();
+        for _ in 1..FALLBACKS_BEFORE_WARNING {
+            s.warn_losing_race_once();
+            assert!(
+                !lock(&s.state).warned.losing_race,
+                "fewer than {FALLBACKS_BEFORE_WARNING} consecutive fallbacks must stay quiet — \
+                 a short run of misses happens in sessions that are working"
+            );
+        }
+
+        s.warn_losing_race_once();
+        assert!(
+            lock(&s.state).warned.losing_race,
+            "a streak of {FALLBACKS_BEFORE_WARNING} must warn — the session is issuing \
+             briefings it never splices"
+        );
+
+        // One-shot: the flag stays set and the streak keeps counting, but the
+        // caller is not told again every compaction for the rest of the run.
+        let before = lock(&s.state).fallbacks;
+        s.warn_losing_race_once();
+        assert!(
+            lock(&s.state).fallbacks > before,
+            "the streak keeps counting"
+        );
+    }
+
+    /// All `Content::Text` of a message, whatever its role.
+    ///
+    /// Not `context::message_text` — that walks `block_texts`, which matches
+    /// only `Message::ToolResult` and returns empty for the `User` message a
+    /// briefing is spliced in as. Both assertions below used it at first and
+    /// were therefore inspecting nothing: the "briefing is absent" check passed
+    /// vacuously, and the "briefing is present" check failed on a splice that
+    /// had in fact happened.
+    fn text_of(m: &AgentMessage) -> String {
+        match m {
+            AgentMessage::Llm(Message::User { content, .. })
+            | AgentMessage::Llm(Message::Assistant { content, .. })
+            | AgentMessage::Llm(Message::ToolResult { content, .. }) => content
+                .iter()
+                .filter_map(|c| match c {
+                    Content::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            AgentMessage::Extension(_) => String::new(),
+        }
+    }
+
+    /// The warning must not claim a cost when nothing was ever spawned.
+    ///
+    /// In the *inert* configuration `choose_cut` never finds a split, so
+    /// `spawn_summarize` is never called and not one token is spent. Warning
+    /// there told the caller they were "paying for briefings" having paid
+    /// nothing — in the same session as `warn_inert_once`, which gives the
+    /// **opposite** `trigger_ratio` advice. Two warnings, contradicting each
+    /// other, both about a cost that does not exist.
+    #[test]
+    fn no_request_issued_means_no_cost_claim() {
+        let s = LlmCompaction::from_config(crate::provider::ModelConfig::mock());
+        assert!(!lock(&s.state).ever_spawned, "fixture must start unspawned");
+
+        for _ in 0..FALLBACKS_BEFORE_WARNING * 3 {
+            s.warn_losing_race_once();
+        }
+        assert!(
+            !lock(&s.state).warned.losing_race,
+            "with nothing ever spawned there is no spend to report, however long \
+             the deterministic streak runs"
+        );
+    }
+
+    /// The latch retracts, so a session that recovers is not permanently
+    /// accused.
+    ///
+    /// Measured false alarm: a session splicing 7 of 9 compactions still
+    /// contained a run of consecutive misses, and a non-retracting latch
+    /// reported it as broken for the rest of the run.
+    ///
+    /// Drives a real splice rather than simulating the clear — the sibling
+    /// discard test showed the staging is cheap, and a simulated version would
+    /// not catch the clear being deleted from `compact`.
+    #[test]
+    fn a_splice_clears_the_latch_so_the_signal_can_retract() {
+        let messages: Vec<AgentMessage> = (0..8)
+            .map(|i| {
+                AgentMessage::Llm(Message::User {
+                    content: vec![Content::Text {
+                        text: format!("message {i}: {}", "x".repeat(400)),
+                    }],
+                    timestamp: i as u64,
+                })
+            })
+            .collect();
+        let config = ContextConfig {
+            max_context_tokens: 600,
+            system_prompt_tokens: 0,
+            keep_first: 1,
+            keep_recent: 2,
+            ..Default::default()
+        };
+        let cut = 6usize;
+
+        let strategy = LlmCompaction::from_provider(
+            std::sync::Arc::new(crate::provider::MockProvider::text("briefing")),
+            crate::provider::ModelConfig::mock(),
+        );
+        {
+            let mut s = lock(&strategy.state);
+            s.ever_spawned = true;
+            s.fallbacks = FALLBACKS_BEFORE_WARNING;
+            s.warned.losing_race = true;
+            // Small enough to survive the budget, so this really splices.
+            s.phase = Phase::Ready(Box::new(Summary {
+                fingerprint: fingerprint(&messages, cut),
+                head_end: config.keep_first,
+                text: "brief".into(),
+                usage: Usage::default(),
+            }));
+        }
+
+        let result = strategy.compact(messages, &config);
+        assert!(
+            result.iter().any(|m| text_of(m).contains("brief")),
+            "fixture must actually splice — the briefing must appear in the result"
+        );
+        let s = lock(&strategy.state);
+        assert_eq!(s.fallbacks, 0, "a landed splice resets the streak");
+        assert!(
+            !s.warned.losing_race,
+            "a configuration that started working must stop being reported as broken"
+        );
+    }
+
+    /// A briefing that is paid for and then discarded must **count** as a
+    /// fallback, not reset the streak.
+    ///
+    /// This is the wiring the policy test below cannot reach, and it is where
+    /// the bug was: `fallbacks = 0` sat on the shared success exit, so the
+    /// "summary ready but head + briefing overflow the budget" branch — which
+    /// sets `method = Deterministic` and leaves via that same exit — cleared
+    /// the counter. Alternating it with the not-ready path sawtoothed 1,0,1,0,
+    /// so a session could take six consecutive deterministic compactions,
+    /// three of them paid for, and never warn.
+    #[test]
+    fn a_discarded_briefing_counts_as_a_fallback() {
+        // Local fixtures rather than widening the sibling test module's
+        // visibility for one caller.
+        let messages: Vec<AgentMessage> = (0..8)
+            .map(|i| {
+                AgentMessage::Llm(Message::User {
+                    content: vec![Content::Text {
+                        text: format!("message {i}: {}", "x".repeat(400)),
+                    }],
+                    timestamp: i as u64,
+                })
+            })
+            .collect();
+        let config = ContextConfig {
+            max_context_tokens: 600,
+            system_prompt_tokens: 0,
+            keep_first: 1,
+            keep_recent: 2,
+            ..Default::default()
+        };
+
+        let strategy = LlmCompaction::from_provider(
+            std::sync::Arc::new(crate::provider::MockProvider::text("briefing")),
+            crate::provider::ModelConfig::mock(),
+        );
+        let budget = config.max_context_tokens;
+        let cut = 6usize;
+
+        // A briefing so large that head + briefing cannot fit, forcing the
+        // discard branch rather than a real splice.
+        lock(&strategy.state).phase = Phase::Ready(Box::new(Summary {
+            fingerprint: fingerprint(&messages, cut),
+            head_end: config.keep_first,
+            text: "b".repeat(budget * 8),
+            usage: Usage::default(),
+        }));
+
+        let before = lock(&strategy.state).fallbacks;
+        let result = strategy.compact(messages, &config);
+        let after = lock(&strategy.state).fallbacks;
+
+        assert!(
+            !result
+                .iter()
+                .any(|m| context::message_text(m).contains("bbbb")),
+            "fixture must actually take the discard branch — the oversized briefing \
+             must not appear in the result"
+        );
+        assert_eq!(
+            after,
+            before + 1,
+            "a briefing that was paid for and then discarded is the most expensive \
+             fallback there is; it must advance the streak, not clear it"
+        );
+    }
+
+    /// A successful splice resets the streak.
+    ///
+    /// Without this, a session that splices most of the time but falls back
+    /// twice across an hour would still be told it is "losing the race", which
+    /// is false and would send the reader tuning something that is working.
+    ///
+    /// **Scope:** this pins the streak *policy*, not the wiring. It sets
+    /// `fallbacks = 0` directly rather than driving a real splice, so deleting
+    /// the reset from `compact`'s success path would not fail it — exercising
+    /// that needs a summary staged in `Phase::Ready` with a matching
+    /// fingerprint. Stated because a test that reads stronger than it is, is
+    /// worse than one that admits its limit.
+    #[test]
+    fn a_successful_splice_resets_the_streak() {
+        let s = strategy();
+        s.warn_losing_race_once();
+        assert_eq!(lock(&s.state).fallbacks, 1);
+
+        // What the splice path does on success.
+        lock(&s.state).fallbacks = 0;
+
+        s.warn_losing_race_once();
+        assert!(
+            !lock(&s.state).warned.losing_race,
+            "one fallback after a successful splice is not a streak"
         );
     }
 }

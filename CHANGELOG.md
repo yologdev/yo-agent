@@ -4,6 +4,73 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Changed
+
+- **`LlmCompaction` says so when briefings keep losing the race**
+  ([#150](https://github.com/yologdev/yoagent/issues/150)). A session whose
+  compactions all take the deterministic path gets `DefaultCompaction`'s
+  retention while still issuing summarization requests it never splices —
+  paying input tokens for the span and output tokens for briefings it discards.
+  After **five** consecutive fallbacks it warns once, naming the likely cause,
+  and a splice that lands both resets the streak and clears the latch. Five, not
+  two: a session measured at seven splices in nine compactions — a 78% success
+  rate — still contained a run of two, and a two-in-a-row threshold reported it
+  as broken for the rest of the run. A signal that cannot retract goes stale the
+  moment the configuration improves.
+
+  It is also gated on a request having actually been issued, and on the briefing
+  surviving into the result. Without the first it fired in the *inert*
+  configuration — where `choose_cut` never finds a split and nothing is ever
+  spawned — claiming a cost of zero tokens, in the same session as
+  `warn_inert_once` giving the opposite `trigger_ratio` advice. Without the
+  second, the "briefing produced, then discarded as too large" path reset the
+  streak rather than counting it, so alternating it with a plain miss sawtoothed
+  the counter and it could never reach the threshold.
+
+- **A briefing rejected on fingerprint mismatch now reports what it cost.** The
+  event carried `summary: None`, so a caller doing cost accounting off
+  `SummaryStats` under-counted exactly the failure mode that wastes the most.
+  `types.rs` states the contract plainly — "the request was still paid for, so
+  the event still reports it" — and the sibling discard branch already honoured
+  it.
+
+  Not one wasted request per fallback: `arm` starts no second request while one
+  is in flight, so a very slow summarizer costs fewer requests than fallbacks —
+  measured at 19 fallbacks against 7 billed requests. The waste is worst in the
+  middle regime, where the briefing lands but always just too late.
+
+  The cause is a documentation problem, not a logic one: reusing the loop's
+  `ModelConfig` is the obvious call and, for a slow loop model, the worst one —
+  `compact` then finds no briefing ready. (It is *not* that the fallback
+  invalidates a pending summary; `arm` fingerprints the history `compact` is
+  about to return, never the one it received, precisely so that cannot happen.)
+
+  Measured on the `long_horizon` harness at a 30K configured budget, **one run
+  each — the model is not deterministic, so read these as the shape of the
+  effect, not calibrated figures**. Both rows are the harness's `[compaction #1]`
+  line, and the runs differ only in the summarizer:
+
+  | summarizer | first compaction | history retained |
+  |---|---|---|
+  | the loop's model (Sonnet 5) | `Deterministic` | 3 msgs / 1.7K tokens |
+  | a fast model (Haiku 4.5) | `Summarized` | 22 msgs / 16.7K tokens |
+
+  The warning is gated on a request having actually been issued. Without that
+  it also fired in the *inert* configuration — where `choose_cut` never finds a
+  split and nothing is ever spawned — telling the caller they were paying for
+  briefings having spent nothing, in the same session as `warn_inert_once`
+  giving the opposite `trigger_ratio` advice.
+
+  **Still open on #150:** `compact_headroom_turns` defaults to `Some(30)`, so
+  any session growing faster than ~2.8% of its budget per turn pins
+  `effective_target_ratio` to its `MIN_HEADROOM_RATIO` floor of 0.15 — about
+  740 tokens/turn at this harness's 26K effective budget, about 2.7K at the 96K
+  default. That is the aggression that makes compaction destructive. Changing
+  the constant alters compaction for every user and wants measurement across
+  growth rates first, not a guess.
+
 ## 0.18.0
 
 ### Added
