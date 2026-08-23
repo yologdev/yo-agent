@@ -8,6 +8,26 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Fixed: summarization retries panicked in debug builds, silently.**
+  `RetryConfig::delay_for_attempt` documents a 1-indexed attempt and computes
+  `attempt - 1`; `llm_compaction.rs` passed the raw `0..=max_retries` loop
+  variable, so the first retry underflowed `usize`. `agent_loop.rs` increments
+  before calling and was correct — this was confined to compaction.
+
+  It landed on a **detached** task, so nothing surfaced: the summarization
+  simply vanished, no briefing arrived, and compaction fell back
+  deterministically. That is one of the behaviours
+  [#150](https://github.com/yologdev/yoagent/issues/150) was filed about.
+
+  `delay_for_attempt` now uses `saturating_sub`, so a caller that misses the
+  1-indexed contract loses the backoff rather than the task.
+
+  `provider_failure_falls_back_deterministically` had been passing *because* of
+  this panic: its `FailingProvider` returns a retryable error, and the instant
+  death released the in-flight slot inside the test's 100ms window. With
+  retries working the first backoff is ~1s, so the test now configures no
+  retries — it is about the drop guard, not about backoff timing.
+
 - **`LlmCompaction` says so when briefings keep losing the race**
   ([#150](https://github.com/yologdev/yoagent/issues/150)). A session whose
   compactions all take the deterministic path gets `DefaultCompaction`'s
