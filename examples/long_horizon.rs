@@ -309,6 +309,15 @@ async fn main() {
             keep_recent: 6,
             keep_first: 2,
             tool_output_max_lines: 200,
+            // #150's open question: does the headroom policy's lower
+            // compaction count actually buy prefix-cache hits? The offline
+            // sweep (`examples/headroom_sweep.rs`) shows Some(30) taking half
+            // to a third as many compactions as Some(5) for ~30% less
+            // retention; only a live run can price the cache side.
+            compact_headroom_turns: std::env::var("YO_HEADROOM")
+                .ok()
+                .map(|v| if v == "none" { None } else { v.parse().ok() })
+                .unwrap_or(Some(30)),
             ..Default::default()
         });
 
