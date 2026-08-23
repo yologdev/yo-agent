@@ -1083,7 +1083,12 @@ async fn summarize(
                 if e.is_retryable() && attempt < retry.max_retries {
                     let delay = e
                         .retry_after()
-                        .unwrap_or_else(|| retry.delay_for_attempt(attempt));
+                        // `attempt` is 0-indexed here (`0..=max_retries`) but
+                        // `delay_for_attempt` documents 1-indexed and computes
+                        // `attempt - 1`, so passing it raw underflowed on the
+                        // first retry. `agent_loop.rs` increments before
+                        // calling; this did not.
+                        .unwrap_or_else(|| retry.delay_for_attempt(attempt + 1));
                     tracing::debug!("llm compaction: {e}, retrying in {delay:?}");
                     tokio::time::sleep(delay).await;
                     continue;
@@ -1094,7 +1099,7 @@ async fn summarize(
             Ok(Ok(message)) => return accept_summary(message),
         }
         if attempt < retry.max_retries {
-            tokio::time::sleep(retry.delay_for_attempt(attempt)).await;
+            tokio::time::sleep(retry.delay_for_attempt(attempt + 1)).await;
         }
     }
     None
@@ -2179,11 +2184,65 @@ mod tests {
         }
     }
 
+    /// Real fallbacks through `compact()` feed the streak and trip the warning.
+    ///
+    /// Lives here, in `mod tests`, because the helpers do. The sibling
+    /// `losing_race_warning` module calls `warn_losing_race_once` directly, so
+    /// deleting its only call site in `compact` left every one of those tests
+    /// green while disconnecting the feature entirely — the counter would never
+    /// move for any real user.
     #[tokio::test(flavor = "multi_thread")]
-    async fn provider_failure_falls_back_deterministically() {
+    async fn compact_counts_real_fallbacks_and_warns_on_the_streak() {
         let strategy = LlmCompaction::from_provider(Arc::new(FailingProvider), ModelConfig::mock())
             .with_trigger_ratio(0.1)
-            .with_retain_tail_tokens(200);
+            .with_retain_tail_tokens(200)
+            .with_retry_config(crate::retry::RetryConfig::none());
+        let cfg = config(2_000);
+
+        // The summarizer always fails, so no briefing is ever ready and every
+        // compaction takes the deterministic path — the condition the warning
+        // exists to report.
+        for expected in 1..FALLBACKS_BEFORE_WARNING {
+            let _ = strategy.compact(history(30, 400), &cfg);
+            // Let the spawned request fail and release the slot, so the next
+            // compaction arms again rather than seeing a busy phase.
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            assert_eq!(
+                lock(&strategy.state).fallbacks,
+                expected,
+                "each deterministic compaction must advance the streak"
+            );
+            assert!(
+                !lock(&strategy.state).warned.losing_race,
+                "{expected} of {FALLBACKS_BEFORE_WARNING} is not yet a streak"
+            );
+        }
+
+        let _ = strategy.compact(history(30, 400), &cfg);
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            lock(&strategy.state).warned.losing_race,
+            "{FALLBACKS_BEFORE_WARNING} consecutive real fallbacks must trip the warning"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provider_failure_falls_back_deterministically() {
+        // No retries, so the failure is immediate and the 100ms below actually
+        // bounds it. This test is about the drop guard releasing the slot, not
+        // about backoff timing.
+        //
+        // It previously passed for the wrong reason: `FailingProvider` returns
+        // a *retryable* error, and `delay_for_attempt` was called 0-indexed
+        // against its documented 1-indexed contract, so the first retry
+        // panicked on `usize` underflow. The task died instantly, the guard
+        // dropped, and the assertion held — on a debug-only panic on a detached
+        // task. With the indexing fixed the first backoff is ~1s and the slot
+        // is legitimately still in flight at 100ms.
+        let strategy = LlmCompaction::from_provider(Arc::new(FailingProvider), ModelConfig::mock())
+            .with_trigger_ratio(0.1)
+            .with_retain_tail_tokens(200)
+            .with_retry_config(crate::retry::RetryConfig::none());
 
         let messages = history(30, 400);
         let cfg = config(2_000);
