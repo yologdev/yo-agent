@@ -230,6 +230,22 @@ async fn test_continue_from_tool_result() {
         system_prompt: "test".into(),
         messages: vec![
             AgentMessage::Llm(Message::user("do something")),
+            // The assistant turn that *made* the call. Without it the
+            // tool_result answers nothing, which is a history no provider
+            // accepts — and which therefore cannot arise in production, so
+            // asserting resume behaviour on it proved nothing about the real
+            // path. MockProvider now rejects it.
+            AgentMessage::Llm(Message::assistant(
+                vec![Content::tool_call(
+                    "tc-1",
+                    "test_tool",
+                    serde_json::json!({}),
+                )],
+                StopReason::ToolUse,
+                "mock",
+                "mock",
+                Usage::default(),
+            )),
             AgentMessage::Llm(Message::ToolResult {
                 tool_call_id: "tc-1".into(),
                 tool_name: "test_tool".into(),
