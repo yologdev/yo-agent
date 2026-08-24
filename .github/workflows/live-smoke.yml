@@ -1,0 +1,83 @@
+name: Live Smoke
+
+# The release gate that mocks cannot be.
+#
+# Every unit test runs against `MockProvider`. That mock now validates message
+# shape (#160), but it still cannot stream SSE, cannot price a request, and
+# cannot tell you whether a model actually follows a truncation marker. The
+# bugs that reached released versions all lived in exactly that gap:
+#
+#   - tools with zero parameters were uncallable on Anthropic
+#   - the truncation stash did not work through the path the model takes
+#   - a retry underflow killed summarization on a detached task
+#
+# `release_smoke` found the first of those on its first ever run.
+#
+# Deliberately NOT part of per-PR CI: it needs provider keys, costs real money,
+# and live calls are flaky enough that a hung request would block the queue.
+# Per-release is the right granularity — a few cents, a few minutes, once per
+# version.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or tag to smoke (defaults to the current branch)"
+        required: false
+        type: string
+  push:
+    branches: ["release/**"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    name: Live smoke (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    # Never let a hung provider call hold the queue. The harness itself has no
+    # global timeout, and two `long_horizon` runs hung mid-session during #150.
+    timeout-minutes: 15
+    strategy:
+      # Both providers report independently: they exercise different SSE
+      # parsers and different tool-call accumulators, which is where the
+      # zero-argument bug lived.
+      fail-fast: false
+      matrix:
+        include:
+          - name: anthropic
+            key_env: ANTHROPIC_API_KEY
+            smoke_model: ""
+          - name: deepseek
+            key_env: DEEPSEEK_API_KEY
+            smoke_model: deepseek
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Skipped, not failed, when the secret is absent — a fork without keys
+      # should not see a red X for a gate it cannot run.
+      - name: Check for a key
+        id: key
+        env:
+          KEY: ${{ secrets[matrix.key_env] }}
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${{ matrix.key_env }} is not set; skipping the ${{ matrix.name }} smoke run."
+          fi
+
+      - name: Run the smoke harness
+        if: steps.key.outputs.present == 'true'
+        env:
+          # Both are set; the harness reads whichever its provider needs.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          SMOKE_MODEL: ${{ matrix.smoke_model }}
+        # The harness exits non-zero on any failed check, so it gates as-is.
+        run: cargo run --example release_smoke
