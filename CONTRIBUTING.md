@@ -56,6 +56,29 @@ locally with `mdbook build` and open `book/index.html`.
 
 **Changelog** — add an entry under `## Unreleased` in [CHANGELOG.md](CHANGELOG.md).
 
+## Live smoke
+
+Unit tests run against `MockProvider`. It validates message shape, but it cannot
+stream SSE, cannot price a request, and cannot tell you whether a model actually
+follows a truncation marker. Bugs that reached released versions all lived in
+that gap — tools with zero parameters were uncallable on Anthropic, and its
+first ever run is what found that.
+
+Before a release, run the **Live Smoke** workflow against the release branch, or
+locally:
+
+```bash
+ANTHROPIC_API_KEY=... cargo run --example release_smoke
+SMOKE_MODEL=deepseek DEEPSEEK_API_KEY=... cargo run --example release_smoke
+```
+
+It exits non-zero on any failed check. Both providers matter: they are separate
+SSE parsers and tool-call accumulators.
+
+`examples/long_horizon.rs` is the diagnostic sibling — compaction, cache
+behaviour across compaction, sub-agent delegation. Slower, and its output wants
+reading rather than a pass/fail, so it is deliberately not a gate.
+
 ## Adding a provider
 
 Most new providers are OpenAI-compatible and need no new code — just a `ModelConfig` with the right
