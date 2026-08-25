@@ -422,6 +422,83 @@ async fn message_delta_without_usage_still_yields_its_stop_reason() {
 /// This is on the happy path for this crate's own configuration: we send the
 /// `fine-grained-tool-streaming` beta, which Anthropic documents as able to
 /// emit incomplete tool JSON when a response hits `max_tokens`.
+/// A tool with **no parameters** must be callable.
+///
+/// The sibling of `malformed_tool_arguments_fail_the_turn_instead_of_defaulting`,
+/// and the case that was missing when a real bug shipped: a zero-argument tool
+/// has no JSON to stream, but Anthropic still emits an `input_json_delta`
+/// carrying `""`. `serde_json::from_str("")` fails with "EOF while parsing a
+/// value", so *empty* was treated as *malformed* — the `__partial_json`
+/// sentinel survived `content_block_stop` and the post-stream sweep failed the
+/// whole turn with "tool call(s) with unusable arguments, not executed".
+///
+/// Every `get_status` / `list_files` / `read_log`-shaped tool was affected, in
+/// released versions. The malformed case was pinned; this one was not, so the
+/// two were conflated and the conflation shipped.
+///
+/// 0.18.1 fixed it and unit-tested `resolve_tool_arguments`, but that is the
+/// pure decision. This drives the empty stream through the actual parser.
+#[tokio::test]
+async fn a_zero_argument_tool_call_is_usable_not_malformed() {
+    let server = MockServer::start().await;
+    // Exactly what Anthropic sends for a tool whose schema takes no arguments:
+    // the block opens, one delta carries an empty string, the block closes.
+    let body = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n\n\
+         event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"list_files\",\"input\":{}}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}\n\n\
+         event: message_stop\n\
+         data: {\"type\":\"message_stop\"}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let message = run_stream(stream_config(&server.uri(), None))
+        .await
+        .expect("the stream is well-formed");
+    let Message::Assistant {
+        stop_reason,
+        error_message,
+        content,
+        ..
+    } = &message
+    else {
+        panic!("expected assistant message");
+    };
+
+    assert_eq!(
+        *stop_reason,
+        StopReason::ToolUse,
+        "a no-argument tool call is a usable turn, not an error. error_message: {error_message:?}"
+    );
+    let call = content
+        .iter()
+        .find_map(|c| match c {
+            Content::ToolCall {
+                name, arguments, ..
+            } if name == "list_files" => Some(arguments),
+            _ => None,
+        })
+        .expect("the tool call must reach the caller");
+    assert_eq!(
+        *call,
+        serde_json::json!({}),
+        "an empty argument stream is an empty argument object, not a sentinel"
+    );
+    assert!(
+        call.get("__partial_json").is_none(),
+        "the accumulator sentinel must not survive into the caller's arguments"
+    );
+}
+
 #[tokio::test]
 async fn malformed_tool_arguments_fail_the_turn_instead_of_defaulting() {
     let server = MockServer::start().await;

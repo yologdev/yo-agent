@@ -134,3 +134,151 @@ async fn test_usage_chunk_after_finish_reason_survives_doneless_close() {
     );
     assert_eq!(usage.output, 3);
 }
+
+/// A tool call split across chunks reassembles into the arguments the model
+/// sent.
+///
+/// This module backs 15+ providers — OpenAI, Groq, Together, DeepSeek,
+/// Fireworks, Mistral, xAI — and had three tests, none of which touched tool
+/// calls at all. Argument streaming is the fiddliest part of the format and the
+/// part with the widest blast radius.
+#[tokio::test]
+async fn tool_call_arguments_reassemble_across_chunks() {
+    let server = MockServer::start().await;
+    let body = format!(
+        "{}{}{}{}",
+        chunk(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"search","arguments":"{\"q\":"}}]}}]}"#
+        ),
+        chunk(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"rust\"}"}}]}}]}"#
+        ),
+        chunk(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#),
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let message = run_stream(stream_config(&server.uri()))
+        .await
+        .expect("stream should complete");
+    let Message::Assistant { content, .. } = &message else {
+        panic!("expected assistant message");
+    };
+    let args = content
+        .iter()
+        .find_map(|c| match c {
+            Content::ToolCall {
+                name, arguments, ..
+            } if name == "search" => Some(arguments),
+            _ => None,
+        })
+        .expect("the tool call must reach the caller");
+    assert_eq!(
+        *args,
+        serde_json::json!({"q": "rust"}),
+        "arguments split across chunks must reassemble, not truncate at the first"
+    );
+}
+
+/// A tool with no parameters is callable here too.
+///
+/// The Anthropic sibling of this shipped a bug: an empty argument stream was
+/// treated as malformed and failed the whole turn. This module reaches the same
+/// outcome by a different route — `from_str("")` fails and it falls back to
+/// `{}` — so the behaviour is correct but incidental. Pinned so it stays.
+#[tokio::test]
+async fn a_zero_argument_tool_call_is_usable() {
+    let server = MockServer::start().await;
+    let body = format!(
+        "{}{}{}",
+        chunk(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"list_files","arguments":""}}]}}]}"#
+        ),
+        chunk(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#),
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let message = run_stream(stream_config(&server.uri()))
+        .await
+        .expect("stream should complete");
+    let Message::Assistant {
+        content,
+        stop_reason,
+        ..
+    } = &message
+    else {
+        panic!("expected assistant message");
+    };
+    assert_eq!(
+        *stop_reason,
+        StopReason::ToolUse,
+        "a no-argument tool call is a usable turn"
+    );
+    let args = content
+        .iter()
+        .find_map(|c| match c {
+            Content::ToolCall {
+                name, arguments, ..
+            } if name == "list_files" => Some(arguments),
+            _ => None,
+        })
+        .expect("the tool call must reach the caller");
+    assert_eq!(*args, serde_json::json!({}));
+}
+
+/// **Documents a provider divergence, deliberately.**
+///
+/// Anthropic fails the turn on unparseable tool arguments, and says why: "a
+/// tool handed `{"__partial_json": ...}` runs on its defaults instead of what
+/// the model asked for". This module does the opposite — it falls back to `{}`
+/// and warns, so the tool *does* run on its defaults.
+///
+/// Pinned rather than fixed, because changing it is a behavioural decision
+/// affecting 15+ providers, not a test fix. If the divergence is ever closed,
+/// this test should fail and be updated deliberately.
+#[tokio::test]
+async fn truncated_tool_arguments_fall_back_to_empty_unlike_anthropic() {
+    let server = MockServer::start().await;
+    let body = format!(
+        "{}{}{}",
+        chunk(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"search","arguments":"{\"q\":"}}]}}]}"#
+        ),
+        chunk(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#),
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let message = run_stream(stream_config(&server.uri()))
+        .await
+        .expect("stream should complete");
+    let Message::Assistant { content, .. } = &message else {
+        panic!("expected assistant message");
+    };
+    let args = content
+        .iter()
+        .find_map(|c| match c {
+            Content::ToolCall {
+                name, arguments, ..
+            } if name == "search" => Some(arguments),
+            _ => None,
+        })
+        .expect("the call still reaches the caller here");
+    assert_eq!(
+        *args,
+        serde_json::json!({}),
+        "truncated arguments currently degrade to an empty object — the tool runs on its \
+         defaults. Anthropic fails the turn instead. If this assertion changes, the \
+         divergence was closed on purpose"
+    );
+}
