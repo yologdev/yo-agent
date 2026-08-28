@@ -111,7 +111,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: yologdev/gasp
-          ref: 08a60a2ee30d6bc065ffbadec34a7993dc109fdf # pin: checker changes must not break yoagent CI silently
+          # Pinned so a checker change cannot break yoagent CI silently — bump
+          # deliberately, after running the job's sequence locally against the
+          # new SHA. This one folds leniently (gasp#3): a dangling op is a note
+          # on the certificate, not an abort, so check 2 now reports what it
+          # skipped instead of failing the whole run at the first bad op.
+          ref: 795bb93449adb206236a97d45d4dd674c0aae862
           path: gasp-checker
       - name: Run conformance checker against a fresh clone (true restore)
         run: |
